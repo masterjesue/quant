@@ -36,27 +36,13 @@ except ImportError:
     MT5_OK = False
 
 # =============================================================================
-# PALETA E TOKENS
+# PALETA E TOKENS — tema Windows 98 (ver estilo_win98.py)
 # =============================================================================
 
-C = {
-    'bg':        '#0A0A0F',
-    'panel':     '#12121A',
-    'border':    '#1C1C28',
-    'gold':      '#C8A96E',
-    'green':     '#2ECC8A',
-    'red':       '#E05C5C',
-    'text':      '#E8E8F0',
-    'text2':     '#8888AA',
-    'blue':      '#4A90D9',
-    'yellow':    '#F0C040',
-}
-
-FONTS = {
-    'display': 'Space Grotesk, system-ui, sans-serif',
-    'mono':    'JetBrains Mono, monospace',
-    'body':    'Inter, system-ui, sans-serif',
-}
+from estilo_win98 import (
+    C, FONTS, win98_raised, win98_sunken, win98_button, win98_field,
+    win98_titlebar, win98_window, win98_groupbox, texto_sobre,
+)
 
 # =============================================================================
 # ESTADO GLOBAL
@@ -1254,10 +1240,6 @@ app = dash.Dash(
 )
 
 app.layout = html.Div([
-
-    # Google Fonts
-    html.Link(rel='stylesheet',
-              href='https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;500&display=swap'),
 
     # Store para mensagem pendente (para preloader)
     dcc.Store(id='store-mensagem-pendente', data=None),

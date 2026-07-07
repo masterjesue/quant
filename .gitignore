@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.bin
+*.bak
 
 # Diário de trade real (Excel, arquivo grande, dados pessoais de operações)
 diario.xlsm
