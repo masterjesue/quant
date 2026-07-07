@@ -1,0 +1,19 @@
+/* Feedback visual dos botões WIN/WDO/WIN×WDO — antes o clique era "seco"
+   (sem hover, sem estado pressionado). Ver CHANGELOG.md 2026-07-04. */
+.btn-ativo:hover {
+    filter: brightness(1.15);
+}
+.btn-ativo:active {
+    transform: scale(0.96);
+}
+
+/* Pulso rápido ao trocar de ativo (WIN/WDO/WIN×WDO) — dá uma confirmação
+   visual imediata do clique, antes do conteúdo terminar de recarregar.
+   Disparado via clientside callback em store-ativo (dashboard.py). */
+#conteudo-principal.trocando-ativo {
+    animation: pulso-troca-ativo 0.35s ease;
+}
+@keyframes pulso-troca-ativo {
+    0%   { opacity: 0.45; }
+    100% { opacity: 1; }
+}

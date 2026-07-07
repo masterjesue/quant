@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.bin
+
+# Diário de trade real (Excel, arquivo grande, dados pessoais de operações)
+diario.xlsm
+
+# Dados de mercado (CSV/Parquet) — reproduzíveis via run_backtest.py
+data/
+
+# Logs
+log.txt
+
+# Configurações locais do Claude Code (permissões específicas da máquina)
+.claude/settings.local.json
