@@ -387,6 +387,110 @@ def buscar_ticks_periodo(ticker: str, inicio: datetime, fim: datetime) -> pd.Dat
 
 
 # -----------------------------------------------------------------------------
+# EXECUÇÕES REAIS — reconciliação do Diário de Trade (Fase D)
+# -----------------------------------------------------------------------------
+# A conexão MT5 já usada acima pra candles/ticks é a CONTA REAL do Jesué na
+# BTG Pactual (confirmado em 08/07/2026: mt5.account_info() retorna o login,
+# servidor BancoBTGPactual-PRD, nome do titular) — não é um terminal só de
+# cotação. `mt5.history_deals_get()` expõe os fills reais dessa conta,
+# ticket a ticket, servindo como fonte de verdade pra reconciliar contra o
+# que foi lançado manualmente no diário.
+
+def _extrair_raiz_contrato(simbolo: str) -> str:
+    """WINJ26 -> WIN, WDOK26 -> WDO — reaproveita o mesmo padrão de ticker
+    (contrato-específico) já usado pra detectar o contrato vigente."""
+    m = _PADRAO_TICKER.match(simbolo)
+    return m.group(1) if m else simbolo
+
+
+def _corrigir_mojibake(texto: str | None) -> str | None:
+    """
+    O campo `comment` de `history_deals_get` vem com acentuação quebrada —
+    bytes UTF-8 de verdade, mas Python já decodificou como latin1 antes de
+    chegar aqui (comportamento da própria lib `MetaTrader5`). Reencoda como
+    latin1 e decodifica como UTF-8 pra recuperar o texto original. Se não
+    for esse o caso (string já correta, ou de fato não-UTF-8), devolve o
+    texto original sem alteração — nunca lança exceção nem descarta caractere.
+    """
+    if not texto:
+        return texto
+    try:
+        return texto.encode('latin1').decode('utf-8')
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return texto
+
+
+def buscar_execucoes_periodo(inicio: datetime, fim: datetime) -> pd.DataFrame | None:
+    """
+    Busca os fills reais da conta MT5 conectada no período — equivalente ao
+    que a aba `profitreal` da planilha trazia via export manual do Profit,
+    mas ao vivo e via API. Retorna None se a chamada ao MT5 falhar (conexão
+    fora do ar); DataFrame vazio (não None) se a chamada funcionou mas não
+    houve fills no período — situação normal, não é erro.
+    """
+    deals = mt5.history_deals_get(inicio, fim)
+    if deals is None:
+        return None
+
+    linhas = []
+    for d in deals:
+        if not d.symbol:
+            continue  # sem symbol = operação de saldo/ajuste da conta, não é fill de contrato
+        linhas.append({
+            'ticket': d.ticket,
+            'time': datetime.fromtimestamp(d.time),
+            'symbol': d.symbol,
+            'raiz_contrato': _extrair_raiz_contrato(d.symbol),
+            'tipo': 'compra' if d.type == mt5.DEAL_TYPE_BUY else ('venda' if d.type == mt5.DEAL_TYPE_SELL else 'outro'),
+            'entry': d.entry,  # 0=IN (abertura), 1=OUT (fechamento), 2=INOUT (reversão)
+            'volume': d.volume,
+            'preco': d.price,
+            'profit': d.profit,
+            'position_id': d.position_id,
+            'comment': _corrigir_mojibake(d.comment),
+        })
+    return pd.DataFrame(linhas)
+
+
+def agrupar_posicoes(df_deals: pd.DataFrame) -> pd.DataFrame:
+    """
+    Uma linha por round-trip (`position_id`) a partir dos fills individuais
+    de `buscar_execucoes_periodo`: direção e preço de entrada vêm da(s)
+    perna(s) IN, preço de saída e profit líquido vêm da(s) perna(s) OUT.
+    Posições sem perna IN visível na janela pesquisada (aberta antes do
+    período) são descartadas — não dá pra reconciliar sem o preço de entrada.
+    """
+    colunas = ['position_id', 'raiz_contrato', 'tipo', 'preco_entrada', 'preco_saida',
+               'datetime_entrada', 'datetime_saida', 'volume', 'profit_total',
+               'tickets_entrada', 'tickets_saida']
+    if df_deals.empty:
+        return pd.DataFrame(columns=colunas)
+
+    linhas = []
+    for position_id, grupo in df_deals.groupby('position_id'):
+        pernas_in = grupo[grupo['entry'] == 0]
+        pernas_out = grupo[grupo['entry'].isin([1, 2])]
+        if pernas_in.empty:
+            continue
+
+        primeira_in = pernas_in.iloc[0]
+        linhas.append({
+            'position_id': position_id,
+            'raiz_contrato': primeira_in['raiz_contrato'],
+            'tipo': primeira_in['tipo'],
+            'preco_entrada': primeira_in['preco'],
+            'preco_saida': pernas_out.iloc[-1]['preco'] if not pernas_out.empty else None,
+            'datetime_entrada': primeira_in['time'],
+            'datetime_saida': pernas_out.iloc[-1]['time'] if not pernas_out.empty else None,
+            'volume': primeira_in['volume'],
+            'profit_total': float(pernas_out['profit'].sum()) if not pernas_out.empty else 0.0,
+            'tickets_entrada': list(pernas_in['ticket']),
+            'tickets_saida': list(pernas_out['ticket']),
+        })
+    return pd.DataFrame(linhas, columns=colunas)
+
+
+# -----------------------------------------------------------------------------
 # TESTE STANDALONE
 # -----------------------------------------------------------------------------
 
