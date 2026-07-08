@@ -67,8 +67,10 @@ ação manual.
 | `persistencia.py` | **Única** porta de entrada/saída em disco (Parquet). Nunca ler/escrever Parquet fora daqui. |
 | `features.py` | O motor de cálculo — transforma candles crus num vetor grande de features de price action. Ver seção dedicada abaixo. |
 | `run_backtest.py` | Ponto de entrada CLI único do motor de dados: `--setup`, `--atualizar`, `--features` (só recalcula features sem buscar dado novo). |
-| `dashboard.py` | Ponto de entrada visual (`python dashboard.py`, abre em `localhost:8050`). App Dash com callbacks ao vivo (1s) e incrementais (30s). Ver seção dedicada abaixo. |
-| `ai_analyst.py` | Mentor IA via Google Gemini, integrado ao chat do dashboard. |
+| `dashboard.py` | Ponto de entrada visual clássico (`python dashboard.py`, abre em `localhost:8050`), dark mode "cockpit financeiro". App Dash com callbacks ao vivo (1s) e incrementais (30s). Ver seção dedicada abaixo. |
+| `dashboard_98.py` | Segundo front-end — **Super Quant '98**, visual Windows 98 completo (`python dashboard_98.py`, abre em `localhost:8051`). Roda em paralelo ao clássico, compartilhando toda a lógica de dados via `metricas.py` e os módulos abaixo. Ver `MAPA_ESTRUTURA_SQ98.md` para a arquitetura própria (sistema de design, janelas, Clippy). |
+| `metricas.py` | `extrair_metricas(df)` — extração de métricas do snapshot, compartilhada pelos dois front-ends (extraído do `dashboard.py` original pra eliminar duplicação). |
+| `ai_analyst.py` | Mentor IA via Google Gemini, integrado ao chat de ambos os dashboards. |
 | `calendario_economico.py` | Janelas de notícia de alto impacto (Copom/FOMC/NFP) — dados estáticos com fonte citada, sem chamada de rede. Ver `CHANGELOG.md` 2026-07-04. |
 | `extrator_mt5.py` | Script utilitário standalone para explorar símbolos/dados via MT5 (não faz parte do pipeline principal). |
 
@@ -99,6 +101,8 @@ histórico de "por que isso é assim", não para rodar de novo sem revisar.
 | `spec_suporte_resistencia_forte.md` | Doutrina de price action puro (fonte normativa dos critérios de S/R forte, bipolaridade, confluência) — trazida pelo Jesué, guia decisões de design do motor de S/R. |
 | `CHANGELOG.md` | Log cronológico de mudanças e decisões (o "porquê"), não um log de commits. |
 | `MAPA_ESTRUTURA.md` | Este arquivo. |
+| `MAPA_ESTRUTURA_SQ98.md` | Mesma ideia deste arquivo, mas pro front-end Windows 98 (`dashboard_98.py`) — arquitetura, sistema de design, Clippy, mecânica de janela. |
+| `CHANGELOG_SQ98.md` | Changelog de UX do front-end Windows 98 — separado deste porque cobre só decisão/correção visual, não pipeline de dados. |
 | `diario.xlsm` | Diário de trade real do Jesué (109 operações, 14/04–01/07/2026), com print anotado por operação via rich-value do Excel. Fonte valiosa de calibração empírica — ver `CHANGELOG.md` de 2026-07-02 pra técnica de extração das imagens. Candidato a virar o módulo "Estudos" (ver plano de S/R, seção "Fases futuras"). |
 
 ---
