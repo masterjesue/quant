@@ -438,14 +438,28 @@ def _clusterizar_pivos_sr(df: pd.DataFrame, tolerancia_pts: float = None) -> dic
 
 
 def _rankear_niveis_sr(closes, atrs, centros, toques, primeiro_idx, zona_min, zona_max,
-                        validade_idx, idx_violacao_alta, idx_violacao_baixa, N):
+                        validade_idx, idx_violacao_alta, idx_violacao_baixa, membros_conf, N):
     """
-    Para cada candle, seleciona os N clusters mais próximos acima/abaixo do
-    preço (dentre os já válidos em validade_idx < i — sem lookahead) e monta
-    as colunas escalares por rank (preço/toques/idade/violado/forte/dist_atr/
-    zona_min/zona_max). Compartilhado por calcular_sr (ranking inicial, só
-    com os clusters "reais") e calcular_zonas_sr (re-ranking depois de
-    incluir zonas espelho confirmadas por bipolaridade — ver B.6 do plano).
+    Para cada candle, seleciona os N clusters de maior RELEVÂNCIA acima/abaixo
+    do preço (dentre os já válidos em validade_idx < i — sem lookahead) e
+    monta as colunas escalares por rank (preço/toques/idade/violado/forte/
+    dist_atr/zona_min/zona_max). Compartilhado por calcular_sr (ranking
+    inicial, só com os clusters "reais") e calcular_zonas_sr (re-ranking
+    depois de incluir zonas espelho confirmadas por bipolaridade — ver B.6
+    do plano).
+
+    Critério de relevância (2026-07-08, substituiu "3 mais próximos" puro —
+    ver nota em config_backtest.py): combina nivel_forte, toques (capado),
+    recência do último toque confirmado ANTES do candle atual (sem
+    lookahead — via searchsorted no índice de toques ordenado
+    cronologicamente, não a ordenação por preço em que membros_conf é
+    armazenado), violação e distância em ATR (agora um fator entre outros,
+    não mais o único critério). Caso real que expôs o problema: dois
+    clusters quase-gêmeos (11 toques cada, mesma idade, ambos parados desde
+    a mesma data) a distâncias diferentes do preço — o mais próximo virava
+    "#1" mesmo sendo idêntico em força ao mais distante, e um nível bem mais
+    forte (22 toques, retestado no candle atual) ficava em #3 só por estar
+    mais longe.
     """
     n = len(closes)
     rank_idx_acima = np.full((n, N), -1, dtype=int)
@@ -454,6 +468,24 @@ def _rankear_niveis_sr(closes, atrs, centros, toques, primeiro_idx, zona_min, zo
     saida = {f'sr_{lado}_{r}{suf}': (np.zeros(n, dtype=bool) if suf in ('_violado', '_forte') else np.full(n, np.nan))
              for lado in lados for r in range(1, N + 1)
              for suf in ('', '_toques', '_idade', '_violado', '_forte', '_dist_atr', '_zona_min', '_zona_max')}
+
+    # Último toque confirmado ATÉ CADA CANDLE (sem lookahead), por cluster —
+    # pré-computado fora do loop principal via searchsorted vetorizado (um
+    # cluster por vez, mas cada chamada resolve os n candles de uma vez em
+    # C, não um loop Python por candle). membros_conf vem ordenado por PREÇO
+    # (ordem de construção do clustering), não por tempo — precisa ordenar
+    # antes de buscar.
+    n_c = len(centros)
+    idx_all = np.arange(n)
+    ultimo_toque = np.full((n_c, n), -1, dtype=np.int64)
+    for k in range(n_c):
+        tk = membros_conf[k]
+        if tk is None or len(tk) == 0:
+            continue
+        tk_sorted = np.sort(np.asarray(tk))
+        pos = np.searchsorted(tk_sorted, idx_all, side='right')
+        valido = pos > 0
+        ultimo_toque[k, valido] = tk_sorted[pos[valido] - 1]
 
     for i in range(n):
         atr = atrs[i]
@@ -466,45 +498,50 @@ def _rankear_niveis_sr(closes, atrs, centros, toques, primeiro_idx, zona_min, zo
         idx_validos = np.where(validos)[0]
         cv = centros[idx_validos]
 
-        mask_ac = cv > preco
-        if mask_ac.any():
-            cand = idx_validos[mask_ac]
-            ordem_prox = np.argsort(cv[mask_ac] - preco)[:N]
-            for rank, pos in enumerate(ordem_prox):
-                k = cand[pos]
-                idade = i - primeiro_idx[k]
-                viol = idx_violacao_alta[k] != -1 and idx_violacao_alta[k] < i
-                forte = (idade >= cfg.IDADE_MINIMA_NIVEL_FORTE) and (toques[k] >= cfg.TOQUES_MINIMOS_NIVEL_FORTE) and (not viol)
-                pref = f'sr_acima_{rank+1}'
-                saida[pref][i] = centros[k]
-                saida[f'{pref}_toques'][i] = toques[k]
-                saida[f'{pref}_idade'][i] = idade
-                saida[f'{pref}_violado'][i] = viol
-                saida[f'{pref}_forte'][i] = forte
-                saida[f'{pref}_dist_atr'][i] = round((centros[k] - preco) / atr, 2)
-                saida[f'{pref}_zona_min'][i] = zona_min[k]
-                saida[f'{pref}_zona_max'][i] = zona_max[k]
-                rank_idx_acima[i, rank] = k
+        for lado_acima in (True, False):
+            mask = (cv > preco) if lado_acima else (cv <= preco)
+            if not mask.any():
+                continue
+            cand = idx_validos[mask]
+            dist_pts = (cv[mask] - preco) if lado_acima else (preco - cv[mask])
+            dist_atr_arr = dist_pts / atr
 
-        mask_ab = cv <= preco
-        if mask_ab.any():
-            cand = idx_validos[mask_ab]
-            ordem_prox = np.argsort(preco - cv[mask_ab])[:N]
-            for rank, pos in enumerate(ordem_prox):
+            idade_arr = i - primeiro_idx[cand]
+            idx_viol = idx_violacao_alta if lado_acima else idx_violacao_baixa
+            viol_arr = (idx_viol[cand] != -1) & (idx_viol[cand] < i)
+            forte_arr = (idade_arr >= cfg.IDADE_MINIMA_NIVEL_FORTE) & (toques[cand] >= cfg.TOQUES_MINIMOS_NIVEL_FORTE) & (~viol_arr)
+
+            ultimo_toque_arr = ultimo_toque[cand, i]
+            candles_desde_toque = np.where(ultimo_toque_arr >= 0, i - ultimo_toque_arr,
+                                            cfg.JANELA_RECENCIA_RELEVANCIA_CANDLES)
+            recencia_arr = np.clip(1 - candles_desde_toque / cfg.JANELA_RECENCIA_RELEVANCIA_CANDLES, 0, 1)
+
+            toques_norm = np.minimum(toques[cand], cfg.TETO_TOQUES_RELEVANCIA) / cfg.TETO_TOQUES_RELEVANCIA
+            dist_norm = np.minimum(dist_atr_arr / cfg.DIST_ATR_SATURACAO_RELEVANCIA, 1.0)
+
+            relevancia = (cfg.PESO_FORTE_RELEVANCIA * forte_arr
+                          + cfg.PESO_TOQUES_RELEVANCIA * toques_norm
+                          + cfg.PESO_RECENCIA_RELEVANCIA * recencia_arr
+                          - cfg.PENALIDADE_VIOLADO_RELEVANCIA * viol_arr
+                          - cfg.PESO_DISTANCIA_RELEVANCIA * dist_norm)
+
+            ordem_rel = np.argsort(-relevancia)[:N]
+            lado_nome = 'acima' if lado_acima else 'abaixo'
+            for rank, pos in enumerate(ordem_rel):
                 k = cand[pos]
-                idade = i - primeiro_idx[k]
-                viol = idx_violacao_baixa[k] != -1 and idx_violacao_baixa[k] < i
-                forte = (idade >= cfg.IDADE_MINIMA_NIVEL_FORTE) and (toques[k] >= cfg.TOQUES_MINIMOS_NIVEL_FORTE) and (not viol)
-                pref = f'sr_abaixo_{rank+1}'
+                pref = f'sr_{lado_nome}_{rank+1}'
                 saida[pref][i] = centros[k]
                 saida[f'{pref}_toques'][i] = toques[k]
-                saida[f'{pref}_idade'][i] = idade
-                saida[f'{pref}_violado'][i] = viol
-                saida[f'{pref}_forte'][i] = forte
-                saida[f'{pref}_dist_atr'][i] = round((preco - centros[k]) / atr, 2)
+                saida[f'{pref}_idade'][i] = idade_arr[pos]
+                saida[f'{pref}_violado'][i] = bool(viol_arr[pos])
+                saida[f'{pref}_forte'][i] = bool(forte_arr[pos])
+                saida[f'{pref}_dist_atr'][i] = round(float(dist_atr_arr[pos]), 2)
                 saida[f'{pref}_zona_min'][i] = zona_min[k]
                 saida[f'{pref}_zona_max'][i] = zona_max[k]
-                rank_idx_abaixo[i, rank] = k
+                if lado_acima:
+                    rank_idx_acima[i, rank] = k
+                else:
+                    rank_idx_abaixo[i, rank] = k
 
     return rank_idx_acima, rank_idx_abaixo, saida
 
@@ -563,7 +600,7 @@ def calcular_sr(df: pd.DataFrame, tolerancia_pts: float = None) -> pd.DataFrame:
     rank_idx_acima, rank_idx_abaixo, saida = _rankear_niveis_sr(
         closes, atrs, clusters['centros'], clusters['toques'], clusters['primeiro_idx'],
         clusters['zona_min'], clusters['zona_max'], clusters['validade_idx'],
-        clusters['idx_violacao_alta'], clusters['idx_violacao_baixa'], N)
+        clusters['idx_violacao_alta'], clusters['idx_violacao_baixa'], clusters['membros_conf'], N)
 
     for col, arr in saida.items():
         df[col] = arr
@@ -581,20 +618,33 @@ def calcular_sr(df: pd.DataFrame, tolerancia_pts: float = None) -> pd.DataFrame:
     return df
 
 
-def _peso_toque(n_ordem: int, volume_relativo: float | None) -> float:
+def _peso_toque(n_ordem: int, volume_relativo: float | None, forte: bool = True) -> float:
     """
     Peso de força de um toque — sobe até o pico (TOQUES_PICO_FORCA) e CAI
     depois (liquidez consumida, spec 2.3), a menos que o volume desse toque
     seja excepcional (REFORCO_VOLUME_MAX atenua a penalidade, nunca a anula).
     Nunca satura tipo decay^n (que só decresce desde o 1º toque) — precisa
     ter formato de pico e queda, conforme a doutrina.
+
+    `forte` (2026-07-08): um toque só entra no catálogo se já houve alguma
+    reversão (detectar_pivos exige isso — nunca é "preço passando reto"),
+    mas a CONFIRMAÇÃO dessa reversão varia: `topo_forte`/`fundo_forte` (ct
+    >= 3 candles seguidos confirmando) é mais convincente que um toque
+    "simples" (ct=1-2). Antes os dois pesavam igual no forca_toques_zona —
+    agora um toque fraco (forte=False) tem o peso reduzido por
+    PESO_TOQUE_FRACO_MULTIPLICADOR, nunca zerado (é uma reversão real,
+    só menos sustentada).
     """
     if n_ordem <= cfg.TOQUES_PICO_FORCA:
-        return cfg.PESO_TOQUE_INICIAL + cfg.INCREMENTO_TOQUE_ATE_PICO * (n_ordem - 1)
-    peso_pico = cfg.PESO_TOQUE_INICIAL + cfg.INCREMENTO_TOQUE_ATE_PICO * (cfg.TOQUES_PICO_FORCA - 1)
-    penalidade = cfg.PESO_TOQUE_PENALIDADE_EXCESSO * (n_ordem - cfg.TOQUES_PICO_FORCA)
-    atenuacao = min(cfg.REFORCO_VOLUME_MAX, max(0.0, (volume_relativo or 0.0) - 1.0))
-    return max(cfg.PESO_TOQUE_MINIMO, peso_pico - penalidade * (1 - atenuacao))
+        peso = cfg.PESO_TOQUE_INICIAL + cfg.INCREMENTO_TOQUE_ATE_PICO * (n_ordem - 1)
+    else:
+        peso_pico = cfg.PESO_TOQUE_INICIAL + cfg.INCREMENTO_TOQUE_ATE_PICO * (cfg.TOQUES_PICO_FORCA - 1)
+        penalidade = cfg.PESO_TOQUE_PENALIDADE_EXCESSO * (n_ordem - cfg.TOQUES_PICO_FORCA)
+        atenuacao = min(cfg.REFORCO_VOLUME_MAX, max(0.0, (volume_relativo or 0.0) - 1.0))
+        peso = max(cfg.PESO_TOQUE_MINIMO, peso_pico - penalidade * (1 - atenuacao))
+    if not forte:
+        peso *= cfg.PESO_TOQUE_FRACO_MULTIPLICADOR
+    return peso
 
 
 def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
@@ -668,6 +718,8 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
     corpo = (df['close'] - df['open']).abs().values
     sombra_sup = df['sombra_sup_pct'].values if 'sombra_sup_pct' in df.columns else np.zeros(n)
     sombra_inf = df['sombra_inf_pct'].values if 'sombra_inf_pct' in df.columns else np.zeros(n)
+    topo_forte_arr = df['topo_forte'].values if 'topo_forte' in df.columns else np.ones(n, dtype=bool)
+    fundo_forte_arr = df['fundo_forte'].values if 'fundo_forte' in df.columns else np.ones(n, dtype=bool)
     tem_fluxo_arr = df['fluxo_disponivel'].values if 'fluxo_disponivel' in df.columns else np.zeros(n, dtype=bool)
     delta_arr = pd.to_numeric(df['delta'], errors='coerce').fillna(0).values if 'delta' in df.columns else np.zeros(n)
     vol_c_arr = pd.to_numeric(df['vol_comprador'], errors='coerce').fillna(0).values if 'vol_comprador' in df.columns else np.zeros(n)
@@ -691,10 +743,12 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
         for ordem_n, pos in enumerate(ordem_tempo, start=1):
             oi = origem[pos]
             e_fundo = tipo[pos] == 'fundo'
+            ci = conf[pos]
             rej = sombra_inf[oi] if e_fundo else sombra_sup[oi]
             vol_oi = vol_total_arr[oi] if tem_fluxo_arr[oi] else np.nan
             vol_rel = (vol_oi / vol_media20[oi]) if (not np.isnan(vol_oi) and vol_media20[oi] > 0) else None
-            peso = _peso_toque(ordem_n, vol_rel)
+            forte_toque = bool(fundo_forte_arr[ci] if e_fundo else topo_forte_arr[ci])
+            peso = _peso_toque(ordem_n, vol_rel, forte_toque)
 
             if tem_fluxo_arr[oi] and vol_total_arr[oi] > 0:
                 delta_norm = delta_arr[oi] / vol_total_arr[oi]
@@ -922,7 +976,8 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
             rej = sombra_inf[oi] if tipo_espelho == 'fundo' else sombra_sup[oi]
             vol_oi = vol_total_arr[oi] if tem_fluxo_arr[oi] else np.nan
             vol_rel = (vol_oi / vol_media20[oi]) if (not np.isnan(vol_oi) and vol_media20[oi] > 0) else None
-            peso = _peso_toque(ordem_n, vol_rel)
+            forte_toque = bool(fundo_forte_arr[conf_i] if tipo_espelho == 'fundo' else topo_forte_arr[conf_i])
+            peso = _peso_toque(ordem_n, vol_rel, forte_toque)
             if tem_fluxo_arr[oi] and vol_total_arr[oi] > 0:
                 delta_norm = delta_arr[oi] / vol_total_arr[oi]
                 agr = float(np.clip(delta_norm if tipo_espelho == 'fundo' else -delta_norm, -1, 1))
@@ -937,6 +992,7 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
             impulsos.append(imp)
 
         z['toques'] = len(cand)
+        z['membros_conf'] = cand
         if pesos:
             pesos_arr = np.array(pesos)
             z['forca_toques'] = float(pesos_arr.sum())
@@ -972,6 +1028,7 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
         rejeicao_media_zona_full = np.concatenate([rejeicao_media_zona, [z['rejeicao_media'] for z in novas_zonas]])
         agressao_media_zona_full = np.concatenate([agressao_media_zona, [z['agressao_media'] for z in novas_zonas]])
         impulso_medio_zona_full = np.concatenate([impulso_medio_zona, [z['impulso_medio'] for z in novas_zonas]])
+        membros_conf_full = membros_conf + [z['membros_conf'] for z in novas_zonas]
         for idx_novo, z in enumerate(novas_zonas):
             k_origem, k_novo = z['origem_k'], n_clusters + idx_novo
             zona_espelho_id[k_origem] = k_novo
@@ -987,13 +1044,14 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
         rejeicao_media_zona_full = rejeicao_media_zona
         agressao_media_zona_full = agressao_media_zona
         impulso_medio_zona_full = impulso_medio_zona
+        membros_conf_full = membros_conf
 
     idx_criacao_por_cluster = primeiro_idx  # p/ cálculo de idade do espelho por candle
 
     # --- Re-ranking incluindo zonas espelho (substitui o ranking inicial de calcular_sr) ---
     rank_idx_acima, rank_idx_abaixo, saida_rank = _rankear_niveis_sr(
         closes, atrs, centros, toques, primeiro_idx, zona_min, zona_max,
-        validade_idx, idx_violacao_alta, idx_violacao_baixa, N)
+        validade_idx, idx_violacao_alta, idx_violacao_baixa, membros_conf_full, N)
     for col, arr in saida_rank.items():
         df[col] = arr
     df['sr_acima'] = df['sr_acima_1']
@@ -1050,6 +1108,66 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
     df.attrs['_rank_idx_acima'] = rank_idx_acima
     df.attrs['_rank_idx_abaixo'] = rank_idx_abaixo
     df.attrs['_zonas_sr_status_timeline'] = status_timeline
+    return df
+
+
+def calcular_pivo_imediato(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Referência tática de curtíssimo prazo — DISTINTA do ranking de zonas
+    fortes (calcular_sr/calcular_zonas_sr). Caso real que motivou (WIN,
+    08/07/2026): o Mentor IA usava só o suporte mais próximo do RANKING
+    (172.362, zona madura mas parada há dias) e ignorava um fundo que tinha
+    acabado de imprimir bem mais perto do preço (172.275, 1º toque, ainda
+    sem reteste) — o nível que Jesué de fato monitora primeiro na leitura
+    gráfica. Um fundo/topo isolado nunca vira cluster "válido" pro ranking
+    até o 2º toque (`validade_idx` em `_clusterizar_pivos_sr`) — essa função
+    preenche exatamente essa lacuna, sem alterar o ranking de zonas fortes:
+    apenas o ÚLTIMO fundo/topo confirmado (ffill causal, sem lookahead —
+    `preco_fundo`/`preco_topo` já são gravados na posição de confirmação),
+    válido enquanto ainda estiver do lado certo do preço (fundo < close,
+    topo > close).
+
+    `_ja_mapeado`: True se esse preço já cai dentro da zona (zona_min-
+    zona_max) de algum dos N_NIVEIS_SR já rankeados do mesmo lado — nesse
+    caso é redundante exibir separadamente (já aparece no card da zona
+    forte). Roda DEPOIS de calcular_zonas_sr (precisa das zonas já
+    rankeadas para essa checagem).
+    """
+    df = df.copy()
+    n = len(df)
+    N = cfg.N_NIVEIS_SR
+    idx_arr = np.arange(n)
+    closes = df['close'].values
+
+    fundo_preco = df['preco_fundo'].where(df['fundo_simples']).ffill().values
+    fundo_idx = pd.Series(np.where(df['fundo_simples'].values, idx_arr, np.nan)).ffill().values
+    topo_preco = df['preco_topo'].where(df['topo_simples']).ffill().values
+    topo_idx = pd.Series(np.where(df['topo_simples'].values, idx_arr, np.nan)).ffill().values
+
+    abaixo_valido = ~np.isnan(fundo_preco) & (fundo_preco < closes)
+    acima_valido = ~np.isnan(topo_preco) & (topo_preco > closes)
+
+    df['pivo_imediato_abaixo'] = np.where(abaixo_valido, fundo_preco, np.nan)
+    df['pivo_imediato_abaixo_idade'] = np.where(abaixo_valido, idx_arr - fundo_idx, np.nan)
+    df['pivo_imediato_acima'] = np.where(acima_valido, topo_preco, np.nan)
+    df['pivo_imediato_acima_idade'] = np.where(acima_valido, idx_arr - topo_idx, np.nan)
+
+    ja_mapeado_abaixo = np.zeros(n, dtype=bool)
+    ja_mapeado_acima = np.zeros(n, dtype=bool)
+    for r in range(1, N + 1):
+        zmin = df.get(f'sr_abaixo_{r}_zona_min')
+        zmax = df.get(f'sr_abaixo_{r}_zona_max')
+        if zmin is not None:
+            dentro = (df['pivo_imediato_abaixo'] >= zmin) & (df['pivo_imediato_abaixo'] <= zmax)
+            ja_mapeado_abaixo |= dentro.fillna(False).values
+        zmin_a = df.get(f'sr_acima_{r}_zona_min')
+        zmax_a = df.get(f'sr_acima_{r}_zona_max')
+        if zmin_a is not None:
+            dentro_a = (df['pivo_imediato_acima'] >= zmin_a) & (df['pivo_imediato_acima'] <= zmax_a)
+            ja_mapeado_acima |= dentro_a.fillna(False).values
+    df['pivo_imediato_abaixo_ja_mapeado'] = ja_mapeado_abaixo
+    df['pivo_imediato_acima_ja_mapeado'] = ja_mapeado_acima
+
     return df
 
 
@@ -1352,6 +1470,7 @@ def calcular_todos_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFr
         ("Tendência e fase",            calcular_tendencia),
         ("S/R por clustering",          calcular_sr),
         ("Zonas S/R e bipolaridade",    calcular_zonas_sr),
+        ("Pivô imediato (tático)",      calcular_pivo_imediato),
         ("Build-up e double pressure",  calcular_buildup_e_double_pressure),
         ("Temporal",                    calcular_temporal),
         ("Fluxo agregado",              calcular_fluxo_agregado),
