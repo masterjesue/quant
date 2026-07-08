@@ -1,8 +1,5 @@
 /* Feedback visual dos botões WIN/WDO/WIN×WDO — antes o clique era "seco"
-   (sem hover, sem estado pressionado). Ver CHANGELOG.md 2026-07-04.
-   NOTA: essas regras (.btn-ativo) ainda são usadas pelo tema antigo — serão
-   substituídas por .win98-btn quando os botões de ativo forem reskinados
-   (fase "Cabeçalho + botões de ativo" do reskin Windows 98). */
+   (sem hover, sem estado pressionado). Ver CHANGELOG.md 2026-07-04. */
 .btn-ativo:hover {
     filter: brightness(1.15);
 }
@@ -21,64 +18,47 @@
     100% { opacity: 1; }
 }
 
-/* =========================================================================
-   TEMA WINDOWS 98 — fundação (ver estilo_win98.py para os tokens/bevels
-   usados em style= inline; aqui só o que precisa de :active/:hover/:before,
-   scrollbar e @font-face, que não dá pra fazer em dict Python).
-   ========================================================================= */
-
-@font-face {
-    font-family: 'Pixelated MS Sans Serif';
-    src: url('fonts/ms_sans_serif.woff2') format('woff2');
-    font-weight: normal;
-    font-style: normal;
-    font-display: swap;
+/* Seletor de modelo do Mentor IA (2026-07-08) — dcc.Dropdown no Dash 4.3
+   NÃO é mais o react-select clássico (.Select-control etc. não existem
+   mais) — é um componente próprio sobre Radix UI (classes .dash-dropdown-*
+   conferidas em dash/dcc/async-dropdown.js). Duas tentativas anteriores
+   com nomes de classe específicos não pegaram (provavelmente estrutura
+   interna diferente do esperado) — universal `#chat-modelo *` é a versão
+   à prova de adivinhação errada: pega QUALQUER elemento dentro do
+   controle fechado, não importa a classe exata.
+   A LISTA ABERTA de opções pode renderizar fora da árvore de #chat-modelo
+   (padrão comum de portal em componentes Radix, pra escapar overflow/
+   z-index do pai) — por isso essas regras não são escopadas pelo id. Só
+   existe 1 dropdown na página hoje, sem risco de colidir com outro. */
+#chat-modelo, #chat-modelo * {
+    background-color: #0A0A0F !important;
+    color: #8888AA !important;
+    border-color: #1C1C28 !important;
+    font-size: 10px !important;
 }
-@font-face {
-    font-family: 'Pixelated MS Sans Serif';
-    src: url('fonts/ms_sans_serif_bold.woff2') format('woff2');
-    font-weight: bold;
-    font-style: normal;
-    font-display: swap;
+#chat-modelo {
+    border-radius: 6px;
+    min-height: unset !important;
 }
-
-/* fonte bitmap não deve ser suavizada — perde o efeito pixelado */
-body, button, input, select, textarea {
-    -webkit-font-smoothing: none;
+#chat-modelo *:focus, #chat-modelo *:focus-visible {
+    outline: none !important; box-shadow: none !important;
 }
-
-html, body {
-    background: #008080; /* teal do desktop nas bordas/gutters */
+.dash-dropdown-value-item {
+    overflow: hidden !important; text-overflow: ellipsis !important;
+    white-space: nowrap !important; max-width: 180px !important;
+    display: inline-block !important;
 }
-
-/* Botão Win98 pressionado ao clique — inverte o bevel (raised -> sunken).
-   Precisa ser :active porque style inline não tem pseudo-classe. */
-.win98-btn:active {
-    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
-                inset -2px -2px #DFDFDF, inset 2px 2px #808080 !important;
+.dash-dropdown-content {
+    background-color: #12121A !important;
+    border: 1px solid #1C1C28 !important;
+    color: #E8E8F0 !important;
+    z-index: 2000 !important;
 }
-.win98-btn:focus-visible {
-    outline: 1px dotted #000000;
-    outline-offset: -4px;
+.dash-dropdown-option {
+    background-color: #12121A !important; color: #E8E8F0 !important; font-size: 10px !important;
 }
-
-/* Scrollbar clássica cinza com bevel (Chromium/Edge — navegador padrão
-   ao abrir o Dash local) */
-::-webkit-scrollbar {
-    width: 16px;
-    height: 17px;
-}
-::-webkit-scrollbar-track {
-    background: #C0C0C0;
-}
-::-webkit-scrollbar-thumb,
-::-webkit-scrollbar-button {
-    background: #C0C0C0;
-    box-shadow: inset -1px -1px #000000, inset 1px 1px #FFFFFF,
-                inset -2px -2px #808080, inset 2px 2px #DFDFDF;
-}
-
-/* Cursor de ampulheta durante atualização — charme de época */
-.carregando, .carregando * {
-    cursor: wait !important;
+.dash-dropdown-option:hover,
+.dash-dropdown-option[data-highlighted],
+.dash-dropdown-option[aria-selected="true"] {
+    background-color: #1C1C28 !important; color: #C8A96E !important;
 }

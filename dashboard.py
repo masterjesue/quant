@@ -9,11 +9,14 @@
 # =============================================================================
 
 import sys
+import base64
+import re
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import dash
 from dash import dcc, html, Input, Output, State, callback_context, no_update
+import flask
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
@@ -27,6 +30,8 @@ import persistencia
 import run_backtest
 import mt5_loader
 import calendario_economico as cal_eco
+import ai_analyst
+import diario_trade as dt
 
 # Flag: MT5 disponível
 try:
@@ -36,13 +41,27 @@ except ImportError:
     MT5_OK = False
 
 # =============================================================================
-# PALETA E TOKENS — tema Windows 98 (ver estilo_win98.py)
+# PALETA E TOKENS
 # =============================================================================
 
-from estilo_win98 import (
-    C, FONTS, win98_raised, win98_sunken, win98_button, win98_field,
-    win98_titlebar, win98_window, win98_groupbox, texto_sobre,
-)
+C = {
+    'bg':        '#0A0A0F',
+    'panel':     '#12121A',
+    'border':    '#1C1C28',
+    'gold':      '#C8A96E',
+    'green':     '#2ECC8A',
+    'red':       '#E05C5C',
+    'text':      '#E8E8F0',
+    'text2':     '#8888AA',
+    'blue':      '#4A90D9',
+    'yellow':    '#F0C040',
+}
+
+FONTS = {
+    'display': 'Space Grotesk, system-ui, sans-serif',
+    'mono':    'JetBrains Mono, monospace',
+    'body':    'Inter, system-ui, sans-serif',
+}
 
 # =============================================================================
 # ESTADO GLOBAL
@@ -78,28 +97,40 @@ def carregar_bases():
                 with lock:
                     estado['bases'][ativo] = df
 
-        # Atualização incremental em background (busca candles novos)
+        # Atualização incremental em background (busca candles novos).
+        # Trava entre PROCESSOS (não só threads) — dashboard.py e
+        # dashboard_98.py rodam em paralelo, cada um seu próprio processo,
+        # e escrever o mesmo Parquet ao mesmo tempo dos dois já corrompeu
+        # WIN_candles.parquet de verdade (2026-07-08). Se outro processo já
+        # estiver atualizando, pula este ciclo — os dados já carregados
+        # (linhas acima) continuam servindo, só ficam sem os candles mais
+        # recentes por até 30s (o próximo ciclo tenta de novo).
         if MT5_OK:
-            try:
-                mt5_loader.conectar()
-                for ativo in cfg.ATIVOS:
-                    if persistencia.base_existe(ativo):
-                        df_novo = run_backtest.atualizar_incremental_silencioso(ativo)
-                        if df_novo is not None:
-                            with lock:
-                                estado['bases'][ativo] = df_novo
+            with persistencia.lock_atualizacao() as adquiriu_lock:
+                if not adquiriu_lock:
+                    with lock:
+                        estado['erro'] = None
+                else:
+                    try:
+                        mt5_loader.conectar()
+                        for ativo in cfg.ATIVOS:
+                            if persistencia.base_existe(ativo):
+                                df_novo = run_backtest.atualizar_incremental_silencioso(ativo)
+                                if df_novo is not None:
+                                    with lock:
+                                        estado['bases'][ativo] = df_novo
 
-                # Detecta contratos vigentes para exibição no status
-                with lock:
-                    t = mt5_loader.detectar_contrato_mais_recente('WIN')
-                    w = mt5_loader.detectar_contrato_mais_recente('WDO')
-                    estado['contrato_win'] = t or '—'
-                    estado['contrato_wdo'] = w or '—'
+                        # Detecta contratos vigentes para exibição no status
+                        with lock:
+                            t = mt5_loader.detectar_contrato_mais_recente('WIN')
+                            w = mt5_loader.detectar_contrato_mais_recente('WDO')
+                            estado['contrato_win'] = t or '—'
+                            estado['contrato_wdo'] = w or '—'
 
-                mt5_loader.desconectar()
-            except Exception as e:
-                with lock:
-                    estado['erro'] = f"MT5: {str(e)[:60]}"
+                        mt5_loader.desconectar()
+                    except Exception as e:
+                        with lock:
+                            estado['erro'] = f"MT5: {str(e)[:60]}"
 
     except Exception as e:
         with lock:
@@ -356,178 +387,10 @@ def secao(titulo: str, cor_titulo: str = None) -> html.Div:
 
 
 # =============================================================================
-# MÉTRICAS CALCULADAS A PARTIR DA BASE
+# MÉTRICAS CALCULADAS A PARTIR DA BASE (compartilhado — ver metricas.py)
 # =============================================================================
 
-def extrair_metricas(df: pd.DataFrame, n_snapshot: int = 500) -> dict:
-    """
-    Extrai métricas do snapshot atual (últimos 500 candles).
-
-    JANELAS EXPLÍCITAS — cada métrica usa a mesma janela ou declara a sua:
-      - Fluxo (delta, razão de agressão): últimos 20 candles COM fluxo disponível
-        (mesma janela para as duas métricas — elimina a contradição anterior)
-      - Tendência/fase/saúde: último candle do snapshot (já é resultado de janela longa)
-      - Amplitude do dia: só os candles do dia atual
-      - Build-up/double pressure: último candle (já é resultado de janela de 8 candles)
-    """
-    if df is None or df.empty:
-        return {}
-
-    snap = df.tail(n_snapshot).copy().reset_index(drop=True)
-    ultimo = snap.iloc[-1]
-    hoje = snap[snap['datetime'].dt.date == pd.Timestamp.now().date()]
-
-    m = {}
-    JANELA_FLUXO = 20  # candles com fluxo — mesma janela para delta E razão de agressão
-
-    def _safe_int(v, default=0):
-        try:
-            f = float(v)
-            return default if (f != f) else int(f)  # f != f detecta nan
-        except (TypeError, ValueError):
-            return default
-
-    def _safe_bool(v, default=False):
-        try:
-            if v is None or v is pd.NA:
-                return default
-            return bool(v)
-        except (TypeError, ValueError):
-            return default
-
-    # Preço atual
-    m['preco'] = ultimo['close']
-
-    # Tendência
-    m['tendencia'] = ultimo.get('estado_tendencia', '—')
-    m['fase']      = ultimo.get('fase_tendencia', '—')
-    m['saude']     = ultimo.get('saude_tendencia', '—')
-    m['tipo_candle'] = ultimo.get('tipo_candle', '—')
-    m['atr'] = ultimo.get('atr', np.nan)
-
-    # Amplitude do dia vs ATR
-    if not hoje.empty and not np.isnan(float(m['atr']) if m['atr'] is not None else np.nan) and m['atr'] > 0:
-        amp_dia = hoje['high'].max() - hoje['low'].min()
-        m['amp_dia'] = amp_dia
-        m['amp_dia_atr'] = round(amp_dia / m['atr'], 2)
-    else:
-        m['amp_dia'] = np.nan
-        m['amp_dia_atr'] = np.nan
-
-    # -------------------------------------------------------------------------
-    # FLUXO — janela única de JANELA_FLUXO candles com dado real
-    # Resolve a contradição anterior: delta e razão de agressão agora olham
-    # exatamente o mesmo período
-    # -------------------------------------------------------------------------
-    tem_fluxo_col = snap.get('fluxo_disponivel', pd.Series([False]*len(snap)))
-    snap_com_fluxo = snap[tem_fluxo_col == True].tail(JANELA_FLUXO)
-
-    if snap_com_fluxo.empty:
-        m['tem_fluxo']       = False
-        m['delta_acum']      = None
-        m['razao_agressao']  = None
-        m['janela_fluxo_n']  = 0
-        m['fluxo_periodo']   = '—'
-    else:
-        delta_col  = pd.to_numeric(snap_com_fluxo['delta'],         errors='coerce')
-        vol_c_col  = pd.to_numeric(snap_com_fluxo.get('vol_comprador', pd.Series([np.nan]*len(snap_com_fluxo))), errors='coerce')
-        vol_v_col  = pd.to_numeric(snap_com_fluxo.get('vol_vendedor',  pd.Series([np.nan]*len(snap_com_fluxo))), errors='coerce')
-
-        delta_total  = delta_col.sum()
-        vol_c_total  = vol_c_col.sum()
-        vol_v_total  = vol_v_col.sum()
-        vol_total    = vol_c_total + vol_v_total
-
-        m['tem_fluxo']      = True
-        m['delta_acum']     = int(delta_total)
-        m['razao_agressao'] = round(vol_c_total / vol_total, 3) if vol_total > 0 else None
-        m['janela_fluxo_n'] = len(snap_com_fluxo)
-
-        # Período coberto pela janela de fluxo
-        dt_ini = snap_com_fluxo['datetime'].iloc[0]
-        dt_fim = snap_com_fluxo['datetime'].iloc[-1]
-        m['fluxo_periodo'] = f"{pd.to_datetime(dt_ini).strftime('%H:%M')}–{pd.to_datetime(dt_fim).strftime('%H:%M')}"
-
-    # S/R — campos escalares legados (alias do rank 1 — ai_analyst.py depende destes)
-    m['sr_acima']            = ultimo.get('sr_acima', np.nan)
-    m['sr_abaixo']           = ultimo.get('sr_abaixo', np.nan)
-    m['dist_sr_acima_atr']   = ultimo.get('dist_sr_acima_atr', np.nan)
-    m['dist_sr_abaixo_atr']  = ultimo.get('dist_sr_abaixo_atr', np.nan)
-    m['qualidade_sr_acima']  = _safe_int(ultimo.get('qualidade_sr_acima', 0))
-    m['qualidade_sr_abaixo'] = _safe_int(ultimo.get('qualidade_sr_abaixo', 0))
-
-    # S/R multi-nível (Fase 1) — até N_NIVEIS_SR níveis de cada lado, ordenados
-    # por proximidade (rank 1 = mais próximo). Degrada graciosamente: se o
-    # parquet ainda não tiver as colunas novas (schema antigo, antes de rodar
-    # `python run_backtest.py --features`), a lista simplesmente fica mais
-    # curta — nunca lança KeyError.
-    def _extrair_niveis(lado: str) -> list:
-        niveis = []
-        for rank in range(1, cfg.N_NIVEIS_SR + 1):
-            pref = f'sr_{lado}_{rank}'
-            preco = ultimo.get(pref, np.nan)
-            if pref not in snap.columns or (isinstance(preco, float) and np.isnan(preco)):
-                continue
-            niveis.append({
-                'rank': rank,
-                'preco': preco,
-                'toques': _safe_int(ultimo.get(f'{pref}_toques', 0)),
-                'idade': _safe_int(ultimo.get(f'{pref}_idade', 0)),
-                'violado': _safe_bool(ultimo.get(f'{pref}_violado', False)),
-                'forte': _safe_bool(ultimo.get(f'{pref}_forte', False)),
-                'dist_atr': ultimo.get(f'{pref}_dist_atr', np.nan),
-                'zona_min': ultimo.get(f'{pref}_zona_min', np.nan),
-                'zona_max': ultimo.get(f'{pref}_zona_max', np.nan),
-                'status': str(ultimo.get(f'{pref}_status', 'ativa')),
-                'rejeicao_media': ultimo.get(f'{pref}_rejeicao_media', np.nan),
-                'agressao_media': ultimo.get(f'{pref}_agressao_media', np.nan),
-                'impulso_medio': ultimo.get(f'{pref}_impulso_medio', np.nan),
-                'forca_toques': ultimo.get(f'{pref}_forca_toques', np.nan),
-                'zona_espelho_id': ultimo.get(f'{pref}_zona_espelho_id', np.nan),
-                'prob_bounce': ultimo.get(f'{pref}_prob_bounce', np.nan),
-                'rompimento_hoje': str(ultimo.get(f'{pref}_rompimento_hoje', 'nenhum')),
-            })
-        return niveis
-
-    m['niveis_sr_acima']  = _extrair_niveis('acima')
-    m['niveis_sr_abaixo'] = _extrair_niveis('abaixo')
-
-    # Build-up
-    m['buildup_ativo']   = _safe_bool(ultimo.get('buildup_ativo', False))
-    m['buildup_duracao'] = _safe_int(ultimo.get('buildup_duracao', 0))
-    m['buildup_pct_atr'] = ultimo.get('buildup_pct_atr', np.nan)
-
-    # Double pressure
-    m['double_pressure'] = _safe_bool(ultimo.get('double_pressure', False))
-    m['dp_streak']       = _safe_int(ultimo.get('dp_streak', 0))
-    m['dp_qualidade']    = str(ultimo.get('dp_qualidade', '—'))
-
-    # -------------------------------------------------------------------------
-    # SCORES para os velocímetros — baseados em métricas da MESMA janela
-    # -------------------------------------------------------------------------
-    score = 0.5
-    if m['tendencia'] == 'alta':   score += 0.15
-    elif m['tendencia'] == 'baixa': score -= 0.15
-    if m['fase'] == 'inicio':       score += 0.05
-    elif m['fase'] == 'exaustao':   score -= 0.10
-    if m['tem_fluxo'] and m['delta_acum'] is not None:
-        if m['delta_acum'] > 0:    score += 0.15
-        elif m['delta_acum'] < 0:  score -= 0.15
-    if m['double_pressure']:
-        dir_c = ultimo.get('direcao_candle', 0)
-        score += 0.05 if dir_c == 1 else -0.05
-    m['score_forca'] = max(0.0, min(1.0, score))
-
-    ctx = 0.5
-    if m['tendencia'] in ('alta', 'baixa') and m['fase'] in ('inicio', 'meio'):
-        ctx += 0.2
-    if m['saude'] == 'forte':  ctx += 0.1
-    elif m['saude'] == 'fraca': ctx -= 0.1
-    if m['buildup_ativo']:     ctx += 0.1
-    if m['dp_qualidade'] in ('alta', 'media'): ctx += 0.1
-    m['score_contexto'] = max(0.0, min(1.0, ctx))
-
-    return m
+from metricas import extrair_metricas
 
 
 # =============================================================================
@@ -599,6 +462,25 @@ def _estilo_botao_ativo(nome: str, ativo_atual: str) -> dict:
             'border': f'1px solid {C["border"]}',
         })
     return base
+
+
+def _estilo_aba(chave: str, aba_ativa: str) -> dict:
+    """Estilo de uma aba do cabeçalho (QUANT LAB/BACKTESTING/DIÁRIO/
+    CONFIGURAÇÕES) dado qual está ativa — mesmo princípio de
+    `_estilo_botao_ativo`: usado no layout estático inicial E no callback
+    `atualizar_estilo_aba_ativa`, o `html.Button` nunca é recriado (a troca
+    de aba do clássico é implementada pela primeira vez neste módulo — até
+    aqui os 4 botões existiam só como decoração, sem callback nenhum)."""
+    ativa = (chave == aba_ativa)
+    return {
+        'background': 'transparent', 'border': 'none',
+        'borderBottom': f'2px solid {C["gold"]}' if ativa else '2px solid transparent',
+        'color': C['text'] if ativa else C['text2'],
+        'padding': '8px 20px', 'cursor': 'pointer',
+        'fontFamily': FONTS['display'], 'fontSize': '12px',
+        'fontWeight': '600' if ativa else '400',
+        'letterSpacing': '0.06em',
+    }
 
 
 def construir_market_view(m: dict) -> html.Div:
@@ -794,11 +676,18 @@ def construir_market_view(m: dict) -> html.Div:
 def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
     """
     Seção Price Action — sem gráfico de candles (Jesué já tem o seu no ProfitPRO).
-    Mostra os N_NIVEIS_SR (default 3) níveis de S/R mais próximos de cada
-    lado — ordenados por PROXIMIDADE (rank 1 = mais próximo, é o próximo a
-    ser testado). Força/status/probabilidade não reordenam, só destacam
-    visualmente qual nível é a "região mais forte" (mais antiga, sem
-    violação por fechamento, 3+ toques — ver nivel_forte em features.py).
+    Mostra os N_NIVEIS_SR (default 3) níveis de S/R de cada lado — ordenados
+    por RELEVÂNCIA (nível forte + toques + recência do último toque, não
+    mais só proximidade — ver _rankear_niveis_sr em features.py, mudado em
+    2026-07-08 depois de um caso real onde o nível mais próximo era uma
+    zona genérica sem repetição real, enquanto um suporte bem mais forte
+    ficava mais abaixo no ranking só por estar mais longe).
+
+    Abaixo dos 3 níveis rankeados, se houver, mostra também o "pivô
+    imediato" (último fundo/topo confirmado, ainda sem reteste — ver
+    calcular_pivo_imediato em features.py): referência tática de curtíssimo
+    prazo que só some quando NÃO está redundante com um dos níveis já
+    rankeados acima.
     """
     preco = m.get('preco', np.nan)
     preco_fmt = _fmt(preco, 0)
@@ -935,6 +824,26 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
             'borderRadius': '10px', 'padding': '14px', 'marginBottom': '10px',
         })
 
+    def _card_pivo_imediato(pivo: dict, eh_resistencia: bool) -> html.Div:
+        """Card discreto (borda tracejada) pro pivô imediato — ver docstring da função pai."""
+        cor = C['red'] if eh_resistencia else C['green']
+        label = 'Topo em formação' if eh_resistencia else 'Fundo em formação'
+        return html.Div([
+            html.Span(f'{label}: ', style={
+                'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+            }),
+            html.Span(_fmt(pivo['preco'], 0), style={
+                'fontSize': '14px', 'fontWeight': '700',
+                'fontFamily': FONTS['mono'], 'color': cor,
+            }),
+            html.Span(f'  · {pivo["idade"]} candles atrás · 1º toque, sem reteste', style={
+                'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+            }),
+        ], style={
+            'background': C['bg'], 'border': f'1px dashed {C["border"]}',
+            'borderRadius': '8px', 'padding': '8px 12px', 'marginBottom': '10px',
+        })
+
     # Bloco de preço atual
     cor_candle = C['green'] if 'alta' in str(m.get('tipo_candle','')) or 'comprador' in str(m.get('tipo_candle','')) else C['red']
     bloco_preco = html.Div([
@@ -998,6 +907,13 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
         ] + [_card_nivel_sr(n, eh_resistencia=False) for n in niveis_abaixo]
     else:
         cards_suporte = [html.Div('Sem suporte identificado.', style={'color': C['text2'], 'fontSize': '12px'})]
+
+    pivo_acima = m.get('pivo_imediato_acima')
+    if pivo_acima:
+        cards_resistencia.append(_card_pivo_imediato(pivo_acima, eh_resistencia=True))
+    pivo_abaixo = m.get('pivo_imediato_abaixo')
+    if pivo_abaixo:
+        cards_suporte.append(_card_pivo_imediato(pivo_abaixo, eh_resistencia=False))
 
     return html.Div([
         secao('PRICE ACTION'),
@@ -1229,6 +1145,364 @@ def construir_big_players(df: pd.DataFrame) -> html.Div:
 
 
 # =============================================================================
+# DIÁRIO DE TRADE — construção da UI (aba "DIÁRIO" do cabeçalho)
+# =============================================================================
+# Fase B do plano (ver `C:\Users\jesue\.claude\plans\t-tulo-super-quant-eager-
+# knuth.md`): mesma janela lógica que o SQ'98 (4 sub-visões: Novo Trade /
+# Histórico / Estatísticas / Reconciliação), mas na linguagem visual do
+# clássico (secao()/card(), sem bevel Win98). Toda a lógica de dados vem de
+# `diario_trade.py` (`dt`) — zero duplicação com o SQ'98, só a construção de
+# HTML é própria de cada front-end. Só "Novo Trade" é funcional nesta fase.
+
+_ABAS_DIARIO_SUB = [
+    ('novo', 'Novo Trade'),
+    ('historico', 'Histórico'),
+    ('estatisticas', 'Estatísticas'),
+    ('reconciliacao', 'Reconciliação'),
+]
+
+
+def _opcoes_diario(valores: list[str]) -> list[dict]:
+    """Converte vocabulário canônico (snake_case) em opções de dropdown legíveis."""
+    return [{'label': v.replace('_', ' ').title(), 'value': v} for v in valores]
+
+
+def _estilo_subaba_diario(chave: str, aba_ativa: str) -> dict:
+    ativa = (chave == aba_ativa)
+    return {
+        'background': C['green'] if ativa else C['panel'],
+        'color': C['bg'] if ativa else C['text2'],
+        'border': f'1px solid {C["border"]}',
+        'padding': '6px 14px', 'borderRadius': '6px', 'cursor': 'pointer',
+        'fontFamily': FONTS['display'], 'fontSize': '12px', 'fontWeight': '600',
+    }
+
+
+def _campo_diario(label, componente) -> html.Div:
+    return html.Div([
+        html.Div(label, style={'fontSize': '10px', 'color': C['text2'],
+                                'marginBottom': '4px', 'fontFamily': FONTS['display']}),
+        componente,
+    ], style={'marginBottom': '10px'})
+
+
+def _bloco_diario(titulo, children) -> html.Div:
+    return html.Div([
+        html.Div(titulo, style={
+            'fontSize': '11px', 'color': C['gold'], 'fontFamily': FONTS['display'],
+            'fontWeight': '600', 'textTransform': 'uppercase', 'letterSpacing': '0.08em',
+            'marginBottom': '10px',
+        }),
+        children,
+    ], style={
+        'background': C['panel'], 'border': f'1px solid {C["border"]}',
+        'borderRadius': '10px', 'padding': '14px 16px', 'marginBottom': '16px',
+    })
+
+
+def _estilo_input_diario(extra=None) -> dict:
+    estilo = {
+        'background': C['bg'], 'border': f'1px solid {C["border"]}',
+        'borderRadius': '6px', 'padding': '6px 10px', 'color': C['text'],
+        'fontFamily': FONTS['body'], 'fontSize': '13px', 'width': '100%',
+        'boxSizing': 'border-box',
+    }
+    if extra:
+        estilo.update(extra)
+    return estilo
+
+
+def _placeholder_aba(nome: str) -> html.Div:
+    return html.Div(f'{nome} — em construção.', style={
+        'padding': '40px', 'textAlign': 'center', 'color': C['text2'],
+        'fontFamily': FONTS['display'], 'fontSize': '13px',
+    })
+
+
+def _construir_diario_novo_trade() -> html.Div:
+    campo = _campo_diario
+    estilo_input = _estilo_input_diario
+    linha = lambda *filhos: html.Div(list(filhos), style={'display': 'flex', 'gap': '16px', 'flexWrap': 'wrap'})
+
+    return html.Div([
+        _bloco_diario('Dados da Operação', html.Div([
+            linha(
+                campo('Data', dcc.Input(id='diario-data', type='date', style=estilo_input({'width': '160px'}))),
+                campo('Ativo', dcc.Dropdown(id='diario-ativo', options=_opcoes_diario(cfg.ATIVOS),
+                                             clearable=False, style={'width': '120px'})),
+                campo('Janela', dcc.Dropdown(id='diario-janela',
+                                              options=_opcoes_diario(list(cfg.JANELAS_PREGAO.keys())),
+                                              style={'width': '170px'})),
+            ),
+            linha(
+                campo('Estratégia', dcc.Dropdown(id='diario-estrategia', multi=True,
+                                                  options=_opcoes_diario(dt.ESTRATEGIA_TAGS_CANONICAS),
+                                                  style={'width': '320px'})),
+                campo('Sala/Análise', dcc.Dropdown(id='diario-sala',
+                                                     options=_opcoes_diario(dt.SALA_ANALISE_CANONICA),
+                                                     style={'width': '190px'})),
+            ),
+            linha(
+                campo('Tipo', dcc.Dropdown(id='diario-tipo-operacao', options=_opcoes_diario(dt.TIPO_OPERACAO),
+                                            clearable=False, style={'width': '110px'})),
+                campo('Alvo (pts)', dcc.Input(id='diario-alvo', type='number', style=estilo_input({'width': '110px'}))),
+                campo('Stop (pts)', dcc.Input(id='diario-stop', type='number', style=estilo_input({'width': '110px'}))),
+                campo('Lote', dcc.Input(id='diario-lote', type='number', value=1, style=estilo_input({'width': '90px'}))),
+            ),
+            linha(
+                campo('Preço Entrada', dcc.Input(id='diario-preco-entrada', type='number', style=estilo_input({'width': '130px'}))),
+                campo('Preço Saída', dcc.Input(id='diario-preco-saida', type='number', style=estilo_input({'width': '130px'}))),
+                campo('Tipo Saída', dcc.Dropdown(id='diario-tipo-saida', options=_opcoes_diario(dt.TIPO_SAIDA),
+                                                  style={'width': '150px'})),
+            ),
+            linha(
+                campo('Resultado (pts)', dcc.Input(id='diario-resultado', type='number', style=estilo_input({'width': '130px'}))),
+                campo('Saldo (R$)', dcc.Input(id='diario-saldo', type='number', style=estilo_input({'width': '130px'}))),
+            ),
+        ])),
+
+        _bloco_diario('Nível de S/R referenciado (opcional)', html.Div([
+            linha(
+                campo('Preço', dcc.Input(id='diario-nivel-sr', type='number', style=estilo_input({'width': '130px'}))),
+                campo('Tipo', dcc.Input(id='diario-nivel-sr-tipo', type='text', placeholder='ex: suporte',
+                                         style=estilo_input({'width': '170px'}))),
+            ),
+        ])),
+
+        _bloco_diario('Anotações', html.Div([
+            campo('Resumo Operacional', dcc.Textarea(id='diario-resumo', rows=3, style=estilo_input({'resize': 'none'}))),
+            campo('Obs (autocoaching)', dcc.Textarea(id='diario-obs', rows=2, style=estilo_input({'resize': 'none'}))),
+            campo('Tags de Setup/Erro', dcc.Dropdown(id='diario-tags-setup-erro', multi=True,
+                                                       options=_opcoes_diario(dt.TAGS_SETUP_ERRO_INICIAIS))),
+        ])),
+
+        _bloco_diario('Print', html.Div([
+            html.Div('Cole (Ctrl+V) um print ou envie um arquivo:', style={
+                'fontSize': '11px', 'color': C['text2'], 'marginBottom': '8px'}),
+            dcc.Upload(
+                id='diario-upload-imagem',
+                children=html.Div('Arraste ou clique pra selecionar um arquivo', style={'fontSize': '12px'}),
+                style={
+                    'background': C['bg'], 'border': f'1px dashed {C["border"]}', 'borderRadius': '8px',
+                    'padding': '16px', 'textAlign': 'center', 'cursor': 'pointer', 'color': C['text2'],
+                },
+            ),
+            dcc.Store(id='store-diario-imagem-colada'),
+            html.Div(id='diario-preview-imagem', style={'marginTop': '10px'}),
+        ])),
+
+        html.Div([
+            html.Button('Salvar Operação', id='btn-diario-salvar', n_clicks=0, style={
+                'background': C['green'], 'color': C['bg'], 'border': 'none', 'borderRadius': '6px',
+                'padding': '8px 20px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
+                'fontWeight': '700', 'fontSize': '12px',
+            }),
+            html.Button('Limpar', id='btn-diario-limpar', n_clicks=0, style={
+                'background': 'transparent', 'color': C['text2'], 'border': f'1px solid {C["border"]}',
+                'borderRadius': '6px', 'padding': '8px 20px', 'cursor': 'pointer', 'marginLeft': '10px',
+                'fontFamily': FONTS['display'], 'fontSize': '12px',
+            }),
+        ], style={'marginTop': '6px'}),
+        html.Div(id='diario-status', style={
+            'marginTop': '10px', 'fontSize': '12px', 'fontFamily': FONTS['mono'], 'color': C['text2'],
+        }),
+    ])
+
+
+def _td_diario(conteudo, extra=None) -> html.Td:
+    estilo = {'padding': '6px 10px', 'fontSize': '12px', 'fontFamily': FONTS['mono'],
+              'borderBottom': f'1px solid {C["border"]}'}
+    if extra:
+        estilo.update(extra)
+    return html.Td(conteudo, style=estilo)
+
+
+def _linha_historico(trade: pd.Series) -> html.Tr:
+    tags = trade['estrategia_tags']
+    tags_str = ', '.join(tags) if hasattr(tags, '__iter__') else ''
+    saldo = trade['saldo_operacao_reais']
+    saldo_num = float(saldo) if pd.notna(saldo) else 0.0
+    cor_saldo = C['green'] if saldo_num > 0 else (C['red'] if saldo_num < 0 else C['text2'])
+    thumb = (
+        html.Img(src=f"/diario-imagens/{trade['imagem_arquivo']}", style={
+            'width': '56px', 'height': '36px', 'objectFit': 'cover', 'borderRadius': '4px',
+            'border': f'1px solid {C["border"]}',
+        }) if trade.get('imagem_arquivo') else html.Span('—', style={'color': C['text2']})
+    )
+    return html.Tr([
+        _td_diario(str(trade['data_op'])),
+        _td_diario(trade['ativo']),
+        _td_diario(trade.get('janela_pregao') or '—'),
+        _td_diario(tags_str or '—'),
+        _td_diario(trade.get('tipo_operacao') or '—'),
+        _td_diario(f"{trade['resultado_pontos']:+.0f}" if pd.notna(trade['resultado_pontos']) else '—'),
+        _td_diario(f"R$ {saldo_num:+.2f}" if pd.notna(saldo) else '—',
+                   extra={'color': cor_saldo, 'fontWeight': '700'}),
+        _td_diario(thumb),
+    ])
+
+
+def _construir_diario_historico() -> html.Div:
+    return html.Div([
+        html.Div([
+            dcc.Dropdown(id='diario-hist-ativo', options=_opcoes_diario(cfg.ATIVOS),
+                         placeholder='Ativo', style={'width': '140px'}),
+            dcc.Dropdown(id='diario-hist-janela', options=_opcoes_diario(list(cfg.JANELAS_PREGAO.keys())),
+                         placeholder='Janela', style={'width': '170px'}),
+            dcc.Dropdown(id='diario-hist-estrategia', options=_opcoes_diario(dt.ESTRATEGIA_TAGS_CANONICAS),
+                         placeholder='Estratégia', style={'width': '200px'}),
+        ], style={'display': 'flex', 'gap': '10px', 'marginBottom': '14px', 'flexWrap': 'wrap'}),
+        html.Div(id='diario-historico-tabela'),
+    ])
+
+
+def _card_estatistica(titulo: str, valor: str, cor=None) -> html.Div:
+    return html.Div([
+        html.Div(titulo, style={'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                                 'textTransform': 'uppercase', 'letterSpacing': '0.06em', 'marginBottom': '5px'}),
+        html.Div(valor, style={'fontSize': '17px', 'fontWeight': '700', 'fontFamily': FONTS['mono'],
+                                'color': cor or C['text']}),
+    ], style={'background': C['bg'], 'border': f'1px solid {C["border"]}', 'borderRadius': '8px',
+              'padding': '10px 14px', 'minWidth': '120px'})
+
+
+def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
+    linhas = [
+        html.Div([
+            html.Span(chave.replace('_', ' ').title(), style={'flex': '1', 'fontSize': '12px'}),
+            html.Span(str(v['n']), style={'width': '34px', 'textAlign': 'right', 'fontSize': '12px',
+                                           'fontFamily': FONTS['mono']}),
+            html.Span(f"R$ {v['saldo']:+.0f}", style={
+                'width': '90px', 'textAlign': 'right', 'fontSize': '12px', 'fontFamily': FONTS['mono'],
+                'color': C['green'] if v['saldo'] > 0 else (C['red'] if v['saldo'] < 0 else C['text2']),
+            }),
+        ], style={'display': 'flex', 'padding': '4px 0', 'borderBottom': f'1px solid {C["border"]}'})
+        for chave, v in dados.items()
+    ] or [html.Div('Sem dados.', style={'fontSize': '12px', 'color': C['text2']})]
+    return _bloco_diario(titulo, html.Div(linhas))
+
+
+def _grafico_evolucao_saldo(stats: dict) -> go.Figure:
+    fig = go.Figure()
+    if stats['evolucao_data']:
+        fig.add_trace(go.Scatter(
+            x=stats['evolucao_data'], y=stats['evolucao_saldo_acumulado'],
+            mode='lines', line=dict(color=C['gold'], width=2),
+            fill='tozeroy', fillcolor='rgba(200,169,110,0.08)',
+        ))
+    fig.update_layout(
+        paper_bgcolor=C['panel'], plot_bgcolor=C['bg'],
+        font=dict(family=FONTS['mono'], color=C['text2'], size=10),
+        margin=dict(l=45, r=10, t=10, b=30), height=200,
+        xaxis=dict(showgrid=False, gridcolor=C['border']),
+        yaxis=dict(gridcolor=C['border'], gridwidth=0.5, title='R$ acumulado'),
+    )
+    return fig
+
+
+def _construir_diario_estatisticas(stats: dict) -> html.Div:
+    if stats['num_operacoes'] == 0:
+        return _placeholder_aba('Estatísticas (nenhum trade real lançado ainda)')
+
+    payoff_str = f"{stats['payoff']:.2f}" if stats['payoff'] is not None else '—'
+    return html.Div([
+        html.Div([
+            _card_estatistica('Operações', str(stats['num_operacoes'])),
+            _card_estatistica('Saldo Total', f"R$ {stats['saldo_total']:+.2f}",
+                               cor=C['green'] if stats['saldo_total'] > 0 else C['red']),
+            _card_estatistica('Taxa de Acerto', f"{stats['taxa_acerto'] * 100:.1f}%"),
+            _card_estatistica('Payoff', payoff_str),
+            _card_estatistica('Expectativa', f"R$ {stats['expectativa']:+.2f}"),
+            _card_estatistica('Max Gain', f"R$ {stats['max_gain']:+.2f}", cor=C['green']),
+            _card_estatistica('Max Loss', f"R$ {stats['max_loss']:+.2f}", cor=C['red']),
+            _card_estatistica('Seq. Wins', str(stats['maior_sequencia_win'])),
+            _card_estatistica('Seq. Losses', str(stats['maior_sequencia_loss'])),
+        ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '16px'}),
+
+        _bloco_diario('Evolução de Saldo', dcc.Graph(
+            figure=_grafico_evolucao_saldo(stats), config={'displayModeBar': False},
+        )),
+
+        html.Div([
+            _bloco_breakdown_diario('Por Ativo', stats['por_ativo']),
+            _bloco_breakdown_diario('Por Janela', stats['por_janela']),
+        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+        html.Div([
+            _bloco_breakdown_diario('Por Sala/Análise', stats['por_sala']),
+            _bloco_breakdown_diario('Por Estratégia', stats['por_estrategia']),
+        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+    ])
+
+
+_COR_STATUS_RECONCILIACAO = {
+    'ok': 'green', 'divergente': 'red',
+    'sem_correspondencia_mt5': 'yellow', 'sem_correspondencia_diario': 'text2',
+}
+
+
+def _tabela_reconciliacao(df: pd.DataFrame | None) -> html.Div:
+    if df is None or df.empty:
+        return html.Div('Nenhum resultado ainda — clique em "Reconciliar agora".', style={
+            'padding': '20px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '13px',
+        })
+    cabecalho = html.Tr([
+        html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
+        for t in ['ID Trade', 'Position MT5', 'Divergência', 'Confiança', 'Status']
+    ])
+    cores_fallback = {'text2': C['text2']}
+    linhas = []
+    for _, linha in df.iterrows():
+        chave_cor = _COR_STATUS_RECONCILIACAO.get(linha['mt5_match_status'], 'text2')
+        cor = C.get(chave_cor, cores_fallback['text2'])
+        divergencia = linha['mt5_divergencia_reais']
+        linhas.append(html.Tr([
+            _td_diario(str(int(linha['id_trade'])) if pd.notna(linha['id_trade']) else '—'),
+            _td_diario(str(int(linha['mt5_position_id'])) if pd.notna(linha['mt5_position_id']) else '—'),
+            _td_diario(f"R$ {divergencia:+.2f}" if pd.notna(divergencia) else '—'),
+            _td_diario(linha['confianca'] or '—'),
+            _td_diario((linha['mt5_match_status'] or '').replace('_', ' '),
+                       extra={'color': cor, 'fontWeight': '700'}),
+        ]))
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
+                       style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+def _construir_diario_reconciliacao() -> html.Div:
+    return html.Div([
+        html.Div([
+            html.Button('Reconciliar agora', id='btn-diario-reconciliar', n_clicks=0, style={
+                'background': C['green'], 'color': C['bg'], 'border': 'none', 'borderRadius': '6px',
+                'padding': '8px 20px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
+                'fontWeight': '700', 'fontSize': '12px',
+            }),
+            html.Span(id='diario-reconciliar-status', style={
+                'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2'],
+            }),
+        ], style={'marginBottom': '14px'}),
+        html.Div(_tabela_reconciliacao(persistencia.carregar_reconciliacao()),
+                 id='diario-reconciliacao-tabela'),
+    ])
+
+
+def construir_diario() -> html.Div:
+    return html.Div([
+        secao('DIÁRIO DE TRADE'),
+        html.Div([
+            html.Button(nome, id=f'btn-diario-sub-{chave}', n_clicks=0,
+                        style=_estilo_subaba_diario(chave, 'novo'))
+            for chave, nome in _ABAS_DIARIO_SUB
+        ], style={'display': 'flex', 'gap': '8px', 'marginBottom': '16px'}),
+
+        html.Div(_construir_diario_novo_trade(), id='painel-diario-sub-novo'),
+        html.Div(_construir_diario_historico(), id='painel-diario-sub-historico', style={'display': 'none'}),
+        html.Div(html.Div(id='diario-estatisticas-conteudo'),
+                 id='painel-diario-sub-estatisticas', style={'display': 'none'}),
+        html.Div(_construir_diario_reconciliacao(),
+                 id='painel-diario-sub-reconciliacao', style={'display': 'none'}),
+    ])
+
+
+# =============================================================================
 # LAYOUT PRINCIPAL
 # =============================================================================
 
@@ -1239,7 +1513,24 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
 )
 
+# Rota pras imagens do diário — `assets/` não serve `data/base_processada/
+# diario_imagens/`. Valida o nome de arquivo contra o padrão exato gerado por
+# `salvar_imagem` (diario_trade.py) antes de repassar pro Flask, pra nunca
+# abrir uma superfície de path traversal (mesma rota existe no SQ'98).
+_PADRAO_NOME_IMAGEM_DIARIO = re.compile(r'^\d{4}_[A-Z]+_\d{8}\.png$')
+
+
+@app.server.route('/diario-imagens/<path:nome_arquivo>')
+def _servir_imagem_diario(nome_arquivo):
+    if not _PADRAO_NOME_IMAGEM_DIARIO.match(nome_arquivo):
+        flask.abort(404)
+    return flask.send_from_directory(cfg.PASTA_DIARIO_IMAGENS, nome_arquivo)
+
 app.layout = html.Div([
+
+    # Google Fonts
+    html.Link(rel='stylesheet',
+              href='https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;500&display=swap'),
 
     # Store para mensagem pendente (para preloader)
     dcc.Store(id='store-mensagem-pendente', data=None),
@@ -1250,6 +1541,11 @@ app.layout = html.Div([
     # Store do ativo selecionado
     dcc.Store(id='store-ativo', data='WIN'),
     dcc.Store(id='store-metricas', data={}),
+
+    # Store da aba ativa do cabeçalho (QUANT LAB/BACKTESTING/DIÁRIO/CONFIGURAÇÕES)
+    dcc.Store(id='store-aba-ativa', data='lab'),
+    # Store da sub-aba ativa dentro do painel Diário
+    dcc.Store(id='store-diario-sub-aba', data='novo'),
 
     # Interval rápido — 1s: atualiza preço, candle atual, fluxo
     dcc.Interval(id='interval-live', interval=1_000, n_intervals=0),
@@ -1272,15 +1568,9 @@ app.layout = html.Div([
             }),
         ]),
         html.Div([
-            *[html.Button(label, id=f'tab-{key}', n_clicks=0, style={
-                'background': 'transparent', 'border': 'none',
-                'borderBottom': f'2px solid {C["gold"]}' if key == 'lab' else '2px solid transparent',
-                'color': C['text'] if key == 'lab' else C['text2'],
-                'padding': '8px 20px', 'cursor': 'pointer',
-                'fontFamily': FONTS['display'], 'fontSize': '12px',
-                'fontWeight': '600' if key == 'lab' else '400',
-                'letterSpacing': '0.06em',
-            }) for label, key in [
+            *[html.Button(label, id=f'tab-{key}', n_clicks=0,
+                          style=_estilo_aba(key, 'lab'))
+              for label, key in [
                 ('QUANT LAB', 'lab'),
                 ('BACKTESTING', 'back'),
                 ('DIÁRIO', 'diary'),
@@ -1321,6 +1611,8 @@ app.layout = html.Div([
     # CONTEÚDO PRINCIPAL
     # =========================================================================
     html.Div(id='conteudo-principal', children=[
+
+      html.Div(id='painel-quantlab', children=[
 
         # HERO
         html.Div([
@@ -1373,6 +1665,25 @@ app.layout = html.Div([
 
         # BIG PLAYERS
         html.Div(id='big-players-conteudo', style={'marginTop': '24px'}),
+
+      ]),
+
+      # PAINEL DIÁRIO — oculto por padrão, só visível quando store-aba-ativa
+      # == 'diary'. Nunca reconstruído por callback de troca de aba (só o
+      # style.display muda) — o formulário "Novo Trade" mantém o que foi
+      # digitado mesmo se o usuário trocar de aba e voltar.
+      html.Div(id='painel-diario', style={'display': 'none'}, children=[
+          construir_diario(),
+      ]),
+
+      # Placeholders — Backtesting/Configurações não têm conteúdo real ainda,
+      # só evitam a aba parecer quebrada ao clicar.
+      html.Div(id='painel-back', style={'display': 'none'}, children=[
+          _placeholder_aba('Backtesting'),
+      ]),
+      html.Div(id='painel-config', style={'display': 'none'}, children=[
+          _placeholder_aba('Configurações'),
+      ]),
 
     ], style={
         'padding': '24px 28px',
@@ -1460,39 +1771,68 @@ app.layout = html.Div([
                                style={'height': '0', 'width': '0'}),
         ),
 
-        # Input + botão — altura fixa 68px
+        # Seletor de modelo (2026-07-08) — Gemini + OpenRouter (automático
+        # ou modelo específico, grátis/pago). "Automático" tenta vários
+        # modelos grátis da OpenRouter em ordem até um responder, evitando
+        # ficar preso no "limite excedido" de um único modelo/provedor.
+        # Discreto de propósito — pequeno, cor apagada — não é o foco do
+        # chat. Ver assets/style.css pro tema escuro (classes reais do
+        # Dash 4.3, não mais o react-select antigo).
         html.Div([
-            dcc.Input(
-                id='chat-input', type='text',
+            dcc.Dropdown(
+                id='chat-modelo',
+                options=ai_analyst.opcoes_modelo(),
+                value='openrouter-auto',
+                clearable=False, searchable=False,
+                style={'fontFamily': FONTS['body'], 'fontSize': '10px', 'width': '200px'},
+            ),
+        ], style={
+            'padding': '2px 12px', 'height': '20px',
+            'display': 'flex', 'justifyContent': 'flex-start',
+            'borderTop': f'1px solid {C["border"]}',
+            'boxSizing': 'border-box', 'flexShrink': '0',
+        }),
+
+        # Input + botão — 2026-07-08: era de fato curto demais pra ler o
+        # que estava sendo digitado, mas a correção certa é MAIS LINHAS
+        # visíveis (textarea), não fonte maior — fonte volta ao tamanho
+        # original. Botão usa alignSelf:stretch pra acompanhar a altura do
+        # textarea automaticamente (nunca mais fica maior/menor que ele).
+        html.Div([
+            dcc.Textarea(
+                id='chat-input',
                 placeholder='Preço ou pergunta...',
-                debounce=False, n_submit=0,
+                rows=3,
                 style={
                     'flex': '1',
                     'background': C['bg'],
                     'border': f'1px solid {C["border"]}',
                     'borderRight': 'none',
-                    'borderRadius': '20px 0 0 20px',
-                    'padding': '10px 16px',
+                    'borderRadius': '10px 0 0 10px',
+                    'padding': '10px 14px',
                     'color': C['text'],
                     'fontFamily': FONTS['body'],
                     'fontSize': '13px',
+                    'lineHeight': '1.4',
                     'outline': 'none',
+                    'resize': 'none',
                 }
             ),
             html.Button('▶', id='btn-chat-enviar', n_clicks=0, style={
                 'background': C['gold'], 'color': C['bg'],
                 'border': 'none',
-                'borderRadius': '0 20px 20px 0',
-                'padding': '10px 18px',
+                'borderRadius': '0 10px 10px 0',
+                'padding': '0 18px',
                 'cursor': 'pointer',
                 'fontWeight': '700', 'fontSize': '14px',
                 'flexShrink': '0',
+                'alignSelf': 'stretch',
+                'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center',
             }),
         ], style={
             'display': 'flex',
-            'alignItems': 'center',
+            'alignItems': 'stretch',
             'padding': '10px 12px',
-            'height': '68px',
             'borderTop': f'1px solid {C["border"]}',
             'boxSizing': 'border-box',
             'flexShrink': '0',
@@ -1513,7 +1853,7 @@ app.layout = html.Div([
     ], id='chat-modal-container', style={
         'display': 'none',
         'position': 'fixed', 'bottom': '96px', 'right': '28px',
-        'width': '420px', 'height': '520px',
+        'width': '420px', 'height': '560px',  # +24px (seletor discreto) +~12px (textarea 3 linhas vs. input 1 linha) sobre o histórico
         'background': C['panel'],
         'border': f'1px solid {C["border"]}',
         'borderRadius': '16px', 'zIndex': '999',
@@ -1799,13 +2139,13 @@ def toggle_chat(n_toggle, n_fechar, estilo_atual):
     Output('store-mensagem-pendente', 'data'),
     Output('chat-loading-target', 'children'),
     Input('btn-chat-enviar', 'n_clicks'),
-    Input('chat-input', 'n_submit'),
     State('chat-input', 'value'),
     State('chat-historico', 'children'),
     State('store-ativo', 'data'),
+    State('chat-modelo', 'value'),
     prevent_initial_call=True,
 )
-def enviar_mensagem_chat(n_clicks, n_submit, texto, historico_atual, ativo):
+def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
     if not texto or not texto.strip():
         return no_update, no_update, no_update, no_update, no_update
 
@@ -1846,16 +2186,17 @@ def enviar_mensagem_chat(n_clicks, n_submit, texto, historico_atual, ativo):
     m = extrair_metricas(df) if df is not None else {}
 
     try:
-        import ai_analyst
-        resposta_bruta = ai_analyst.analisar_com_pergunta_raw(m, texto, ativo)
+        resposta_bruta = ai_analyst.analisar_com_pergunta_raw(m, texto, ativo, modelo)
 
         if isinstance(resposta_bruta, dict) and resposta_bruta.get('erro_429'):
             # Rate limit — calcula timer de espera
             segundos_espera = resposta_bruta.get('retry_after', 60)
+            modelo_limitado = resposta_bruta.get('modelo_usado', '')
+            sufixo_modelo = f' ({modelo_limitado})' if modelo_limitado else ''
             msg_ia = html.Div([
                 html.Div([
                     html.Span('⏱ ', style={'color': C['yellow']}),
-                    html.Span(f'Limite de requisições atingido. Aguarde {segundos_espera}s antes de enviar novamente.',
+                    html.Span(f'Limite de requisições atingido{sufixo_modelo}. Aguarde {segundos_espera}s antes de enviar novamente.',
                               style={'color': C['yellow']}),
                 ], style={
                     'background': '#1A1A14', 'borderRadius': '10px 10px 10px 2px',
@@ -1902,7 +2243,8 @@ def enviar_mensagem_chat(n_clicks, n_submit, texto, historico_atual, ativo):
             ], style={'display': 'flex', 'justifyContent': 'flex-start'})
 
             ts = datetime.now().strftime('%H:%M:%S')
-            status_str = f'{ts} · {tokens_usados} tokens ({pct}% do limite)'
+            modelo_usado = resposta_bruta.get('modelo_usado', '')
+            status_str = f'{ts} · {tokens_usados} tokens ({pct}% do limite) · {modelo_usado}'
 
     except Exception as e:
         msg_ia = html.Div([
@@ -1917,6 +2259,244 @@ def enviar_mensagem_chat(n_clicks, n_submit, texto, historico_atual, ativo):
     return novo_historico, status_str, '', None, ''
 
 
+# -----------------------------------------------------------------------------
+# CABEÇALHO — troca de aba real (QUANT LAB/BACKTESTING/DIÁRIO/CONFIGURAÇÕES)
+# -----------------------------------------------------------------------------
+# Primeira vez que essas 4 abas viram funcionais de verdade — antes eram só
+# decoração (sem callback nenhum, `conteudo-principal` sempre mostrava o
+# mesmo conteúdo). Mesma disciplina do seletor de ativo: nunca recriar os
+# botões, só trocar `style`/`display` (evita o bug histórico de reset de
+# `n_clicks` documentado no CHANGELOG.md de 2026-07-04).
+
+_ABAS_CABECALHO = ['lab', 'back', 'diary', 'config']
+
+
+@app.callback(
+    Output('store-aba-ativa', 'data'),
+    [Input(f'tab-{chave}', 'n_clicks') for chave in _ABAS_CABECALHO],
+    prevent_initial_call=True,
+)
+def selecionar_aba(*_n_clicks):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    botao_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    return botao_id.replace('tab-', '')
+
+
+@app.callback(
+    [Output(f'tab-{chave}', 'style') for chave in _ABAS_CABECALHO],
+    Input('store-aba-ativa', 'data'),
+)
+def atualizar_estilo_aba_ativa(aba_ativa):
+    return [_estilo_aba(chave, aba_ativa) for chave in _ABAS_CABECALHO]
+
+
+@app.callback(
+    Output('painel-quantlab', 'style'),
+    Output('painel-diario', 'style'),
+    Output('painel-back', 'style'),
+    Output('painel-config', 'style'),
+    Input('store-aba-ativa', 'data'),
+)
+def atualizar_painel_principal(aba_ativa):
+    def _estilo(chave):
+        return {} if chave == aba_ativa else {'display': 'none'}
+    return _estilo('lab'), _estilo('diary'), _estilo('back'), _estilo('config')
+
+
+# -----------------------------------------------------------------------------
+# DIÁRIO DE TRADE — callbacks (aba "DIÁRIO")
+# -----------------------------------------------------------------------------
+
+@app.callback(
+    Output('store-diario-sub-aba', 'data'),
+    [Input(f'btn-diario-sub-{chave}', 'n_clicks') for chave, _ in _ABAS_DIARIO_SUB],
+    prevent_initial_call=True,
+)
+def selecionar_sub_aba_diario(*_n_clicks):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    botao_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    return botao_id.replace('btn-diario-sub-', '')
+
+
+@app.callback(
+    [Output(f'btn-diario-sub-{chave}', 'style') for chave, _ in _ABAS_DIARIO_SUB],
+    Input('store-diario-sub-aba', 'data'),
+)
+def atualizar_estilo_sub_aba_diario(sub_aba_ativa):
+    return [_estilo_subaba_diario(chave, sub_aba_ativa) for chave, _ in _ABAS_DIARIO_SUB]
+
+
+@app.callback(
+    [Output(f'painel-diario-sub-{chave}', 'style') for chave, _ in _ABAS_DIARIO_SUB],
+    Input('store-diario-sub-aba', 'data'),
+)
+def atualizar_painel_sub_diario(sub_aba_ativa):
+    return [{'display': 'block' if chave == sub_aba_ativa else 'none'} for chave, _ in _ABAS_DIARIO_SUB]
+
+
+@app.callback(
+    Output('diario-preview-imagem', 'children'),
+    Input('diario-upload-imagem', 'contents'),
+    Input('store-diario-imagem-colada', 'data'),
+    prevent_initial_call=True,
+)
+def preview_imagem_diario(upload_contents, imagem_colada):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    origem = ctx.triggered[0]['prop_id'].split('.')[0]
+    data_url = upload_contents if origem == 'diario-upload-imagem' else imagem_colada
+    if not data_url:
+        return no_update
+    return html.Img(src=data_url, style={'maxWidth': '240px', 'borderRadius': '6px',
+                                          'border': f'1px solid {C["border"]}'})
+
+
+@app.callback(
+    Output('diario-status', 'children'),
+    Input('btn-diario-salvar', 'n_clicks'),
+    State('diario-data', 'value'),
+    State('diario-ativo', 'value'),
+    State('diario-janela', 'value'),
+    State('diario-estrategia', 'value'),
+    State('diario-sala', 'value'),
+    State('diario-tipo-operacao', 'value'),
+    State('diario-alvo', 'value'),
+    State('diario-stop', 'value'),
+    State('diario-lote', 'value'),
+    State('diario-preco-entrada', 'value'),
+    State('diario-preco-saida', 'value'),
+    State('diario-tipo-saida', 'value'),
+    State('diario-resultado', 'value'),
+    State('diario-saldo', 'value'),
+    State('diario-resumo', 'value'),
+    State('diario-obs', 'value'),
+    State('diario-nivel-sr', 'value'),
+    State('diario-nivel-sr-tipo', 'value'),
+    State('diario-tags-setup-erro', 'value'),
+    State('diario-upload-imagem', 'contents'),
+    State('store-diario-imagem-colada', 'data'),
+    prevent_initial_call=True,
+)
+def salvar_novo_trade(n_clicks, data_op, ativo, janela, estrategia_tags, sala, tipo_op, alvo, stop, lote,
+                       preco_entrada, preco_saida, tipo_saida, resultado, saldo, resumo, obs,
+                       nivel_sr, nivel_sr_tipo, tags_setup_erro, upload_contents, imagem_colada):
+    if not data_op or not ativo:
+        return '⚠ Preencha ao menos Data e Ativo.'
+
+    campos = dict(
+        data_op=data_op, ativo=ativo, janela_pregao=janela,
+        estrategia_tags=estrategia_tags or [], sala_analise=sala,
+        tipo_operacao=tipo_op, alvo_pontos=alvo, stop_pontos=stop, lote=lote or 1,
+        preco_entrada=preco_entrada, preco_saida=preco_saida, tipo_saida=tipo_saida,
+        resultado_pontos=resultado, saldo_operacao_reais=saldo,
+        resumo_operacional=resumo, obs=obs,
+        nivel_sr_referencia=nivel_sr, nivel_sr_tipo=nivel_sr_tipo,
+        tags_setup_erro=tags_setup_erro or [],
+        conta='real',
+    )
+
+    imagem_bytes = None
+    data_url = upload_contents or imagem_colada
+    if data_url:
+        try:
+            imagem_bytes = base64.b64decode(data_url.split(',', 1)[1])
+        except Exception:
+            imagem_bytes = None
+
+    id_trade = dt.registrar_trade(campos, imagem_bytes=imagem_bytes)
+    if id_trade is None:
+        return '⚠ Diário ocupado por outra escrita — tente novamente em instantes.'
+    return f'✔ Operação #{id_trade} salva.'
+
+
+@app.callback(
+    Output('diario-data', 'value'),
+    Output('diario-ativo', 'value'),
+    Output('diario-janela', 'value'),
+    Output('diario-estrategia', 'value'),
+    Output('diario-sala', 'value'),
+    Output('diario-tipo-operacao', 'value'),
+    Output('diario-alvo', 'value'),
+    Output('diario-stop', 'value'),
+    Output('diario-lote', 'value'),
+    Output('diario-preco-entrada', 'value'),
+    Output('diario-preco-saida', 'value'),
+    Output('diario-tipo-saida', 'value'),
+    Output('diario-resultado', 'value'),
+    Output('diario-saldo', 'value'),
+    Output('diario-resumo', 'value'),
+    Output('diario-obs', 'value'),
+    Output('diario-nivel-sr', 'value'),
+    Output('diario-nivel-sr-tipo', 'value'),
+    Output('diario-tags-setup-erro', 'value'),
+    Output('diario-preview-imagem', 'children', allow_duplicate=True),
+    Output('store-diario-imagem-colada', 'data', allow_duplicate=True),
+    Input('btn-diario-limpar', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def limpar_form_diario(n_clicks):
+    return (None, None, None, None, None, None, None, None, 1,
+            None, None, None, None, None, None, None, None, None, None,
+            None, None)
+
+
+@app.callback(
+    Output('diario-historico-tabela', 'children'),
+    Input('diario-hist-ativo', 'value'),
+    Input('diario-hist-janela', 'value'),
+    Input('diario-hist-estrategia', 'value'),
+)
+def atualizar_historico(ativo, janela, estrategia):
+    df = dt.listar_trades(ativo=ativo, janela=janela, estrategia_tag=estrategia, is_simulated=False)
+    df = df.sort_values('data_op', ascending=False).head(50)
+    if df.empty:
+        return html.Div('Nenhuma operação encontrada.', style={
+            'padding': '20px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '13px',
+        })
+    cabecalho = html.Tr([
+        html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
+        for t in ['Data', 'Ativo', 'Janela', 'Estratégia', 'Tipo', 'Pts', 'Saldo', 'Print']
+    ])
+    linhas = [_linha_historico(row) for _, row in df.iterrows()]
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
+                       style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+@app.callback(
+    Output('diario-estatisticas-conteudo', 'children'),
+    Input('diario-status', 'children'),
+    Input('store-diario-sub-aba', 'data'),
+)
+def atualizar_estatisticas(_status, sub_aba_ativa):
+    # Recomputa só ao entrar na aba Estatísticas ou logo após salvar — NÃO
+    # em `interval-slow` (30s). Ver comentário equivalente em
+    # dashboard_98.py::atualizar_estatisticas_98 — esse trigger de intervalo
+    # rodava pra sempre em segundo plano (mesmo sem a aba Diário aberta) e,
+    # num servidor Dash de thread única, cada leitura ocasionalmente lenta
+    # do parquet (OneDrive) travava o app inteiro, inclusive o tick de 1s do
+    # preço ao vivo — causa raiz da lentidão relatada após esta feature.
+    if sub_aba_ativa != 'estatisticas':
+        return no_update
+    return _construir_diario_estatisticas(dt.calcular_estatisticas())
+
+
+@app.callback(
+    Output('diario-reconciliacao-tabela', 'children'),
+    Output('diario-reconciliar-status', 'children'),
+    Input('btn-diario-reconciliar', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def reconciliar_classico(n_clicks):
+    try:
+        resultado = dt.reconciliar_com_mt5(dias_atras=30)
+    except Exception as e:
+        return no_update, f'⚠ Erro ao reconciliar: {str(e)[:100]}'
+    return _tabela_reconciliacao(resultado), f'Concluído — {len(resultado)} linhas.'
 
 
 # =============================================================================
