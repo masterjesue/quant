@@ -1,0 +1,19 @@
+Barra de Tarefas:
+Diminuir a borda (veja o espaço em volta do menu iniciar).
+O "botão" da janela minimizada está com ícone duplicado e não tem o efeito de alto relevo.
+O fundo do relógio deve ser cinza.
+(Embaixo da barra de tarefas que você fez está a minha barra de tarefas para você comparar)
+
+Janelas:
+Não tem o efeito de profundidade nas bordas, está flat, sem relevo e sombra.
+Barra de rolagem (está fora do padrão Windows, revise). Não tem as setinhas e o fundo.
+
+Botôes da barra de título: Veja as referências que eu te mandei anteriormente ou revise o deseign do Windows 98, não é o mesmo botão que colocou.
+
+Clippy: ficou ótimo! Vamos ajustar umas coisas... Lembra do balão de conversa que aparecia no Clippy quando pedíamos ajuda no Word? (veja o print) Faça o box de diálogo da IA surgir nesse balão, no mesmo estilo retro do CLippy. Imagine que o Clippy não é muito diferente do chat suspenso que temos hoje nos sites, ele deve ficar sempre no canto e mostrar um balão de diálogo quando clicamos (ou recolhendo o balão quando clicamos novamente). A diferença é que o Clippy pode ser clicado e arrastado, para ser fiel à experiência do original. E também, é claro, que o balão deve ser estilizado igual ao original, cores, fonte, botões e etc... É obvio que terá ajustes para acoplar o input de texto, call-back da IA, a barra de rolagem para ver todo o texto e etc... Mas com exceção dos ajustes inevitáveis, seja fial ao design original.
+
+Coloque um easter egg no Clippy, eu quero uma forma de ver todas as animações em sequência ao apertar um botão que você pode deixar discretamente ao lado do relógio na barra de tarefas (lembre-se, tudo dentro do design retro fiel ao Windows 98.
+
+A Janela Quant Lab está maior do que o necessário e com muito espaço vazio. Junte essa tela com o Market View, acho que faz mais sentido assim.
+
+Estamos fazendo uma obra de arte. Estou contando com você!

@@ -1,0 +1,293 @@
+// assets_98/window_manager.js
+// Gerencia a "casca" das janelas Win98 — drag, foco/z-index, minimizar,
+// maximizar, fechar, taskbar, menu Start e relógio — inteiramente no
+// cliente. Os nós DOM das janelas (.win98-window) são criados uma única
+// vez pelo app.layout do Dash e NUNCA destruídos por callback (só o
+// conteúdo interno, ex. #hero-conteudo, é substituído a cada tick de 1s/
+// 30s). Por isso um script estático em assets_98/ (mesma convenção de
+// assets_98/style.css, servido pelo Dash via assets_folder='assets_98' em
+// dashboard_98.py, carregado uma vez no load da página) é suficiente:
+// nenhuma dessas mecânicas depende de dado vindo do Python.
+//
+// INVARIANTE: depois do mount, top/left/width/height/zIndex inline de
+// .win98-window são propriedade exclusiva deste script. Nenhum callback
+// Python deve escrever essas mesmas chaves via Output(<id>, 'style').
+(function () {
+  'use strict';
+
+  var PERSIST_LAYOUT = true;   // false = sempre reseta pro layout padrão a cada load
+  // v2: bump sempre que os defaults de posição/tamanho mudarem no Python —
+  // sem isso, quem já abriu/moveu uma janela nunca vê o novo default (o
+  // localStorage antigo é restaurado e mascara a mudança por completo).
+  var STORAGE_KEY = 'sq98:layout:v2';
+  var TASKBAR_HEIGHT = 28;
+  var CASCADE_STEP = 26;
+
+  var taskbarButtons, windows, zTop;
+  var layout = loadLayout();
+  var saveTimer = null;
+
+  function loadLayout() {
+    if (!PERSIST_LAYOUT) return {};
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; }
+    catch (e) { return {}; }
+  }
+  function scheduleSave() {
+    if (!PERSIST_LAYOUT) return;
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(layout)); } catch (e) {}
+    }, 250);
+  }
+  function rememberWindow(win) {
+    layout[win.dataset.window] = {
+      top: win.style.top, left: win.style.left,
+      width: win.style.width, height: win.style.height,
+      z: parseInt(win.style.zIndex, 10) || 0,
+      minimized: win.classList.contains('minimized'),
+      closed: win.classList.contains('closed'),
+    };
+    scheduleSave();
+  }
+  function clamp(v, min, max) { return Math.max(min, Math.min(v, max)); }
+
+  function placeInitial(win, index) {
+    var saved = layout[win.dataset.window];
+    var maxLeft = function () { return Math.max(0, window.innerWidth - win.offsetWidth - 4); };
+    var maxTop = function () { return Math.max(0, window.innerHeight - TASKBAR_HEIGHT - win.offsetHeight - 4); };
+
+    if (saved) {
+      if (saved.width) win.style.width = saved.width;
+      if (saved.height) win.style.height = saved.height;
+      win.style.top = clamp(parseInt(saved.top, 10) || 0, 0, maxTop()) + 'px';
+      win.style.left = clamp(parseInt(saved.left, 10) || 0, 0, maxLeft()) + 'px';
+      if (saved.minimized) win.classList.add('minimized');
+      if (saved.closed) win.classList.add('closed'); else win.classList.remove('closed');
+      win.style.zIndex = saved.z || (10 + index);
+      return;
+    }
+
+    // primeira visita: usa a posição padrão percentual (data-default-top/
+    // left, definida em estilo_win98.py) + uma cascata leve por índice,
+    // calculada em cima do viewport atual — nunca pixel fixo.
+    if (win.dataset.startClosed === 'true') win.classList.add('closed');
+    var pctTop = parseFloat(win.dataset.defaultTop || '8');
+    var pctLeft = parseFloat(win.dataset.defaultLeft || '6');
+    var top = (window.innerHeight - TASKBAR_HEIGHT) * (pctTop / 100) + index * CASCADE_STEP;
+    var left = window.innerWidth * (pctLeft / 100) + index * CASCADE_STEP;
+    win.style.top = clamp(top, 0, maxTop()) + 'px';
+    win.style.left = clamp(left, 0, maxLeft()) + 'px';
+    win.style.zIndex = 10 + index;
+  }
+
+  function clampAllToViewport() {
+    windows.forEach(function (win) {
+      if (win.classList.contains('maximized')) return;
+      var maxLeft = Math.max(0, window.innerWidth - win.offsetWidth - 4);
+      var maxTop = Math.max(0, window.innerHeight - TASKBAR_HEIGHT - win.offsetHeight - 4);
+      win.style.left = clamp(parseInt(win.style.left, 10) || 0, 0, maxLeft) + 'px';
+      win.style.top = clamp(parseInt(win.style.top, 10) || 0, 0, maxTop) + 'px';
+    });
+  }
+
+  function titleOf(win) {
+    var t = win.querySelector('.win98-titlebar-text > span:last-child');
+    return t ? t.textContent.trim() : win.dataset.window;
+  }
+  // Extrai só a <img> do ícone (não o outerHTML do wrapper inteiro) —
+  // evita que markup extra do wrapper (ou um fallback de emoji com texto)
+  // acabe duplicado visualmente ao lado do <span> de título no botão.
+  function iconOf(win) {
+    var img = win.querySelector('.win98-titlebar-icon img');
+    if (img) return '<img src="' + img.getAttribute('src') + '" style="width:14px;height:14px;image-rendering:pixelated;vertical-align:middle">';
+    var span = win.querySelector('.win98-titlebar-icon');
+    return span ? '<span>' + span.textContent + '</span>' : '';
+  }
+
+  function buildTaskbarButtons() {
+    taskbarButtons.innerHTML = '';
+    windows.forEach(function (win) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'win98-task-btn';
+      btn.dataset.win = win.dataset.window;
+      btn.innerHTML = iconOf(win) + '<span>' + titleOf(win) + '</span>';
+      btn.addEventListener('click', function () { toggleFromTaskbar(win); });
+      taskbarButtons.appendChild(btn);
+    });
+    windows.forEach(refreshTaskbarState);
+  }
+
+  // FIX do bug encontrado no protótipo: a visibilidade do botão da taskbar
+  // depende só de "fechada" (.closed). Minimizada mantém o botão visível
+  // (só perde o estado "active") — é assim que dá pra restaurar clicando
+  // na taskbar. Antes a checagem usava uma classe presente nos dois casos
+  // (minimizada E fechada), e o botão sumia também ao minimizar.
+  function refreshTaskbarState(win) {
+    var btn = taskbarButtons.querySelector('[data-win="' + win.dataset.window + '"]');
+    if (!btn) return;
+    var closed = win.classList.contains('closed');
+    var minimized = win.classList.contains('minimized');
+    btn.style.display = closed ? 'none' : 'flex';
+    btn.classList.toggle('active', !closed && !minimized && parseInt(win.style.zIndex, 10) === zTop);
+  }
+
+  function focusWindow(win) {
+    zTop += 1;
+    win.style.zIndex = zTop;
+    windows.forEach(function (w) { w.classList.toggle('inactive', w !== win); });
+    windows.forEach(refreshTaskbarState);
+    rememberWindow(win);
+  }
+  function openWindow(win) {
+    win.classList.remove('closed', 'minimized');
+    focusWindow(win);
+  }
+  function minimizeWindow(win) {
+    win.classList.add('minimized');
+    windows.forEach(refreshTaskbarState);
+    rememberWindow(win);
+  }
+  function closeWindow(win) {
+    win.classList.remove('minimized');
+    win.classList.add('closed');
+    windows.forEach(refreshTaskbarState);
+    rememberWindow(win);
+  }
+  function toggleFromTaskbar(win) {
+    if (win.classList.contains('closed') || win.classList.contains('minimized')) {
+      openWindow(win);
+      return;
+    }
+    if (parseInt(win.style.zIndex, 10) === zTop) {
+      minimizeWindow(win);
+      return;
+    }
+    focusWindow(win);
+  }
+
+  function wireWindow(win) {
+    win.addEventListener('mousedown', function () { focusWindow(win); });
+
+    var titlebar = win.querySelector('.win98-titlebar');
+    var dragging = false, sx = 0, sy = 0, ox = 0, oy = 0;
+    titlebar.addEventListener('mousedown', function (e) {
+      if (win.classList.contains('maximized')) return;
+      if (e.target.closest('[data-action]')) return;  // não arrasta clicando em _/□/×
+      dragging = true;
+      sx = e.clientX; sy = e.clientY;
+      var rect = win.getBoundingClientRect();
+      ox = rect.left; oy = rect.top;
+      e.preventDefault();
+    });
+    window.addEventListener('mousemove', function (e) {
+      if (!dragging) return;
+      win.style.left = clamp(ox + (e.clientX - sx), -win.offsetWidth + 80, window.innerWidth - 80) + 'px';
+      win.style.top = clamp(oy + (e.clientY - sy), 0, window.innerHeight - TASKBAR_HEIGHT - 30) + 'px';
+    });
+    window.addEventListener('mouseup', function () {
+      if (dragging) { dragging = false; rememberWindow(win); }
+    });
+
+    var actions = { close: closeWindow, minimize: minimizeWindow };
+    win.querySelectorAll('[data-action]').forEach(function (btn) {
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var action = btn.dataset.action;
+        if (action === 'maximize') { win.classList.toggle('maximized'); rememberWindow(win); }
+        else if (actions[action]) actions[action](win);
+      });
+    });
+  }
+
+  function wireDesktopIcons() {
+    document.querySelectorAll('.win98-icon').forEach(function (icon) {
+      icon.addEventListener('click', function () {
+        document.querySelectorAll('.win98-icon').forEach(function (i) { i.classList.remove('selected'); });
+        icon.classList.add('selected');
+      });
+      icon.addEventListener('dblclick', function () {
+        var win = document.getElementById(icon.dataset.openWindow);
+        if (win) openWindow(win);
+      });
+    });
+  }
+
+  function wireStartMenu() {
+    var startBtn = document.getElementById('start-btn');
+    var startMenu = document.getElementById('start-menu');
+    if (!startBtn || !startMenu) return;
+    startBtn.addEventListener('click', function (e) {
+      startMenu.classList.toggle('open');
+      startBtn.classList.toggle('open');
+      e.stopPropagation();
+    });
+    document.addEventListener('click', function () {
+      startMenu.classList.remove('open');
+      startBtn.classList.remove('open');
+    });
+    startMenu.querySelectorAll('[data-open-window]').forEach(function (item) {
+      item.addEventListener('click', function () {
+        var win = document.getElementById(item.dataset.openWindow);
+        if (win) openWindow(win);
+      });
+    });
+  }
+
+  // FIX do relógio: o protótipo tinha dois bugs — faltava ":SS" E o
+  // intervalo real era a cada 10s (setInterval(tick, 1000 * 10)), não 1s.
+  // Day trade precisa de segundos certos.
+  function pad2(n) { return String(n).padStart(2, '0'); }
+  function tickClock() {
+    var el = document.getElementById('taskbar-clock');
+    if (!el) return;
+    var d = new Date();
+    el.textContent = pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  }
+
+  function initDesktop() {
+    taskbarButtons = document.getElementById('taskbar-buttons');
+    windows = Array.prototype.slice.call(document.querySelectorAll('.win98-window'));
+    zTop = 10;
+    if (!windows.length || !taskbarButtons) return;
+
+    windows.forEach(function (win, i) { placeInitial(win, i); wireWindow(win); });
+    buildTaskbarButtons();
+    wireDesktopIcons();
+    wireStartMenu();
+
+    var topWin = windows
+      .filter(function (w) { return !w.classList.contains('closed'); })
+      .sort(function (a, b) { return (parseInt(b.style.zIndex, 10) || 0) - (parseInt(a.style.zIndex, 10) || 0); })[0];
+    if (topWin) focusWindow(topWin);
+
+    window.addEventListener('resize', clampAllToViewport);
+
+    tickClock();
+    setInterval(tickClock, 1000);
+  }
+
+  // Não há garantia de ordem entre a execução deste <script> estático e o
+  // primeiro commit do React/Dash-renderer — DOMContentLoaded sozinho não
+  // é suficiente (pode rodar antes do Dash montar a árvore e retornar
+  // vazio, silenciosamente). Espera a primeira .win98-window aparecer.
+  function whenWindowsExist(cb) {
+    if (document.querySelectorAll('.win98-window').length) { cb(); return; }
+    var observer = new MutationObserver(function () {
+      if (document.querySelectorAll('.win98-window').length) {
+        observer.disconnect();
+        cb();
+      }
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    setTimeout(function () {
+      observer.disconnect();
+      if (!document.querySelectorAll('.win98-window').length) {
+        console.warn('[window_manager] nenhuma .win98-window encontrada após 8s — ' +
+                     'confira se app.layout renderizou e se ids/classes batem.');
+      }
+    }, 8000);
+  }
+
+  whenWindowsExist(initDesktop);
+})();

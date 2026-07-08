@@ -1,0 +1,438 @@
+/* Feedback visual dos botões WIN/WDO/WIN×WDO — ver CHANGELOG.md 2026-07-04. */
+.win98-btn:hover {
+    filter: brightness(1.08);
+}
+
+/* Pulso rápido ao trocar de ativo (WIN/WDO/WIN×WDO) — dá uma confirmação
+   visual imediata do clique, antes do conteúdo terminar de recarregar.
+   Disparado via clientside callback em store-ativo (dashboard_98.py).
+   Seletor genérico (.trocando-ativo, não mais #conteudo-principal) porque
+   agora aplica em 4 janelas separadas — Hero/Market View/Price Action/
+   Big Players — em vez de um único container. */
+.trocando-ativo {
+    animation: pulso-troca-ativo 0.35s ease;
+}
+@keyframes pulso-troca-ativo {
+    0%   { opacity: 0.45; }
+    100% { opacity: 1; }
+}
+
+/* =========================================================================
+   TEMA WINDOWS 98 — fundação (ver estilo_win98.py para os tokens/bevels
+   usados em style= inline; aqui só o que precisa de :active/:hover/:before,
+   scrollbar e @font-face, que não dá pra fazer em dict Python).
+   ========================================================================= */
+
+/* MS Sans Serif bitmap fica disponível (@font-face) mas não é mais a
+   fonte padrão — ver estilo_win98.py::FONTS. Achatada/pixelada demais em
+   telas de hoje; trocamos por Tahoma, que é suave e ainda assim período-
+   correta (o próprio Windows 98/2000 já usava Tahoma em vários diálogos). */
+@font-face {
+    font-family: 'Pixelated MS Sans Serif';
+    src: url('fonts/ms_sans_serif.woff2') format('woff2');
+    font-weight: normal;
+    font-style: normal;
+    font-display: swap;
+}
+@font-face {
+    font-family: 'Pixelated MS Sans Serif';
+    src: url('fonts/ms_sans_serif_bold.woff2') format('woff2');
+    font-weight: bold;
+    font-style: normal;
+    font-display: swap;
+}
+
+/* Botão Win98 pressionado ao clique — inverte o bevel (raised -> sunken).
+   Precisa ser :active porque style inline não tem pseudo-classe. */
+.win98-btn:active {
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
+                inset -2px -2px #DFDFDF, inset 2px 2px #808080 !important;
+}
+.win98-btn:focus-visible {
+    outline: 1px dotted #000000;
+    outline-offset: -4px;
+}
+
+/* Scrollbar clássica — valores copiados literalmente do CSS compilado de
+   98.css v0.1.20 (github.com/jdan/98.css, MIT): setas de rolagem reais
+   (bitmap SVG) e o padrão xadrez 2x2 do track, não uma barra lisa. A
+   versão anterior aqui era uma simplificação livre (só bevel, sem setas
+   nem padrão de track) — não batia com a referência. */
+::-webkit-scrollbar {
+    width: 16px;
+}
+::-webkit-scrollbar:horizontal {
+    height: 17px;
+}
+::-webkit-scrollbar-corner {
+    background: #dfdfdf;
+}
+::-webkit-scrollbar-track {
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg width='2' height='2' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M1 0H0v1h1v1h1V1H1V0z' fill='silver'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M2 0H1v1H0v1h1V1h1V0z' fill='%23fff'/%3E%3C/svg%3E");
+}
+::-webkit-scrollbar-thumb {
+    background-color: #dfdfdf;
+    box-shadow: inset -1px -1px #0a0a0a, inset 1px 1px #fff,
+                inset -2px -2px grey, inset 2px 2px #dfdfdf;
+}
+::-webkit-scrollbar-button:horizontal:end:increment,
+::-webkit-scrollbar-button:horizontal:start:decrement,
+::-webkit-scrollbar-button:vertical:end:increment,
+::-webkit-scrollbar-button:vertical:start:decrement {
+    display: block;
+}
+::-webkit-scrollbar-button:vertical:start {
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg width='16' height='17' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M15 0H0v16h1V1h14V0z' fill='%23DFDFDF'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M2 1H1v14h1V2h12V1H2z' fill='%23fff'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M16 17H0v-1h15V0h1v17z' fill='%23000'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M15 1h-1v14H1v1h14V1z' fill='gray'/%3E%3Cpath fill='silver' d='M2 2h12v13H2z'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M8 6H7v1H6v1H5v1H4v1h7V9h-1V8H9V7H8V6z' fill='%23000'/%3E%3C/svg%3E");
+    height: 17px;
+}
+::-webkit-scrollbar-button:vertical:end {
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg width='16' height='17' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M15 0H0v16h1V1h14V0z' fill='%23DFDFDF'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M2 1H1v14h1V2h12V1H2z' fill='%23fff'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M16 17H0v-1h15V0h1v17z' fill='%23000'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M15 1h-1v14H1v1h14V1z' fill='gray'/%3E%3Cpath fill='silver' d='M2 2h12v13H2z'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M11 6H4v1h1v1h1v1h1v1h1V9h1V8h1V7h1V6z' fill='%23000'/%3E%3C/svg%3E");
+    height: 17px;
+}
+::-webkit-scrollbar-button:horizontal:start {
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg width='16' height='17' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M15 0H0v16h1V1h14V0z' fill='%23DFDFDF'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M2 1H1v14h1V2h12V1H2z' fill='%23fff'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M16 17H0v-1h15V0h1v17z' fill='%23000'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M15 1h-1v14H1v1h14V1z' fill='gray'/%3E%3Cpath fill='silver' d='M2 2h12v13H2z'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M9 4H8v1H7v1H6v1H5v1h1v1h1v1h1v1h1V4z' fill='%23000'/%3E%3C/svg%3E");
+    width: 16px;
+}
+::-webkit-scrollbar-button:horizontal:end {
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg width='16' height='17' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M15 0H0v16h1V1h14V0z' fill='%23DFDFDF'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M2 1H1v14h1V2h12V1H2z' fill='%23fff'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M16 17H0v-1h15V0h1v17z' fill='%23000'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M15 1h-1v14H1v1h14V1z' fill='gray'/%3E%3Cpath fill='silver' d='M2 2h12v13H2z'/%3E%3Cpath fill-rule='evenodd' clip-rule='evenodd' d='M7 4H6v7h1v-1h1V9h1V8h1V7H9V6H8V5H7V4z' fill='%23000'/%3E%3C/svg%3E");
+    width: 16px;
+}
+
+/* Cursor de ampulheta durante atualização — charme de época */
+.carregando, .carregando * {
+    cursor: wait !important;
+}
+
+/* =========================================================================
+   METÁFORA DE DESKTOP — janelas, taskbar, Start, ícones
+   (mecânica em assets_98/window_manager.js; aqui só o que precisa de
+   classe/pseudo-classe, que não dá pra fazer em style= inline do Python)
+   ========================================================================= */
+
+html, body, #react-entry-point {
+    height: 100%;
+    margin: 0;
+    overflow: hidden; /* desktop não rola de página — como um SO de verdade */
+    background: #008080; /* teal do desktop nas bordas/gutters */
+}
+
+.win98-window.maximized {
+    top: 0 !important;
+    left: 0 !important;
+    width: 100% !important;
+    height: calc(100vh - 30px) !important;
+}
+.win98-window.minimized,
+.win98-window.closed {
+    /* !important necessário: win98_window() define 'display: flex' inline
+       (pro layout de titlebar+body+statusbar), e estilo inline sempre vence
+       sobre classe — sem isso, minimizar/fechar não escondia a janela. */
+    display: none !important;
+}
+.win98-window-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 14px 10px 10px;
+    background: #C0C0C0;
+}
+
+/* Janela sem foco — titlebar cinza em vez de navy (decidido 100% no
+   cliente, via window_manager.js alternando esta classe) */
+.win98-window.inactive .win98-titlebar {
+    background: linear-gradient(90deg, #808080, #B5B5B5) !important;
+}
+
+.win98-titlebar-btn:active {
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
+                inset -2px -2px #DFDFDF, inset 2px 2px #808080 !important;
+}
+
+.win98-icon span {
+    padding: 1px 3px;
+}
+.win98-icon.selected span {
+    background: #000080;
+    color: #FFFFFF;
+    text-shadow: none;
+}
+.win98-icon:focus-visible {
+    outline: 1px dotted #FFFFFF;
+}
+
+.win98-taskbar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px;
+    background: #C0C0C0;
+    z-index: 9000;
+    box-shadow: inset 0 1px #FFFFFF;
+}
+.win98-start-btn:active,
+.win98-start-btn.open {
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
+                inset -2px -2px #DFDFDF, inset 2px 2px #808080 !important;
+}
+.win98-taskbar-sep {
+    width: 2px;
+    align-self: stretch;
+    box-shadow: inset -1px 0 #FFFFFF, inset 1px 0 #808080;
+}
+.win98-taskbar-buttons {
+    display: flex;
+    gap: 3px;
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+}
+.win98-task-btn {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 10px;
+    height: 22px;
+    font-size: 11px;
+    background: #C0C0C0;
+    border: none;
+    cursor: pointer;
+    max-width: 160px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-family: 'Tahoma', 'Segoe UI', Verdana, Arial, sans-serif;
+    flex-shrink: 0;
+    /* Todo botão de taskbar é 3D por padrão (mesmo minimizado/sem foco) —
+       só o da janela em foco fica "afundado" (.active). Antes, os
+       não-ativos não tinham NENHUM box-shadow, ou seja, ficavam
+       completamente chapados. */
+    box-shadow: inset -1px -1px #0a0a0a, inset 1px 1px #fff,
+                inset -2px -2px #808080, inset 2px 2px #DFDFDF;
+}
+.win98-task-btn.active {
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
+                inset -2px -2px #DFDFDF, inset 2px 2px #808080;
+}
+
+.win98-start-menu {
+    position: fixed;
+    left: 2px; bottom: 32px;
+    width: 200px;
+    background: #C0C0C0;
+    padding: 2px;
+    z-index: 9001;
+    display: none;
+    box-shadow: inset -1px -1px #000000, inset 1px 1px #FFFFFF,
+                inset -2px -2px #808080, inset 2px 2px #DFDFDF;
+}
+.win98-start-menu.open {
+    display: block;
+}
+.win98-start-item:hover {
+    background: #000080;
+    color: #FFFFFF;
+    cursor: default;
+}
+.win98-start-menu-inner {
+    display: flex;
+}
+.win98-start-side {
+    width: 22px;
+    background: linear-gradient(180deg, #808080, #000080 55%);
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    padding-bottom: 8px;
+}
+.win98-start-side span {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+    color: #FFFFFF;
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 1px;
+    font-family: 'Tahoma', 'Segoe UI', Verdana, Arial, sans-serif;
+}
+.win98-start-items {
+    flex: 1;
+    padding: 2px;
+}
+
+/* =========================================================================
+   CLIPPY — Mentor IA. NÃO é uma janela (sem titlebar/taskbar/minimizar) —
+   é o assistente flutuante que fica sempre ancorado no canto e abre seu
+   balão de fala ao ser clicado (arrastável, do mesmo jeito que o Clippy
+   original). Cores/moldura/fonte do balão copiadas do clippy.css real
+   (github.com/clippyjs/clippy.js, MIT — o mesmo Clippy que
+   felixrieseberg/clippy usa). O conteúdo interno (histórico/input/
+   scrollbar) é o "ajuste inevitável" pra virar chat de verdade — ver
+   assets_98/clippy_agent.js pro sprite/drag/reposicionamento do balão.
+   ========================================================================= */
+#clippy-agent {
+    position: fixed;
+    z-index: 8000;
+    cursor: pointer;
+}
+.clippy-balloon {
+    position: fixed;
+    z-index: 8001;
+    display: none;
+    background: #FFFFCC;
+    color: #000;
+    border: 1px solid #000;
+    border-radius: 6px;
+    padding: 10px;
+    width: 280px;
+    box-shadow: 3px 3px 8px rgba(0, 0, 0, .35);
+}
+.clippy-balloon.open {
+    display: block;
+}
+.clippy-content {
+    display: flex;
+    flex-direction: column;
+    font-family: 'Tahoma', 'Segoe UI', Verdana, Arial, sans-serif;
+    font-size: 11px;
+}
+.clippy-chat-historico {
+    background: #FFFFFF;
+    box-shadow: inset -1px -1px #fff, inset 1px 1px grey,
+                inset -2px -2px #dfdfdf, inset 2px 2px #0a0a0a;
+    height: 285px; /* 1.5x (era 190px) — pedido em 2026-07-08 */
+    overflow-y: auto;
+    padding: 4px;
+    margin-bottom: 6px;
+}
+.clippy-chat-inputrow {
+    display: flex;
+    gap: 4px;
+}
+
+/* Preloader clássico Win98 — os bloquinhos azuis do "please wait" de
+   instalação/cópia de arquivo. Track sunken (mesmo bevel de input) com uma
+   faixa de blocos (repeating-linear-gradient, não elementos separados)
+   que desliza da esquerda pra direita em loop — indeterminado porque não
+   temos como saber quanto tempo a IA vai demorar a responder. Pequeno e
+   discreto de propósito (fica ao lado do seletor de modelo, não empilhado
+   acima dele) — ver o `html.Div` wrapper em dashboard_98.py. */
+.win98-progress {
+    width: 36px;
+    height: 10px;
+    flex-shrink: 0;
+    background: #FFFFFF;
+    box-shadow: inset -1px -1px #fff, inset 1px 1px grey,
+                inset -2px -2px #dfdfdf, inset 2px 2px #0a0a0a;
+    overflow: hidden;
+    position: relative;
+}
+.win98-progress-fill {
+    position: absolute;
+    top: 1px; bottom: 1px; left: 0;
+    width: 50%;
+    background-image: repeating-linear-gradient(90deg,
+        #000080 0px, #000080 5px, transparent 5px, transparent 7px);
+    animation: win98-progress-scroll 1s linear infinite;
+}
+@keyframes win98-progress-scroll {
+    0%   { left: -50%; }
+    100% { left: 100%; }
+}
+
+/* Seletor de modelo do Mentor IA (2026-07-08) — dcc.Dropdown no Dash 4.3
+   NÃO é mais o react-select clássico — é um componente próprio sobre
+   Radix UI (classes .dash-dropdown-* conferidas em dash/dcc/
+   async-dropdown.js). Duas tentativas anteriores com nomes de classe
+   específicos não pegaram direito (estrutura interna deve ser diferente
+   do esperado) — universal `#chat-modelo *` é a versão à prova de
+   adivinhação errada: pega QUALQUER elemento dentro do controle fechado.
+   A LISTA ABERTA de opções pode renderizar fora da árvore de #chat-modelo
+   (padrão comum de portal em componentes Radix) — por isso essas regras
+   não são escopadas pelo id. Só existe 1 dropdown na página, sem risco de
+   colidir com outro. */
+#chat-modelo, #chat-modelo * {
+    background-color: #FFFFFF !important;
+    color: #000 !important;
+    font-size: 9px !important;
+}
+#chat-modelo {
+    border-radius: 0;
+    box-shadow: inset -1px -1px #fff, inset 1px 1px grey,
+                inset -2px -2px #dfdfdf, inset 2px 2px #0a0a0a;
+    min-height: unset !important;
+    height: 17px !important;
+}
+/* mais discreto (2026-07-08): reduz o padding vertical interno pra ficar
+   mais baixo/compacto — o componente por padrão vem com bastante respiro
+   vertical, exagerado pra um seletor secundário que não é o foco do chat.
+   O wildcard sozinho não bastou (a caixa clicável tem um min-height/
+   line-height próprio, independente do padding dos filhos) — reduzindo
+   a altura pela metade (2026-07-08) precisou mirar a classe real do
+   "trigger" (a caixa clicável fechada, ver dash/dcc/async-dropdown.js). */
+#chat-modelo * {
+    padding-top: 1px !important;
+    padding-bottom: 1px !important;
+}
+#chat-modelo .dash-dropdown-grid-container.dash-dropdown-trigger {
+    min-height: 0 !important;
+    height: 15px !important;
+    align-items: center !important;
+}
+#chat-modelo .dash-dropdown-value,
+#chat-modelo .dash-dropdown-value-item {
+    line-height: 13px !important;
+}
+#chat-modelo .dash-dropdown-trigger-icon {
+    width: 9px !important;
+    height: 9px !important;
+}
+#chat-modelo *:focus, #chat-modelo *:focus-visible {
+    outline: none !important; box-shadow: none !important;
+}
+.dash-dropdown-value-item {
+    overflow: hidden !important; text-overflow: ellipsis !important;
+    white-space: nowrap !important; max-width: 140px !important;
+    display: inline-block !important;
+}
+.dash-dropdown-content {
+    background-color: #C0C0C0 !important; border-radius: 0 !important; color: #000 !important;
+    box-shadow: inset -1px -1px #000, inset 1px 1px #fff,
+                inset -2px -2px #808080, inset 2px 2px #dfdfdf;
+    z-index: 9500 !important; /* acima da taskbar (9000) e do Start Menu (9001) */
+}
+.dash-dropdown-option {
+    background-color: #C0C0C0 !important; color: #000 !important; font-size: 9px !important;
+}
+.dash-dropdown-option:hover,
+.dash-dropdown-option[data-highlighted],
+.dash-dropdown-option[aria-selected="true"] {
+    background-color: #000080 !important; color: #fff !important;
+}
+
+/* Ponta do balão — mesmo sprite (bitmap) do clippy.js original, com as 4
+   variantes de posição/espelhamento conforme o lado escolhido pelo
+   reposition() em clippy_agent.js (mesmo algoritmo do balloon.js
+   original: tenta os 4 cantos até um que caiba na viewport). */
+.clippy-tip {
+    width: 10px;
+    height: 16px;
+    position: absolute;
+    background: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAgCAMAAAAlvKiEAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAAAlQTFRF///MAAAA////52QwgAAAAAN0Uk5T//8A18oNQQAAAGxJREFUeNqs0kEOwCAIRFHn3//QTUU6xMyyxii+jQosrTPkyPEM6IN3FtzIRk1U4dFeKWQiH6pRRowMVKEmvronEynkwj0uZJgR22+YLopPSo9P34wJSamLSU7lSIWLJU7NkNomNlhqxUeAAQC+TQLZyEuJBwAAAABJRU5ErkJggg==") no-repeat;
+}
+.clippy-balloon.clippy-top-left .clippy-tip {
+    top: 100%; margin-top: 0; left: 100%; margin-left: -50px;
+}
+.clippy-balloon.clippy-top-right .clippy-tip {
+    top: 100%; margin-top: 0; left: 0; margin-left: 50px;
+    background-position: -10px 0;
+}
+.clippy-balloon.clippy-bottom-right .clippy-tip {
+    top: 0; margin-top: -16px; left: 0; margin-left: 50px;
+    background-position: -10px -16px;
+}
+.clippy-balloon.clippy-bottom-left .clippy-tip {
+    top: 0; margin-top: -16px; left: 100%; margin-left: -50px;
+    background-position: 0 -16px;
+}
