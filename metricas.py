@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 
 import config_backtest as cfg
+import features
 
 
 def extrair_metricas(df: pd.DataFrame, n_snapshot: int = 500) -> dict:
@@ -208,3 +209,183 @@ def extrair_metricas(df: pd.DataFrame, n_snapshot: int = 500) -> dict:
     m['score_contexto'] = max(0.0, min(1.0, ctx))
 
     return m
+
+
+def _json_safe(v):
+    """Converte tipos numpy/NaN (que `extrair_metricas` produz por vir de um
+    `pd.Series`) para tipos nativos Python — `json.dumps` não serializa
+    `numpy.int64`/`numpy.bool_` diretamente, e NaN vira `None` em vez do
+    literal inválido "NaN"."""
+    if v is None:
+        return None
+    if isinstance(v, (np.floating, float)):
+        f = float(v)
+        return None if f != f else f  # f != f detecta NaN
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.bool_, bool)):
+        return bool(v)
+    if isinstance(v, dict):
+        return {k: _json_safe(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    return v
+
+
+def montar_snapshot_diario(m: dict) -> dict | None:
+    """
+    Recorte JSON-safe de `extrair_metricas()` para gravar junto de um trade
+    do Diário — captura o que o motor via no instante do save, sem I/O novo
+    (reaproveita o dict `m` já calculado a cada tick de 1s). Escopo: só
+    CAPTURA (direção quant→diário). Comparar isso contra `nivel_sr_referencia`
+    marcado à mão é um passo futuro registrado no plano do módulo Diário, não
+    implementado aqui.
+
+    Recorte deliberado, não o dict inteiro: fora ficam o bloco de fluxo/tape
+    (sensível ao segundo exato, sem relação com comparar níveis S/R) e os
+    aliases legados de rank 1 (`sr_acima`/`sr_abaixo`, redundantes com
+    `niveis_sr_*[0]`).
+    """
+    if not m:
+        return None
+
+    def _nivel(n: dict) -> dict:
+        return {campo: n.get(campo) for campo in (
+            'rank', 'preco', 'toques', 'idade', 'violado', 'forte',
+            'dist_atr', 'zona_min', 'zona_max', 'status',
+            'prob_bounce', 'rompimento_hoje',
+        )}
+
+    snapshot = {
+        'preco': m.get('preco'), 'atr': m.get('atr'), 'amp_dia_atr': m.get('amp_dia_atr'),
+        'tendencia': m.get('tendencia'), 'fase': m.get('fase'), 'saude': m.get('saude'),
+        'tipo_candle': m.get('tipo_candle'),
+        'niveis_sr_acima': [_nivel(n) for n in m.get('niveis_sr_acima', [])],
+        'niveis_sr_abaixo': [_nivel(n) for n in m.get('niveis_sr_abaixo', [])],
+        'pivo_imediato_acima': m.get('pivo_imediato_acima'),
+        'pivo_imediato_abaixo': m.get('pivo_imediato_abaixo'),
+        'buildup_ativo': m.get('buildup_ativo'), 'buildup_duracao': m.get('buildup_duracao'),
+        'buildup_pct_atr': m.get('buildup_pct_atr'),
+        'double_pressure': m.get('double_pressure'), 'dp_qualidade': m.get('dp_qualidade'),
+        'score_forca': m.get('score_forca'), 'score_contexto': m.get('score_contexto'),
+    }
+    return _json_safe(snapshot)
+
+
+def candles_para_grafico(df: pd.DataFrame, n: int = 300) -> list:
+    """OHLC no formato que o Lightweight Charts espera (ver assets_98/
+    lwchart.js e assets/lwchart.js — um gráfico em cada front-end, mesma
+    extração de dado) — `time` em epoch segundos. `Timestamp.timestamp()`
+    num datetime naive assume fuso LOCAL do sistema (mesmo comportamento do
+    `datetime.timestamp()` padrão do Python) — correto aqui porque servidor
+    e navegador rodam na mesma máquina (uso único, localhost)."""
+    if df is None or df.empty:
+        return []
+    d = df.tail(n)
+    return [
+        {'time': int(pd.Timestamp(dt).timestamp()),
+         'open': float(o), 'high': float(h), 'low': float(l), 'close': float(c)}
+        for dt, o, h, l, c in zip(d['datetime'], d['open'], d['high'], d['low'], d['close'])
+    ]
+
+
+def niveis_sr_para_grafico(m: dict) -> list:
+    """Os mesmos níveis de S/R rankeados exibidos no Price Action (mais o
+    pivô imediato, quando houver), no formato que assets_98/lwchart.js e
+    assets/lwchart.js usam pra desenhar linhas horizontais
+    (`createPriceLine`) — ver `desenharNiveisSR` em ambos. Reaproveita
+    `m['niveis_sr_acima'/'abaixo']`, já calculado por `extrair_metricas`;
+    não recalcula nada, só reformata pro gráfico."""
+    def _valido(preco):
+        return preco is not None and not (isinstance(preco, float) and np.isnan(preco))
+
+    out = []
+    for n in m.get('niveis_sr_acima', []):
+        if _valido(n.get('preco')):
+            out.append({'preco': float(n['preco']), 'tipo': 'resistencia',
+                        'forte': bool(n.get('forte')), 'label': f"R{n.get('rank', '')}"})
+    for n in m.get('niveis_sr_abaixo', []):
+        if _valido(n.get('preco')):
+            out.append({'preco': float(n['preco']), 'tipo': 'suporte',
+                        'forte': bool(n.get('forte')), 'label': f"S{n.get('rank', '')}"})
+    pivo_acima = m.get('pivo_imediato_acima')
+    if pivo_acima and _valido(pivo_acima.get('preco')):
+        out.append({'preco': float(pivo_acima['preco']), 'tipo': 'pivo',
+                     'forte': False, 'label': 'Topo em formação'})
+    pivo_abaixo = m.get('pivo_imediato_abaixo')
+    if pivo_abaixo and _valido(pivo_abaixo.get('preco')):
+        out.append({'preco': float(pivo_abaixo['preco']), 'tipo': 'pivo',
+                     'forte': False, 'label': 'Fundo em formação'})
+    return out
+
+
+def _serie_mme21(df: pd.DataFrame) -> pd.Series:
+    """EMA21 sobre o close — `adjust=False` é o cálculo recursivo padrão
+    (cada valor pesa no anterior), o mesmo que qualquer plataforma de
+    gráfico usa pra média móvel exponencial."""
+    return df['close'].ewm(span=cfg.MME21_PERIODO, adjust=False).mean()
+
+
+def mme21_para_grafico(df: pd.DataFrame, n: int = 300) -> list:
+    """Série da MME21 no formato que o Lightweight Charts espera pra uma
+    linha (`addLineSeries` + `setData`) — ver assets_98/lwchart.js e
+    assets/lwchart.js. Mesma extração de tempo de `candles_para_grafico`,
+    mas 1 valor por candle (não OHLC) — calcula a EMA sobre TODO o
+    histórico disponível (a EMA "esquece" o passado bem distante sozinha
+    via decaimento exponencial) e só serializa os últimos `n`."""
+    if df is None or df.empty:
+        return []
+    mme = _serie_mme21(df)
+    d = df[['datetime']].tail(n)
+    valores = mme.tail(n)
+    return [
+        {'time': int(pd.Timestamp(dt).timestamp()), 'value': float(v)}
+        for dt, v in zip(d['datetime'], valores)
+    ]
+
+
+def mme21_ponto_live(df: pd.DataFrame, preco_live: float = None) -> dict | None:
+    """Só o ponto da MME21 no candle EM FORMAÇÃO — mesmo espírito do candle
+    vivo em `candles_para_grafico(df, n=1)`: barato (não serializa a série
+    inteira), aplicado no cliente via `.update()`, nunca `.setData()`. Se
+    `preco_live` vier (preço em tempo real, candle ainda não fechou), a EMA
+    do último ponto é recalculada com esse preço no lugar do close
+    persistido — mesma ideia de "respirar" no tick de 1s que os candles
+    já fazem."""
+    if df is None or df.empty:
+        return None
+    mme = _serie_mme21(df)
+    ultimo_dt = df['datetime'].iloc[-1]
+    valor = float(mme.iloc[-1])
+    if preco_live is not None and len(mme) > 1:
+        alpha = 2.0 / (cfg.MME21_PERIODO + 1)
+        ema_anterior = float(mme.iloc[-2])
+        valor = alpha * preco_live + (1 - alpha) * ema_anterior
+    return {'time': int(pd.Timestamp(ultimo_dt).timestamp()), 'value': valor}
+
+
+def analisar_mme21(df: pd.DataFrame, tendencia: str = None) -> dict:
+    """Leitura quantitativa da MME21 pra seção "Rastreador de Tendência" —
+    mesma linguagem do Price Action (toques/força/probabilidade), via
+    `features.analisar_linha_generica`, mas com a regra própria do Jesué
+    pra médias móveis: testada e respeitada só 1x já conta como forte
+    (`TOQUES_MINIMOS_MME21_FORTE=1`, mais permissivo que o S/R estático), e
+    NUNCA operável em mercado lateral — a MME21 não é o operacional
+    principal dele, só ajuda em dias de tendência sem entrada no price
+    action puro."""
+    if df is None or df.empty:
+        return {'operavel': False, 'mensagem': 'Base de dados não encontrada.'}
+
+    mme = _serie_mme21(df)
+    analise = features.analisar_linha_generica(
+        df, mme.values, janela=cfg.JANELA_RESPEITO_MME21,
+        toques_min_forte=cfg.TOQUES_MINIMOS_MME21_FORTE,
+    )
+
+    lateral = (tendencia == 'lateral')
+    analise['operavel'] = not lateral
+    analise['mensagem'] = (
+        'Mercado lateral — MME21 não deve ser operada aqui. Aguarde tendência definida.'
+        if lateral else None
+    )
+    return analise

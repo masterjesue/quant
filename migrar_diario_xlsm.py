@@ -408,6 +408,8 @@ def _montar_dataframe(caminho_xlsm) -> tuple[pd.DataFrame, dict[int, bytes], Cou
     df["nivel_sr_referencia"] = None
     df["nivel_sr_tipo"] = None
     df["nivel_sr_forte"] = None
+    df["snapshot_mercado_json"] = None
+    df["imagens_adicionais"] = [[] for _ in range(len(df))]
     df["tags_setup_erro"] = [[] for _ in range(len(df))]
     df["imagem_arquivo"] = None
 

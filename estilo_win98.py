@@ -213,7 +213,7 @@ def win98_window(window_id: str, titulo: str, children, icone: str = '🗔',
                   width: str = '480px', min_width: str = '300px',
                   default_top_pct: float = 8, default_left_pct: float = 6,
                   start_closed: bool = False, menubar=None, statusbar=None,
-                  estilo_extra=None):
+                  estilo_extra=None, resizable: bool = False):
     """Janela de desktop genérica. `window_id` é ao mesmo tempo o `id` do
     DOM (usado pelo Dash pra popular o conteúdo interno via callback,
     inalterado) e o `data-window` que assets/window_manager.js usa como
@@ -234,12 +234,24 @@ def win98_window(window_id: str, titulo: str, children, icone: str = '🗔',
         }))
 
     classes = 'win98-window' + (' closed' if start_closed else '')
-    return html.Div(corpo, id=window_id, className=classes, **{
+    data_attrs = {
         'data-window': window_id,
         'data-default-top': str(default_top_pct),
         'data-default-left': str(default_left_pct),
         'data-start-closed': 'true' if start_closed else 'false',
-    }, style={
+    }
+    if width.endswith('%'):
+        # Largura percentual — assets_98/window_manager.js recalcula essa
+        # mesma porcentagem em cima da largura "útil" (viewport menos a
+        # coluna de ícones do desktop), pra caber lado a lado sem precisar
+        # de zoom e sem tampar os ícones (ver ICON_RAIL no JS).
+        data_attrs['data-default-width'] = width[:-1]
+    if resizable:
+        # Pega os handles de borda/canto que assets_98/window_manager.js
+        # injeta via JS (não HTML — mais simples manter os 8 <div> num só
+        # lugar do que duplicar em cada chamada de win98_window).
+        data_attrs['data-resizable'] = 'true'
+    return html.Div(corpo, id=window_id, className=classes, **data_attrs, style={
         # 3px de padding (igual ao .window real de 98.css) é o que dá
         # espaço pro bevel aparecer — com padding 0, a titlebar/body (que
         # cobrem 100% da área) pintam por cima da sombra 3D e ela some
@@ -337,7 +349,10 @@ JANELAS = [
     {'id': 'win-quantlab',     'titulo': 'Quant Lab',     'icone': '/assets/icons/my-computer.png', 'start_closed': False, 'implementada': True},
     {'id': 'win-price-action', 'titulo': 'Price Action',  'icone': '/assets/icons/find-file.png',   'start_closed': False, 'implementada': True},
     {'id': 'win-big-players',  'titulo': 'Big Players',   'icone': '/assets/icons/favorites.png',   'start_closed': False, 'implementada': True},
+    {'id': 'win-grafico',      'titulo': 'Gráfico',       'icone': '/assets/icons/grafico.png',     'start_closed': False, 'implementada': True},
     {'id': 'win-diario',       'titulo': 'Diário',        'icone': '/assets/icons/notepad.png',     'start_closed': True,  'implementada': True},
+    {'id': 'win-posicao',      'titulo': 'Posição',       'icone': '/assets/icons/network.png',     'start_closed': True,  'implementada': True},
+    {'id': 'win-rastreador',   'titulo': 'Rastreador de Tendência', 'icone': '/assets/icons/rastreador.png', 'start_closed': True, 'implementada': True},
     {'id': 'win-backtesting',  'titulo': 'Backtesting',   'icone': '/assets/icons/calculator.png',  'start_closed': True,  'implementada': False},
     {'id': 'win-config',       'titulo': 'Configurações', 'icone': '/assets/icons/settings.png',    'start_closed': True,  'implementada': False},
 ]

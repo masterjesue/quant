@@ -146,11 +146,15 @@
   // à experiência original: ele pode ser clicado E arrastado).
   // -------------------------------------------------------------------------
   function wireDrag() {
-    var dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0;
+    var dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0, width = 0, height = 0;
     el.addEventListener('mousedown', function (e) {
       dragging = true; moved = false;
       sx = e.clientX; sy = e.clientY;
       var r = agentRect(); ox = r.left; oy = r.top;
+      // Cacheado 1x (não em cada mousemove) — ler el.offsetWidth/offsetHeight
+      // depois de escrever el.style.left/top força layout síncrono a cada
+      // frame do arraste (mesmo bug corrigido em window_manager.js).
+      width = r.width; height = r.height;
       e.preventDefault();
     });
     window.addEventListener('mousemove', function (e) {
@@ -158,8 +162,8 @@
       var dx = e.clientX - sx, dy = e.clientY - sy;
       if (!moved && Math.hypot(dx, dy) < DRAG_THRESHOLD) return;
       moved = true;
-      var left = Math.max(0, Math.min(ox + dx, window.innerWidth - el.offsetWidth));
-      var top = Math.max(0, Math.min(oy + dy, window.innerHeight - 30 - el.offsetHeight));
+      var left = Math.max(0, Math.min(ox + dx, window.innerWidth - width));
+      var top = Math.max(0, Math.min(oy + dy, window.innerHeight - 30 - height));
       el.style.left = left + 'px'; el.style.top = top + 'px';
       el.style.right = 'auto'; el.style.bottom = 'auto';
       if (balloonOpen) repositionBalloon();

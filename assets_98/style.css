@@ -148,6 +148,19 @@ html, body, #react-entry-point {
                 inset -2px -2px #DFDFDF, inset 2px 2px #808080 !important;
 }
 
+/* Handles de redimensionar — injetados via JS (window_manager.js) só nas
+   janelas com data-resizable="true". Ficam DENTRO do miolo da janela (não
+   projetados pra fora, tipo -3px) porque o .win98-window tem overflow:
+   hidden (necessário pro bevel/scroll não vazar) — um handle com offset
+   negativo seria cortado e ficaria impossível de clicar. */
+.win98-resize-handle { position: absolute; z-index: 6; }
+.win98-resize-e  { top: 0; right: 0; width: 5px; height: 100%; cursor: ew-resize; }
+.win98-resize-w  { top: 0; left: 0; width: 5px; height: 100%; cursor: ew-resize; }
+.win98-resize-s  { left: 0; bottom: 0; width: 100%; height: 5px; cursor: ns-resize; }
+.win98-resize-se { right: 0; bottom: 0; width: 12px; height: 12px; cursor: nwse-resize; z-index: 7; }
+.win98-resize-sw { left: 0; bottom: 0; width: 12px; height: 12px; cursor: nesw-resize; z-index: 7; }
+.win98-window.maximized .win98-resize-handle { display: none; }
+
 .win98-icon span {
     padding: 1px 3px;
 }

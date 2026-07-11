@@ -270,13 +270,18 @@ def buscar_candles(ticker: str, n: int = 10000) -> pd.DataFrame | None:
 
 def buscar_candles_apos(ticker: str, data_referencia: datetime) -> pd.DataFrame | None:
     """
-    Busca candles do ticker estritamente posteriores à data de referência.
-    Usado para complementar o CSV com o que veio depois da última exportação.
+    Busca candles do ticker a partir da data de referência (inclusive).
+    Inclusive de propósito: o candle em `data_referencia` pode ter sido
+    salvo ainda em formação (MT5 sempre retorna o candle M5 corrente com
+    valores parciais, mudando a cada tick) — re-buscá-lo permite que
+    `merge_fontes.atualizar_incremental` (via `drop_duplicates(keep='last')`)
+    substitua o valor parcial pelo definitivo assim que o candle fechar, em
+    vez de congelá-lo para sempre no primeiro flagra incompleto.
     """
     todos = buscar_candles(ticker, n=10000)
     if todos is None:
         return None
-    return todos[todos['datetime'] > data_referencia].reset_index(drop=True)
+    return todos[todos['datetime'] >= data_referencia].reset_index(drop=True)
 
 
 # -----------------------------------------------------------------------------
@@ -486,6 +491,97 @@ def agrupar_posicoes(df_deals: pd.DataFrame) -> pd.DataFrame:
             'profit_total': float(pernas_out['profit'].sum()) if not pernas_out.empty else 0.0,
             'tickets_entrada': list(pernas_in['ticket']),
             'tickets_saida': list(pernas_out['ticket']),
+        })
+    return pd.DataFrame(linhas, columns=colunas)
+
+
+# -----------------------------------------------------------------------------
+# POSIÇÕES ABERTAS AO VIVO — seção "Posição" dos dashboards (ver plano em
+# C:\Users\jesue\.claude\plans\analise-o-bloco-de-glimmering-marble.md)
+# -----------------------------------------------------------------------------
+
+def buscar_posicoes_abertas(ticker: str | None = None) -> pd.DataFrame | None:
+    """
+    Wrap de mt5.positions_get() — posições REALMENTE abertas agora na conta
+    conectada (mesma conta real da reconciliação, ver comentário acima de
+    _extrair_raiz_contrato). Chamada direta, sem _com_retry: roda num tick
+    de alguns segundos (não o de 1s), mesmo espírito de
+    atualizar_candle_atual/symbol_info_tick em dashboard.py — se falhar
+    numa rodada, o próximo ciclo tenta de novo, nunca trava a UI.
+
+    Retorna None se a chamada ao MT5 falhar; DataFrame vazio (colunas
+    garantidas) se a chamada funcionou mas não há posição aberta agora.
+    """
+    colunas = ['ticket', 'ativo', 'contrato', 'tipo_operacao', 'volume',
+               'preco_entrada', 'preco_atual', 'sl', 'tp', 'profit',
+               'datetime_entrada', 'comment']
+    posicoes = mt5.positions_get(symbol=ticker) if ticker else mt5.positions_get()
+    if posicoes is None:
+        return None
+    if len(posicoes) == 0:
+        return pd.DataFrame(columns=colunas)
+
+    linhas = []
+    for p in posicoes:
+        linhas.append({
+            'ticket': p.ticket,
+            'ativo': _extrair_raiz_contrato(p.symbol),
+            'contrato': p.symbol,
+            'tipo_operacao': 'long' if p.type == mt5.POSITION_TYPE_BUY else 'short',
+            'volume': p.volume,
+            'preco_entrada': p.price_open,
+            'preco_atual': p.price_current,
+            'sl': p.sl or None,
+            'tp': p.tp or None,
+            'profit': p.profit,
+            'datetime_entrada': datetime.fromtimestamp(p.time),
+            'comment': _corrigir_mojibake(p.comment),
+        })
+    return pd.DataFrame(linhas, columns=colunas)
+
+
+_TIPO_ORDEM_PENDENTE = {
+    mt5.ORDER_TYPE_BUY_LIMIT: 'compra_limitada',
+    mt5.ORDER_TYPE_SELL_LIMIT: 'venda_limitada',
+    mt5.ORDER_TYPE_BUY_STOP: 'compra_stop',
+    mt5.ORDER_TYPE_SELL_STOP: 'venda_stop',
+    mt5.ORDER_TYPE_BUY_STOP_LIMIT: 'compra_stop_limitada',
+    mt5.ORDER_TYPE_SELL_STOP_LIMIT: 'venda_stop_limitada',
+}
+
+
+def buscar_ordens_pendentes(ticker: str | None = None) -> pd.DataFrame | None:
+    """
+    Wrap de mt5.orders_get() — ordens PENDENTES (ainda não executadas: buy/
+    sell limit/stop) na conta conectada. Diferente de `buscar_posicoes_
+    abertas`: aqui o preço-alvo é o que o usuário definiu (`price_open`),
+    não um preço de entrada já preenchido. Mesmo espírito de chamada direta
+    (sem _com_retry) que `buscar_posicoes_abertas`.
+
+    Retorna None se a chamada ao MT5 falhar; DataFrame vazio (colunas
+    garantidas) se a chamada funcionou mas não há ordem pendente agora.
+    """
+    colunas = ['ticket', 'ativo', 'contrato', 'tipo_ordem', 'volume',
+               'preco_pedido', 'sl', 'tp', 'datetime_criacao', 'comment']
+    ordens = mt5.orders_get(symbol=ticker) if ticker else mt5.orders_get()
+    if ordens is None:
+        return None
+    if len(ordens) == 0:
+        return pd.DataFrame(columns=colunas)
+
+    linhas = []
+    for o in ordens:
+        linhas.append({
+            'ticket': o.ticket,
+            'ativo': _extrair_raiz_contrato(o.symbol),
+            'contrato': o.symbol,
+            'tipo_ordem': _TIPO_ORDEM_PENDENTE.get(o.type, 'outro'),
+            'volume': o.volume_current,
+            'preco_pedido': o.price_open,
+            'sl': o.sl or None,
+            'tp': o.tp or None,
+            'datetime_criacao': datetime.fromtimestamp(o.time_setup),
+            'comment': _corrigir_mojibake(o.comment),
         })
     return pd.DataFrame(linhas, columns=colunas)
 

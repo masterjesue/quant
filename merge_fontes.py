@@ -175,6 +175,9 @@ def setup_inicial(prefixo: str, buscar_tick_historico: bool = True) -> pd.DataFr
             df_completo['fluxo_disponivel'] = False
     else:
         print(f"[merge] {prefixo}: pulando busca de tick (buscar_tick_historico=False)")
+        df_completo['delta'] = pd.NA
+        df_completo['vol_comprador'] = pd.NA
+        df_completo['vol_vendedor'] = pd.NA
         df_completo['fluxo_disponivel'] = False
 
     # --- 4. Salva

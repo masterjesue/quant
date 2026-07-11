@@ -1,0 +1,61 @@
+A aba inicial do diário deve a "Estatísticas".
+Estatísticas: Adicione Quantidade de de Wins, Loss e Breakevens.
+A ideia do calendário é ótima, mas ele deveria estar acima do gráfico de Evolução de Saldo, abaixo dos indicadores e o números devem ser mensais, acompanhando o seletor de meses do calendário. Coloque um botão (tipo liga e desliga) para selecionar "Ano Corrente", onde vai mostrar os números gerais de 2026, e no calendário, seguindo a mesma lógica vai aparecer o saldo por mês (ao invés do dia-a-dia).
+.
+Detalhe de UX: Muita informação ilegível por falta de contraste de cor (exemplo: fonte preta em fundo cinza escuro). Revise tudo.
+.
+Ainda no calendário: ao clicar no dia deve ser direcionado para o histórico daquele dia para que eu possa analisar com detalhe o que aconteceu naquele dia.
+.
+No histórico precisamos de um filtro por data \ período. Na janela coloque o nome mas também o horário, por exemplo, "Abertura (9:00 - 9:30)".
+As estratégias listadas no histórico não estão boas, crie uma aba "Estratégias", já preparando para implementar o Playbook (que está no plano, modelando o Tradezella). Nessa tela eu quero editar, cadastrar e fazer manutenção das estratégias para que seja listada corretamente no histórico e no registro do diário, já preparando para transformar isso em uma ferramenta análise e acompanhamento do meu operacional (com detalhes da estratégia que vamos cadastrar para fazer o checklist operacional, avaliar disciplina (se na prática foi aplicada, se as condições de mercado analisadas pelo quant lab validaram ou não a operação e etc...)).
+
+Ainda no histórico, o print precisa ser clicável e abrir em tamanho grande para analisar. Coloque um botão para detalhar o trade abrindo uma janela ou poup-up com todos os detalhes, observações, anotações, análises, estatísticas e etc.. (avalie com atenção isso, quero todas as informações possíveis que me ajude a ter clareza do que foi executado e como foi operado esse trade), nesse detalhamento do trade, pode colocar o print também em um tamanho médio.
+
+Posição: Essa será a aba mais utilizada do diário, coloque em segundo depois da estatística. A aba "Novo Trade" será usada apenas em casos específicos onde a integração das posições não funcione, é mais cirúrgico pegar o snapshot do mercado, timestamp e demais informações da operação direto do MT5. A ideia é que eu inicie o trade na plataforma e já consiga ver a posição aberta no diário e então complementar com as informações, então você deve trazer os campos da aba "Novo Trade" para "Posições", com exceções das informações que virão atomaticamente. Para cada posição, deve ter um campo para adicionar o print (verifique se funciona com copiar e colar, é a forma que mais uso). Verifique se não está faltando nenhuma informação importante de backgroud para capturar e registrar (lembre-se que faremos análise retroativa e vamos precisar de todo o contexto detalhado da operação).
+Ainda em "Posição"...
+Não faz sentido o "Finalizar operação", isso será feito na plataforma de operação, o tipo de saída, se deu gain, loss ou breakeven devem ser trazidos ou calculados com os dados do MT5. 
+Eu gosto da ideia de adicionar tags, mas parece que está com bug (as tags somem depois que seleciono. Aumente a largura desse campo para ver as tags selecionadas em linha, crie uma forma de adicionar tags novas na própria caixa de seleção, e coloque uma seção de cadastro \ edição de tags na aba de estratégias.
+
+Detalhe de UX: As caixas de seleção e alguns botões típicos de formulário estão na cor branca no SQ, o que destoa totalmente do dark mode. Revise tudo.
+
+Aba Novo Trade:
+Os campos ficaram empilhados à esquerda e ficou um espaço vazio  à direita. Organize melhor a disposição dos campos.
+Adicione uma caixa de seleção de estratégia R:R (que será cadastrado também na aba de estratégias). Ao selecionar a estratégia R:R (ou apenas R:R para encurtar), os campos Alvo, Stop são preenchidos automaticamente, com a opção de modificar digitando diretamente no campo (se eu digitar e alterar esses campos, o seletor de R:R deve mudar para "nenhuma"), no cadastro de estratégias R:R adicione o campo de Breakeven (pts.) assim podemos avaliar nas análises se eu fiz o breakeven na pontuação correta, se o breakeven foi eficiente nessa operação e etc...).
+
+Ainda em Novo Trade....
+Não faz sentido ter os botões +\- nos inputs, eu não vou apertar o botão de + para chegar de zero ao preço 175.897 por exemplo! Apenas o campo "Lote" faz sentido ter os botões +\-.
+
+Revise se não falta nada em Novo Trade.
+
+Aba Reconciliação: Eu ainda não consegui ver a utilidade prática disso, para que serve mesmo? Me parece muito mais algo que deveria rodar em background. Com a migração da planilha para a plataforma e acompanhamento em tempo real das operações não teremos o que reconciliar.
+
+Eu ainda não consegui ver como se apresenta a aba Aderência e Padrões (não tem dados ainda). Mas eu imagino que essas informações (aderência e padrões) devem estar junto com as estatísticas, incluído no histórico trade-a-trade enriquecendo o registro do trade. Então eu imagino que a aba Aderência não é necessária (avalie).
+Agora, a aba Padrões faz um gancho para um novo módulo do Diário que é a análise emocional e comportamental do trader. vamos aprofundar nesse módulo mais à frente com mais planejamento, mas já podemos estruturar da seguinte forma:
+- No registro do trade (Novo Trade e Posições) adicione, além do autocoaching, coloque alguns critérios para autoanálise em uma nota de 1 a 5 (coloque estrelas para marcar ou algo visual intuitivo e prático) avaliando: Confiança; Humor; Energia; Atenção; Presença; - Adicione o campo para inserir tags "Print Emocional", facilite a inserção e registro de novas tags para que possamos criar um mapa emocional - Adicione o campo "Sentimento de Mercado" que pode ser uma barra para arrastar entre os níveis:
+De 0 a 24: Medo extremo
+De 25 a 49: Medo
+50: Neutro
+De 51 a 74: Ganância
+De 75 a 100: Ganância extrema
+.
+Inclusive, eu quero que anote aí para implementarmos o índice do medo e ganância em nosso dashboard (é um conceito que pega vários indicadores de mercado para saber como está o sentimento do mercado dos traders em geral).
+.
+(Pesquise sobre isso)
+https://investidor10.com.br/noticias/ndice-do-medo-e-ganancia-entenda-o-que-ele-revela-sobre-os-seus-investimentos-113980/
+.
+Ainda sobre essa parte dos Padrões Comportamentais...
+Crie um seção de checkin que deve ser feito antes de começar as operações. Nesse checkin deve ter um série de itens para marcar (de 1 a 5 estrelas) tipo: Qualidade de Sono; Qualidade do Café; Tempo para Autocuidado; Tempo para Meditação; - Deve ter um campo seletor para marcar o horário que acordei \ quanto tempo de sono; Adicione uma roda da vida - ferramenta de coaching (gráfico interativo; clicar e arrastar para dar as notas de 0 a 10 em cada área) (https://www.sistemizecoach.com/guia/roda-da-vida.php). Um campo para adicionar observações \ 5 motivos para agradecer. Pesquise os principais recursos de apps de selfawerness como https://vibememo.com/ para adicionar ao nosso sistema. Estude sobre a escala Hawkins (veja os pdfs na pasta C:\Users\jesue\OneDrive\Documentos\Trade\quant\diario), quero uma forma de compilar todos os dados emocionais, mentais e comportamentais e chegar à uma escala de vibração segundo Hawkins, traga isso de forma visual no painel. 
+Estude uma forma de trazer os dados do Google Health e do meu smarth watch para enriquecer toda a nossa análise.
+.
+SOBRE SQ'98
+
+O maior desafio dessa versão da plataforma e manter um layout consistente e bonito dentro do padrão do Windows 98. Além de aplicar todas essas alterações também ao SQ'98, eu quero que revise todo o design e UX, para que eu tenha uma experiência nostalgica sem perder qualidade estética. Acredito que todas as janelas (principalmente a do Diário) devem ser redimensionáveis ao clicar nas bordas. Os as caixas seletoras estão em um estilo diferente das caixas de texto. As caixas de texto tem tamanhos irregulares. Em algumas telas tem bordas brancas com fundo cinza trazendo uma impressão de coisa mal feita. Em algumas partes como por exemplo o Calendário, existem cores de fontes ilegíveis pois não fazem um bom contraste com a cor de fundo. - Eu quero que faça uma revisão completa e minuciosa de toda a estética e layout do SQ'98, lembre-se que estamos criando uma obra de arte dos anos 90.
+
+
+
+
+
+
+
+.
+

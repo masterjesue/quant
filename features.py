@@ -647,6 +647,167 @@ def _peso_toque(n_ordem: int, volume_relativo: float | None, forte: bool = True)
     return peso
 
 
+def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
+                             toques_min_forte: int = None) -> dict:
+    """
+    Leitura quantitativa (toques/força/probabilidade) de uma linha
+    qualquer — mesma linguagem do motor de S/R estático
+    (calcular_zonas_sr/calcular_prob_niveis_sr: toques ponderados via
+    _peso_toque, rejeição por wick, agressão via delta, impulso pós-toque,
+    score 50±ajustes clipado), mas pra uma linha que muda de valor POR
+    CANDLE (média móvel, trendline desenhada à mão) em vez de um nível
+    fixo — por isso não reaproveita _clusterizar_pivos_sr/_rankear_niveis_sr
+    diretamente (aquelas comparam contra um centro/zona ESCALAR).
+
+    `linha` precisa ter o mesmo comprimento de `df` — valor da linha em
+    cada candle (broadcast de um escalar pro caso de S/R horizontal, série
+    de EMA, ou interpolação linear de uma trendline de 2 pontos).
+
+    Só analisa os últimos `janela` candles (regra do Jesué pra MME21: "se
+    foi respeitada nos últimos 20 candles"). Reaproveita as colunas já
+    computadas pelo pipeline de features em lote (pivôs simples/fortes,
+    sombra_sup/inf_pct, atr, delta, vol_comprador/vendedor,
+    fluxo_disponivel) — roda direto sobre o DataFrame já carregado em
+    memória, sem re-rodar o backtest nem recalcular pivôs.
+    """
+    n = len(df)
+    if n == 0:
+        return {'tipo': 'indefinido', 'toques': 0, 'forca_toques': 0.0,
+                'forte': False, 'violado': False, 'rejeicao_media': None,
+                'agressao_media': None, 'impulso_medio': None,
+                'prob_bounce': 50.0, 'janela': 0, 'linha_atual': None}
+
+    toques_min_forte = toques_min_forte or cfg.TOQUES_MINIMOS_NIVEL_FORTE
+    janela = min(janela, n)
+    ini = n - janela
+
+    linha = np.asarray(linha, dtype=float)
+    if len(linha) != n:
+        raise ValueError('linha precisa ter o mesmo comprimento de df')
+
+    closes = df['close'].values
+    highs = df['high'].values
+    lows = df['low'].values
+    opens = df['open'].values
+    atrs = df['atr'].values
+    sombra_sup = df['sombra_sup_pct'].values if 'sombra_sup_pct' in df.columns else np.zeros(n)
+    sombra_inf = df['sombra_inf_pct'].values if 'sombra_inf_pct' in df.columns else np.zeros(n)
+    topo_simples = df['topo_simples'].values if 'topo_simples' in df.columns else np.zeros(n, dtype=bool)
+    fundo_simples = df['fundo_simples'].values if 'fundo_simples' in df.columns else np.zeros(n, dtype=bool)
+    topo_forte_arr = df['topo_forte'].values if 'topo_forte' in df.columns else np.zeros(n, dtype=bool)
+    fundo_forte_arr = df['fundo_forte'].values if 'fundo_forte' in df.columns else np.zeros(n, dtype=bool)
+    tem_fluxo_arr = df['fluxo_disponivel'].values if 'fluxo_disponivel' in df.columns else np.zeros(n, dtype=bool)
+    delta_arr = pd.to_numeric(df['delta'], errors='coerce').fillna(0).values if 'delta' in df.columns else np.zeros(n)
+    vol_c_arr = pd.to_numeric(df['vol_comprador'], errors='coerce').fillna(0).values if 'vol_comprador' in df.columns else np.zeros(n)
+    vol_v_arr = pd.to_numeric(df['vol_vendedor'], errors='coerce').fillna(0).values if 'vol_vendedor' in df.columns else np.zeros(n)
+    vol_total_arr = vol_c_arr + vol_v_arr
+    vol_media20 = pd.Series(vol_total_arr).rolling(20, min_periods=1).mean().values
+
+    preco_atual = closes[-1]
+    linha_atual = linha[-1]
+    tipo = 'suporte' if linha_atual <= preco_atual else 'resistencia'
+    e_fundo = (tipo == 'suporte')  # suporte é testado por fundos (bounce de baixo pra cima)
+
+    # --- toques: pivôs confirmados (fractal, já computados por detectar_pivos)
+    # dentro da janela, próximos da linha NAQUELE candle — não de um valor fixo ---
+    idxs_touch = []
+    for i in range(ini, n):
+        pivo_aqui = fundo_simples[i] if e_fundo else topo_simples[i]
+        if not pivo_aqui:
+            continue
+        atr_i = atrs[i]
+        if np.isnan(atr_i) or atr_i <= 0:
+            continue
+        preco_pivo = lows[i] if e_fundo else highs[i]
+        if abs(preco_pivo - linha[i]) <= atr_i * cfg.TOLERANCIA_LINHA_GENERICA_ATR:
+            idxs_touch.append(i)
+
+    N_IMP = cfg.N_CANDLES_IMPULSO
+    pesos, rejeicoes, agressoes, impulsos = [], [], [], []
+    for ordem_n, idx in enumerate(idxs_touch, start=1):
+        rej = sombra_inf[idx] if e_fundo else sombra_sup[idx]
+        vol_i = vol_total_arr[idx] if tem_fluxo_arr[idx] else np.nan
+        vol_rel = (vol_i / vol_media20[idx]) if (not np.isnan(vol_i) and vol_media20[idx] > 0) else None
+        forte_toque = bool(fundo_forte_arr[idx] if e_fundo else topo_forte_arr[idx])
+        peso = _peso_toque(ordem_n, vol_rel, forte_toque)
+
+        if tem_fluxo_arr[idx] and vol_total_arr[idx] > 0:
+            delta_norm = delta_arr[idx] / vol_total_arr[idx]
+            agr = float(np.clip(delta_norm if e_fundo else -delta_norm, -1, 1))
+        else:
+            agr = 0.0
+
+        idx_alvo = min(idx + N_IMP, n - 1)
+        atr_idx = atrs[idx] if (not np.isnan(atrs[idx]) and atrs[idx] > 0) else np.nan
+        imp = (abs(closes[idx_alvo] - closes[idx]) / (atr_idx * N_IMP)) if not np.isnan(atr_idx) else np.nan
+
+        pesos.append(peso)
+        rejeicoes.append(rej)
+        agressoes.append(agr)
+        impulsos.append(imp)
+
+    pesos_arr = np.array(pesos)
+    toques = len(idxs_touch)
+    forca_toques = float(pesos_arr.sum()) if toques else 0.0
+    rejeicao_media = float(np.average(rejeicoes, weights=pesos_arr)) if toques and pesos_arr.sum() > 0 else np.nan
+    agressao_media = float(np.average(agressoes, weights=pesos_arr)) if toques and pesos_arr.sum() > 0 else np.nan
+    if toques:
+        impulsos_arr = np.array(impulsos)
+        validos_imp = ~np.isnan(impulsos_arr)
+        impulso_medio = float(np.average(impulsos_arr[validos_imp], weights=pesos_arr[validos_imp])) if validos_imp.any() else np.nan
+    else:
+        impulso_medio = np.nan
+
+    # --- violado: fechamento cruzou a linha (contra o papel dela) com corpo
+    # mínimo, e ainda não retomou — estado avaliado cronologicamente pra
+    # refletir a situação ATUAL (fim da janela), não qualquer cruzamento
+    # isolado no meio do caminho (mesmo espírito do wick-sweep do S/R
+    # estático, sem a máquina de estados completa de pullback/throwback). ---
+    violado = False
+    for i in range(ini, n):
+        atr_i = atrs[i]
+        if np.isnan(atr_i) or atr_i <= 0:
+            continue
+        corpo_i = abs(closes[i] - opens[i])
+        rompeu = (closes[i] < linha[i]) if e_fundo else (closes[i] > linha[i])
+        if rompeu and corpo_i >= cfg.CORPO_MINIMO_ROMPIMENTO_ATR * atr_i:
+            violado = True
+        elif violado:
+            recuperou = (closes[i] >= linha[i]) if e_fundo else (closes[i] <= linha[i])
+            if recuperou:
+                violado = False
+
+    forte = (toques >= toques_min_forte) and not violado
+
+    score = 50.0
+    if toques:
+        score += 10.0 if forte else -5.0
+        score += min(forca_toques, 10) * 1.5
+        if not np.isnan(rejeicao_media):
+            score += rejeicao_media * 10
+        if not np.isnan(agressao_media):
+            score += agressao_media * 8  # já orientado favoravelmente (ver cálculo de `agr` acima)
+        if not np.isnan(impulso_medio):
+            score += min(impulso_medio, 2.0) * 3
+    if violado:
+        score -= 15.0
+    prob_bounce = float(np.clip(score, cfg.SCORE_PROB_MIN, cfg.SCORE_PROB_MAX))
+
+    return {
+        'tipo': tipo,
+        'toques': toques,
+        'forca_toques': round(forca_toques, 2),
+        'forte': bool(forte),
+        'violado': bool(violado),
+        'rejeicao_media': None if np.isnan(rejeicao_media) else round(rejeicao_media, 3),
+        'agressao_media': None if np.isnan(agressao_media) else round(agressao_media, 3),
+        'impulso_medio': None if np.isnan(impulso_medio) else round(impulso_medio, 3),
+        'prob_bounce': round(prob_bounce, 1),
+        'janela': janela,
+        'linha_atual': float(linha_atual),
+    }
+
+
 def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
     """
     Catálogo de zonas (Fase 1, núcleo operacional — spec 2.2 a 2.10 de

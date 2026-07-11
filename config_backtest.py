@@ -287,6 +287,23 @@ SCORE_PROB_MIN               = 5     # nunca reportar 0% (evita falsa certeza)
 SCORE_PROB_MAX               = 95    # nunca reportar 100%
 
 # -----------------------------------------------------------------------------
+# ANÁLISE DE LINHA GENÉRICA — MME21 e (mais tarde) traçados manuais
+# (2026-07-10, ver plano em vamos-trabalhar-no-ux-dapper-music.md). Motor
+# compartilhado: mesma leitura de toques/força/probabilidade do S/R
+# estático, mas pra uma linha que muda de valor por candle (média móvel,
+# trendline) — ver analisar_linha_generica em features.py.
+# -----------------------------------------------------------------------------
+MME21_PERIODO = 21
+JANELA_RESPEITO_MME21 = 20           # candles de lookback — especificado por Jesué
+TOQUES_MINIMOS_MME21_FORTE = 1       # testada E respeitada só 1x já é "forte" pra MME21
+                                      # (diferente de TOQUES_MINIMOS_NIVEL_FORTE=3 do S/R
+                                      # estático — regra própria do Jesué pra médias móveis:
+                                      # ele opera a MME21 puramente em dias de tendência,
+                                      # não exige a mesma repetição de um nível estrutural)
+TOLERANCIA_LINHA_GENERICA_ATR = 0.5  # mesmo multiplicador de TOLERANCIA_CLUSTER_SR_ATR,
+                                      # reaproveitado pra "toque" numa linha qualquer
+
+# -----------------------------------------------------------------------------
 # JANELAS DO PREGÃO — confirmado por Jesué em 30/06/2026
 # -----------------------------------------------------------------------------
 

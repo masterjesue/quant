@@ -284,3 +284,155 @@ def carregar_reconciliacao() -> pd.DataFrame | None:
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)
+
+
+def _caminho_aderencia_sr() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_aderencia_sr.parquet"
+
+
+def salvar_aderencia_sr(df: pd.DataFrame):
+    """
+    Salva a tabela de aderência S/R (nível marcado à mão × snapshot do
+    motor) — tabela separada da principal, mesmo motivo de
+    `salvar_reconciliacao`: recomputável a qualquer momento, não histórico
+    imutável do próprio trade.
+    """
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_aderencia_sr(), index=False)
+    print(f"[persistencia] aderência S/R: {len(df)} linhas salvas em {_caminho_aderencia_sr()}")
+
+
+def carregar_aderencia_sr() -> pd.DataFrame | None:
+    """Carrega a tabela de aderência S/R salva. Retorna None se ainda não existir."""
+    caminho = _caminho_aderencia_sr()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def _caminho_padroes_comportamentais() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_padroes_comportamentais.parquet"
+
+
+def salvar_padroes_comportamentais(df: pd.DataFrame):
+    """
+    Salva a tabela de padrões comportamentais detectados (revenge trading/
+    tilt cascade) — tabela separada da principal, mesmo motivo de
+    `salvar_reconciliacao`/`salvar_aderencia_sr`: recomputável a qualquer
+    momento, não histórico imutável do próprio trade.
+    """
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_padroes_comportamentais(), index=False)
+    print(f"[persistencia] padrões comportamentais: {len(df)} linhas salvas em {_caminho_padroes_comportamentais()}")
+
+
+def carregar_padroes_comportamentais() -> pd.DataFrame | None:
+    """Carrega a tabela de padrões comportamentais salva. Retorna None se ainda não existir."""
+    caminho = _caminho_padroes_comportamentais()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# POSIÇÕES ABERTAS (rascunho ao vivo do Diário) — ver plano em
+# C:\Users\jesue\.claude\plans\analise-o-bloco-de-glimmering-marble.md
+# -----------------------------------------------------------------------------
+# Tabela SEPARADA de `diario_trades.parquet` (que continua append-only/
+# imutável) — aqui uma linha = 1 posição atualmente aberta ou recém-fechada
+# aguardando confirmação, escrita tanto pelo dashboard principal (campos
+# vindos do MT5, a cada ciclo de sincronização) quanto pelo processo do
+# Diário (notas/tags/imagens do usuário, enquanto ele acompanha a operação)
+# — dois escritores diferentes, por isso a trava própria e a escrita
+# atômica (`_salvar_parquet_atomico`) desde o primeiro dia, diferente de
+# `salvar_diario` (que hoje tem um único escritor por vez).
+
+def _caminho_posicoes_abertas() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "posicoes_abertas.parquet"
+
+
+def _caminho_posicoes_abertas_lock() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / '.posicoes_abertas.lock'
+
+
+@contextmanager
+def lock_posicoes_abertas():
+    """
+    Mesmo mecanismo de `lock_atualizacao()`/`lock_diario()` (criação atômica
+    via O_EXCL). Uso: `with persistencia.lock_posicoes_abertas() as adquirida:
+    if adquirida: ...`. O sync automático (dashboard principal, a cada poucos
+    segundos) deve pular o ciclo em silêncio se ocupado, igual ao lock de
+    candle; já uma ação do usuário (salvar nota/imagem no Diário) deve
+    mostrar erro/retry visível, igual ao `lock_diario()`.
+    """
+    caminho = _caminho_posicoes_abertas_lock()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+
+    if caminho.exists():
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+        except FileNotFoundError:
+            idade = 0
+        if idade > _LOCK_STALE_SEGUNDOS:
+            try:
+                caminho.unlink()
+            except FileNotFoundError:
+                pass
+
+    try:
+        fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        try:
+            caminho.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def salvar_posicoes_abertas(df: pd.DataFrame):
+    """Salva a tabela de posições abertas/rascunhos — escrita atômica
+    (dois escritores possíveis, ver comentário da seção)."""
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    _salvar_parquet_atomico(_caminho_posicoes_abertas(), df)
+
+
+def carregar_posicoes_abertas() -> pd.DataFrame | None:
+    """Carrega a tabela de posições abertas/rascunhos. Retorna None se
+    ainda não existir (nenhuma posição foi sincronizada ainda)."""
+    caminho = _caminho_posicoes_abertas()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# ORDENS PENDENTES (ainda não executadas) — mesma seção "Posição" do Diário.
+# Escritor único (o sync do dashboard principal, mesmo ciclo de
+# `sincronizar_posicoes_abertas`) — sem lock dedicado, mesmo tratamento de
+# `salvar_reconciliacao`/`salvar_aderencia_sr` (recomputada do zero a cada
+# ciclo, nunca editada por múltiplos escritores). Escrita atômica mesmo
+# assim, pra nunca expor um arquivo parcial a quem só lê (Diário).
+# -----------------------------------------------------------------------------
+
+def _caminho_ordens_pendentes() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "ordens_pendentes.parquet"
+
+
+def salvar_ordens_pendentes(df: pd.DataFrame):
+    """Salva a tabela de ordens pendentes (escrita atômica)."""
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    _salvar_parquet_atomico(_caminho_ordens_pendentes(), df)
+
+
+def carregar_ordens_pendentes() -> pd.DataFrame | None:
+    """Carrega a tabela de ordens pendentes. Retorna None se ainda não existir."""
+    caminho = _caminho_ordens_pendentes()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)

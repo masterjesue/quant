@@ -11,6 +11,10 @@ data/
 
 # Logs
 log.txt
+_log_*.txt
 
 # Configurações locais do Claude Code (permissões específicas da máquina)
 .claude/settings.local.json
+
+# Material de referência pesado (PDFs de pesquisa), não faz parte do app
+diario/
