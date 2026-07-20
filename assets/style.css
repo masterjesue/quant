@@ -1,3 +1,81 @@
+/* Tokens de tema (2026-07-17, modo claro/escuro do SQ Padrão) — fonte
+   única de verdade das 10 cores semânticas antes hardcoded no dicionário
+   `C` de dashboard.py/diario_app_classico.py (ambos passaram a emitir
+   'var(--x)' em vez de hex cru — ver PALETA_GAUGE nesses arquivos pro
+   equivalente em hex literal, usado só onde CSS var não serve: Plotly e
+   Lightweight Charts). `--text-disabled`/`--stroke-strong` não fazem parte
+   dos 10 tokens "de negócio" — existem só pra dar contraparte clara aos
+   blocos --Dash-Text-x e --Dash-Stroke-x abaixo. Trocar `data-theme` no
+   <html> (assets/tema.js) é o único gatilho — tudo aqui reage sozinho.
+   Claro é o padrão do sistema (2026-07-20, pedido do Jesué) — `:root` sem
+   atributo carrega a paleta clara direto, escuro vira o override explícito
+   em `:root[data-theme="dark"]` (antes era o contrário). */
+:root {
+    /* 2026-07-17 — retrabalho: a primeira versão desta paleta (F3F4F8/
+       FFFFFF/DDE0EA) calculava contraste de TEXTO (WCAG) mas não contraste
+       ESTRUTURAL — bg-vs-panel era só 255→243 (~5% de salto relativo) e
+       border-vs-panel 255→221 (~13%), contra os ~50-60% do escuro abaixo.
+       Resultado real (screenshot, feedback Jesué): "perdeu os blocos, as
+       bordas e todo o desenho do layout" — os cards viravam branco-sobre-
+       branco, indistinguíveis da página. Branco não pode ficar mais claro
+       que 255 pra abrir esse degrau do lado do `panel` — a correção é
+       aprofundar `bg`/`border` E somar uma sombra suave (`--shadow-card`),
+       igual todo design system claro de referência (GitHub/Linear/Stripe)
+       já faz: em fundo claro, contraste de PAINEL se apoia em sombra +
+       borda, não só em delta de luminosidade. */
+    --bg: #E4E7F0; --panel: #FFFFFF; --border: #C7CCDC;
+    --gold: #A87C2E; --green: #128A55; --red: #B33A3A;
+    --text: #14141C; --text2: #5B5B78; --blue: #3573B5; --yellow: #8A6508;
+    --text-disabled: #9A9AB2; --stroke-strong: #AEB4C9;
+    --bolha-neutra: #EEF0F6; --bolha-atencao: #FBF3DE; --bolha-erro: #FBEAEA;
+    --mme21: #0F6E82;
+    --shadow-card: 0 1px 2px rgba(23, 28, 55, 0.06), 0 6px 16px rgba(23, 28, 55, 0.08);
+}
+:root[data-theme="dark"] {
+    --bg: #0A0A0F; --panel: #12121A; --border: #1C1C28;
+    --gold: #C8A96E; --green: #2ECC8A; --red: #E05C5C;
+    --text: #E8E8F0; --text2: #8888AA; --blue: #4A90D9; --yellow: #F0C040;
+    --text-disabled: #55556A; --stroke-strong: #2A2A3A;
+    /* Bolhas de mensagem do Mentor IA — tons quase-pretos, cada um com um
+       leve tingimento (neutro/atenção/erro). Achados hardcoded FORA do
+       dicionário `C` (não eram um dos 10 tokens) — ficariam escuros pra
+       sempre mesmo no modo claro, mesmo bug do gradiente do hero
+       (2026-07-17, achado real no screenshot de verificação). */
+    --bolha-neutra: #1A1A28; --bolha-atencao: #1A1A14; --bolha-erro: #1A1414;
+    /* Azul petróleo da MME21 (gráfico + ícone do olho ao lado) — cor
+       própria pedida pelo Jesué, sem relação com a paleta semântica de
+       mercado. */
+    --mme21: #1B4F5C;
+    /* Elevação de card — no escuro o degrau bg→panel→border (10,15→18,18,26
+       →28,28,40) já é ~50-60% de salto RELATIVO em cada passo (perceptível
+       mesmo com deltas absolutos pequenos, efeito Weber-Fechner em tons
+       baixos); sombra própria não faz falta. `none` preserva o visual atual
+       intocado. */
+    --shadow-card: none;
+}
+
+/* Switch de tema (aba Configurações) — pílula + bolinha deslizante, classe
+   alternada direto via JS (assets/tema.js), nunca recriado pelo Dash —
+   mesmo motivo de .tracado-tool-btn/.diario-estrela (n_clicks resetando
+   num componente recriado). */
+.tema-toggle {
+    position: relative; display: inline-block; width: 46px; height: 24px;
+    border-radius: 999px; background: var(--border);
+    border: 1px solid var(--border); cursor: pointer;
+    transition: background 0.15s ease; flex-shrink: 0; vertical-align: middle;
+}
+.tema-toggle-knob {
+    position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+    border-radius: 50%; background: var(--text);
+    transition: transform 0.15s ease, background 0.15s ease;
+}
+.tema-toggle.tema-toggle--claro {
+    background: var(--gold); border-color: var(--gold);
+}
+.tema-toggle.tema-toggle--claro .tema-toggle-knob {
+    transform: translateX(22px); background: var(--panel);
+}
+
 /* Feedback visual dos botões WIN/WDO/WIN×WDO — antes o clique era "seco"
    (sem hover, sem estado pressionado). Ver CHANGELOG.md 2026-07-04. */
 .btn-ativo:hover {
@@ -28,12 +106,19 @@
    controle fechado, não importa a classe exata.
    A LISTA ABERTA de opções pode renderizar fora da árvore de #chat-modelo
    (padrão comum de portal em componentes Radix, pra escapar overflow/
-   z-index do pai) — por isso essas regras não são escopadas pelo id. Só
-   existe 1 dropdown na página hoje, sem risco de colidir com outro. */
+   z-index do pai) — por isso essas regras não são escopadas pelo id.
+   AVISO (2026-07-11): "só existe 1 dropdown na página" deixou de ser
+   verdade assim que o Diário (diario_app_classico.py, mesma pasta
+   assets/) ganhou dropdowns próprios com `.classico-dropdown` — CSS é
+   compartilhado entre os dois processos (assets_folder padrão = 'assets'
+   nos dois). A regra `.dash-dropdown-value-item` global logo abaixo ERA
+   pensada só pro #chat-modelo mas vazava pra qualquer multi-select,
+   truncando os chips selecionados do Diário até sumirem visualmente
+   (bug "as tags somem" do feedback) — agora escopada pelo id. */
 #chat-modelo, #chat-modelo * {
-    background-color: #0A0A0F !important;
-    color: #8888AA !important;
-    border-color: #1C1C28 !important;
+    background-color: var(--bg) !important;
+    color: var(--text2) !important;
+    border-color: var(--border) !important;
     font-size: 10px !important;
 }
 #chat-modelo {
@@ -43,22 +128,222 @@
 #chat-modelo *:focus, #chat-modelo *:focus-visible {
     outline: none !important; box-shadow: none !important;
 }
-.dash-dropdown-value-item {
+#chat-modelo .dash-dropdown-value-item {
     overflow: hidden !important; text-overflow: ellipsis !important;
     white-space: nowrap !important; max-width: 180px !important;
     display: inline-block !important;
 }
+
+/* Dash 4.3 reescreveu Dropdown/Slider sobre variáveis CSS pensadas pra UI
+   CLARA (--Dash-Text-Strong default = rgba(0,9,38,.9), quase preto — ver
+   dash/dcc/dash_core_components.js). A setinha do dropdown
+   (.dash-dropdown-trigger-icon) e o contador "+N" de tags multi-select
+   (.dash-dropdown-value-count) usam essa variável direto — em fundo escuro
+   isso é preto sobre preto, INVISÍVEL (bug "não aparece a setinha no
+   canto", feedback 2026-07-11). Sobrescrever no :root corrige os dois
+   processos (Diário clássico e o dropdown do Mentor IA em #chat-modelo),
+   já que os dois compartilham esta stylesheet. */
+:root {
+    --Dash-Text-Strong: var(--text);
+    --Dash-Text-Weak: var(--text2);
+    --Dash-Text-Primary: var(--text);
+    --Dash-Text-Disabled: var(--text-disabled);
+    --Dash-Stroke-Strong: var(--stroke-strong);
+    --Dash-Stroke-Weak: var(--border);
+}
+
+/* Dropdowns do Diário (2026-07-11) — nenhum dcc.Dropdown do Diário tinha
+   estilo próprio, então a caixa FECHADA caía no branco cru padrão do Dash,
+   destoando totalmente do dark mode (feedback diário.txt). Fundo/borda
+   iguais a `_estilo_input_diario()` (diario_app_classico.py), pra combinar
+   com os campos de texto ao lado. Altura FIXA (não só min-height) pra bater
+   exatamente com a altura dos campos de texto/número vizinhos na mesma
+   grade — antes cada um crescia pro tamanho de conteúdo e a fileira ficava
+   com alturas desencontradas (feedback 2026-07-11). */
+.classico-dropdown .dash-dropdown-grid-container.dash-dropdown-trigger {
+    background-color: var(--bg) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 6px !important;
+    color: var(--text) !important;
+    height: 32px !important;
+    min-height: 32px !important;
+    box-sizing: border-box !important;
+    font-size: 13px !important;
+}
+/* Sem isso, o texto da caixa FECHADA (valor selecionado OU o placeholder,
+   ex.: "nenhuma" do R:R) cai no tamanho padrão do próprio Dash — que não é
+   nem os 13px dos campos de texto vizinhos nem os 10px da lista aberta
+   logo abaixo, um terceiro tamanho pra ninguém pedir (feedback "tamanhos
+   de fontes diferentes no seletor", 2026-07-11). Tamanho aplica aos 3
+   (valor selecionado, chip de tag, placeholder) — cor NÃO: o placeholder
+   continua com a cor apagada (--Dash-Text-Disabled, já legível desde o
+   ajuste acima) de propósito, pra parecer dica e não um valor real
+   selecionado. */
+.classico-dropdown .dash-dropdown-value,
+.classico-dropdown .dash-dropdown-value-item,
+.classico-dropdown .dash-dropdown-placeholder {
+    font-size: 13px !important;
+}
+.classico-dropdown .dash-dropdown-value,
+.classico-dropdown .dash-dropdown-value-item {
+    color: var(--text) !important;
+}
+/* Multi-select de tags (Estratégia / Tags Setup-Erro / Print Emocional):
+   sem isso o max-width global truncava os chips selecionados até sumirem —
+   aqui quebra linha ao invés de truncar. */
+.classico-dropdown-tags .dash-dropdown-grid-container.dash-dropdown-trigger {
+    flex-wrap: wrap !important;
+    height: auto !important;
+    min-height: 32px !important;
+    padding: 4px !important;
+}
+.classico-dropdown-tags .dash-dropdown-value-item {
+    max-width: none !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+}
+
 .dash-dropdown-content {
-    background-color: #12121A !important;
-    border: 1px solid #1C1C28 !important;
-    color: #E8E8F0 !important;
+    background-color: var(--panel) !important;
+    border: 1px solid var(--border) !important;
+    color: var(--text) !important;
     z-index: 2000 !important;
 }
 .dash-dropdown-option {
-    background-color: #12121A !important; color: #E8E8F0 !important; font-size: 10px !important;
+    /* 13px pra bater com a caixa fechada acima — era 10px, ilegível e
+       destoando do resto da UI (feedback 2026-07-11). #chat-modelo
+       continua em 10px de propósito (seletor de modelo compacto) — a
+       regra `#chat-modelo *` mais acima ganha por especificidade de ID. */
+    background-color: var(--panel) !important; color: var(--text) !important; font-size: 13px !important;
 }
 .dash-dropdown-option:hover,
 .dash-dropdown-option[data-highlighted],
 .dash-dropdown-option[aria-selected="true"] {
-    background-color: #1C1C28 !important; color: #C8A96E !important;
+    background-color: var(--border) !important; color: var(--gold) !important;
+}
+
+/* Esconde as setas +/- nativas de <input type=number> — só fazem sentido
+   no campo Lote (poucas unidades); em Alvo/Stop/Preço/Resultado/Saldo
+   ninguém vai clicar +/- até o valor certo (feedback diário.txt). */
+.no-spinner::-webkit-outer-spin-button,
+.no-spinner::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+.no-spinner[type=number] {
+    -moz-appearance: textfield;
+}
+
+/* dcc.Slider (feedback 2026-07-12, corrigido de vez em 2026-07-16):
+   1) O fix de 2026-07-12 mirava `.dash-slider-tooltip` (rc-slider), mas o
+      Slider deste Dash na verdade renderiza via componentes Radix UI —
+      confirmado com dump-dom real da página ao vivo (Posição, WIN·WINQ26):
+      o "número solto" reportado de novo pelo usuário é um
+      `<input class="dash-range-slider-input dash-range-slider-max-input">`
+      SEMPRE visível (não um tooltip de hover/drag) — a regra antiga nunca
+      pegava esse elemento, por isso "não resolveu" mesmo depois do fix
+      anterior. Corrigido pro seletor real; mesmo escopo por substring de
+      id de antes (só Sentimento de Mercado, não mexe no valor numérico
+      de outros sliders como Roda da Vida).
+   2) `.dash-slider-mark` (texto de cada marca, ex: "Medo Extremo") tem um
+      `transform` INLINE (`translateX(-50%)` na marca do meio) escrito pelo
+      próprio componente React — uma regra de CSS sem `!important` nunca
+      vence estilo inline, então o fix de centralização de 2026-07-12
+      também nunca chegou a valer (mesma causa raiz do item 1: mudança na
+      implementação interna do Slider, não percebida na hora porque não
+      dava pra testar interação num navegador real). Adicionado
+      `!important` nas pontas (primeira/última marca) pra realmente vencer
+      o inline e parar de vazar pra fora do slider. */
+[id*="sentimento-mercado"] .dash-range-slider-input {
+    display: none !important;
+}
+.dash-slider-mark {
+    transform: translateX(-50%);
+}
+.dash-slider-mark:first-of-type {
+    transform: translateX(0) !important;
+}
+.dash-slider-mark:last-of-type {
+    transform: translateX(-100%) !important;
+}
+
+/* Avaliação em estrelas clicável (Autoavaliação Emocional / Bem-Estar,
+   feedback 2026-07-11: "coloque apenas as estrelas... como tem
+   normalmente nos apps") — substitui o dcc.Slider com marks de ★ (ver
+   diario_app_classico.py::_estrela_rating). Caractere e cor vêm só da
+   classe .ativa (via ::before), não de `children` — assim o
+   clientside_callback de sincronismo visual escreve 1 propriedade
+   (className) por estrela em vez de 2. */
+.diario-estrela {
+    cursor: pointer;
+    font-size: 20px;
+    line-height: 1;
+    user-select: none;
+    color: var(--stroke-strong);
+}
+.diario-estrela::before {
+    content: '☆';
+}
+.diario-estrela.ativa {
+    color: var(--gold);
+}
+.diario-estrela.ativa::before {
+    content: '★';
+}
+
+/* Barra de ferramentas de desenho — aba "Traçados" (ver assets/lwchart.js).
+   Estado "ativa" é alternado via classList direto no JS (não recriado por
+   callback Dash — mesmo motivo de window_manager.js não usar Dash pra
+   chrome de UI: n_clicks de um botão recriado reseta e causa cliques
+   fantasma, já corrigido uma vez neste projeto pro calendário do Diário). */
+.tracado-tool-btn {
+    background: var(--panel);
+    color: var(--text2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 14px;
+    cursor: pointer;
+    font-size: 12px;
+}
+.tracado-tool-btn:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+.tracado-tool-btn.tracado-tool-ativa {
+    background: var(--gold);
+    color: var(--bg);
+    border-color: var(--gold);
+    font-weight: 700;
+}
+
+/* Popup de imagem do Diário (Histórico) — feedback 2026-07-20: "preencher
+   o bloco inteiro, zoom pela rolagem do scroll, clicar e arrastar".
+   Mecânica (transform translate+scale) fica em assets/diario_zoom.js;
+   aqui só o tamanho/recorte do container e o cursor por estado. */
+.diario-zoom-container {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.25);
+    cursor: zoom-in;
+    touch-action: none;
+}
+.diario-zoom-container.diario-zoom-ativo {
+    cursor: grab;
+}
+.diario-zoom-container.diario-zoom-arrastando {
+    cursor: grabbing;
+}
+.diario-zoom-img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    user-select: none;
+    -webkit-user-drag: none;
+    transform-origin: 0 0;
+    will-change: transform;
 }

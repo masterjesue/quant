@@ -135,6 +135,66 @@ def detectar_pivos(df: pd.DataFrame, n_confirm: int = 3) -> pd.DataFrame:
     return df
 
 
+def detectar_pivo_em_formacao(df: pd.DataFrame, n_confirm: int = 3) -> dict:
+    """
+    Espelha a lacuna que `detectar_pivos` deixa de propósito: seu loop
+    principal roda só até `n - n_confirm` — os últimos `n_confirm` candles
+    nunca são avaliados como origem de topo/fundo porque ainda não tiveram
+    candles suficientes depois pra confirmar (virar simples/forte) ou
+    invalidar (quebrar a sequência). Esta função varre exatamente essa
+    cauda e devolve, para topo e fundo separadamente, o candidato mais
+    EXTREMO (maior alta / menor baixa) que ainda está "vivo" — nenhum
+    candle seguinte quebrou a condição de confirmação (mesmo teste E/E de
+    detectar_pivos: alta E baixa maiores/menores). Usado pra responder "o
+    preço atual (ex.: mínima do dia) já é um fundo validado, ou ainda está
+    esperando confirmação?".
+
+    Retorna {'topo': {...} | None, 'fundo': {...} | None}, cada um:
+      {'idx_origem': int, 'preco': float, 'confirmadas': int, 'faltam': int}
+    """
+    n = len(df)
+    if n < 2:
+        return {'topo': None, 'fundo': None}
+
+    highs = df['high'].values
+    lows = df['low'].values
+
+    inicio = max(1, n - n_confirm)
+    melhor_topo = None
+    melhor_fundo = None
+
+    for i in range(inicio, n):
+        # TOPO — mesmo teste de detectar_pivos, sem gravar em array
+        cmax, clow = highs[i], lows[i]
+        ct, vivo = 0, True
+        for j in range(i + 1, n):
+            if highs[j] < cmax and lows[j] < clow:
+                ct += 1
+            else:
+                vivo = False
+                break
+        if vivo and ct < n_confirm:
+            if melhor_topo is None or cmax > melhor_topo['preco']:
+                melhor_topo = {'idx_origem': i, 'preco': float(cmax),
+                               'confirmadas': ct, 'faltam': n_confirm - ct}
+
+        # FUNDO
+        cmin, chigh = lows[i], highs[i]
+        cf, vivo = 0, True
+        for j in range(i + 1, n):
+            if lows[j] > cmin and highs[j] > chigh:
+                cf += 1
+            else:
+                vivo = False
+                break
+        if vivo and cf < n_confirm:
+            if melhor_fundo is None or cmin < melhor_fundo['preco']:
+                melhor_fundo = {'idx_origem': i, 'preco': float(cmin),
+                                'confirmadas': cf, 'faltam': n_confirm - cf}
+
+    return {'topo': melhor_topo, 'fundo': melhor_fundo}
+
+
 # =============================================================================
 # BLOCO 4 — ESTADO E FASE DA TENDÊNCIA
 # Reescrito: pré-computa índices de pivôs e usa searchsorted para lookup O(log n)
@@ -647,6 +707,304 @@ def _peso_toque(n_ordem: int, volume_relativo: float | None, forte: bool = True)
     return peso
 
 
+class _SemDeepcopy:
+    """Contêiner opaco pro `copy.deepcopy`: embrulha uma estrutura grande de
+    dicts/listas (detalhe de toque por cluster/zona-espelho) sem impedir a
+    leitura normal (`.valor`). `pandas.NDFrame.__finalize__` chama
+    `deepcopy(df.attrs)` em quase TODA operação (`.tail()`, `df[col]`,
+    filtro booleano, etc.) — pra propagar attrs pro objeto novo. Clonar
+    milhares de dicts pequenos a cada tick de 1s (`metricas.extrair_
+    metricas`, chamado o tempo todo pelo dashboard) é caro demais pra dado
+    que nunca é mutado depois de calculado (medido: ~250ms/chamada extras
+    sem isso, contra ~1-2ms com). `__deepcopy__` retornando `self` faz o
+    `copy` module parar de recursar exatamente aqui, sem afetar o resto de
+    `df.attrs` (que continua sendo copiado normalmente)."""
+    __slots__ = ('valor',)
+
+    def __init__(self, valor):
+        self.valor = valor
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def _ts_iso(valor) -> str:
+    """Converte um valor de `df['datetime']` (numpy.datetime64/Timestamp)
+    pro formato ISO — usado nos detalhes de toque/regime que viram JSON
+    pro dashboard."""
+    return pd.Timestamp(valor).isoformat()
+
+
+# =============================================================================
+# BLOCOS DE FORÇA (combustível / aproximação / rejeição) — 2026-07-13
+# ver especificacao_forca_zonas_price_action.md. Helpers puros (escalar OU
+# vetorizado conforme o parâmetro), reaproveitados tanto por calcular_zonas_sr
+# (zonas automáticas) quanto por analisar_linha_generica (traçados/MME21) —
+# mesmo espírito de _peso_toque acima.
+# =============================================================================
+
+def _decaimento_idade(idade_candles):
+    """Bloco 1.2 — decaimento gradual de combustível por idade, aplicado a
+    QUALQUER zona (diferente de forca_herdada, que só existe pra zona
+    espelho). 1.0 = recém-formada (fuel preservado), cai pela metade a cada
+    MEIA_VIDA_COMBUSTIVEL_IDADE candles, independente de toques. Aceita
+    escalar ou array — quem chama decide."""
+    meia_vida = max(cfg.MEIA_VIDA_COMBUSTIVEL_IDADE, 1)
+    idade = np.nan_to_num(np.asarray(idade_candles, dtype=float), nan=0.0)
+    return np.exp(-np.log(2) * np.clip(idade, 0, None) / meia_vida)
+
+
+def _forca_origem(idx_origem, highs, lows, atrs) -> dict:
+    """Bloco 1.3/1.4 — proxy de intensidade/limpeza no candle de origem do
+    nível, na ausência de tape confiável em WIN/WDO: `intensidade_origem`
+    (range do candle de origem vs. ATR — impulso forte deixa mais ordens
+    represadas) e `base_limpa` (quão estreita foi a formação nos
+    JANELA_BASE_LIMPA_CANDLES candles ANTERIORES à origem — base rápida e
+    concentrada sugere ordens concentradas; base larga e demorada sugere
+    ordens diluídas). Ambos em [0, 1], 0.5 = neutro (dado insuficiente)."""
+    n = len(highs)
+    if idx_origem is None or idx_origem < 0 or idx_origem >= n:
+        return {'intensidade_origem': 0.5, 'base_limpa': 0.5}
+
+    atr_o = atrs[idx_origem]
+    if np.isnan(atr_o) or atr_o <= 0:
+        intensidade = 0.5
+    else:
+        range_o = highs[idx_origem] - lows[idx_origem]
+        intensidade = float(np.clip(range_o / atr_o, 0, 3) / 3)
+
+    ini_base = max(0, idx_origem - cfg.JANELA_BASE_LIMPA_CANDLES)
+    if idx_origem - ini_base < 2:
+        base_limpa = 0.5
+    else:
+        h_base = highs[ini_base:idx_origem]
+        l_base = lows[ini_base:idx_origem]
+        atr_medio_base = float(np.nanmean(atrs[ini_base:idx_origem]))
+        if atr_medio_base > 0:
+            largura_base = float(np.max(h_base) - np.min(l_base))
+            base_limpa = float(np.clip(1.0 - largura_base / (atr_medio_base * 3), 0, 1))
+        else:
+            base_limpa = 0.5
+
+    return {'intensidade_origem': round(intensidade, 3), 'base_limpa': round(base_limpa, 3)}
+
+
+def _profundidade_mitigacao(preco_extremo: float, zona_min: float, zona_max: float, e_fundo: bool) -> float:
+    """Bloco 1.6 — fração do range da zona penetrada NESSE toque (0 = tocou
+    a borda de fora pra dentro, preservando combustível; >=1 = atravessou a
+    zona inteira). Um toque raso consome menos liquidez represada que uma
+    penetração profunda."""
+    largura = zona_max - zona_min
+    if largura <= 0:
+        return 0.0
+    pen = (zona_max - preco_extremo) / largura if e_fundo else (preco_extremo - zona_min) / largura
+    return float(np.clip(pen, 0.0, 1.5))
+
+
+def _pureza_corpo(idx: int, opens, closes, highs, lows) -> float:
+    """Bloco 3 — corpo/range do candle de rejeição (0 = doji/indecisão,
+    1 = corpo ocupa o candle inteiro = decisão de fluxo clara)."""
+    rng = highs[idx] - lows[idx]
+    if rng <= 0:
+        return 0.5
+    return float(np.clip(abs(closes[idx] - opens[idx]) / rng, 0.0, 1.0))
+
+
+def _retracoes_na_saida(idx_toque: int, highs, lows, zona_min: float, zona_max: float, n_candles: int) -> int:
+    """Bloco 3 — quantas vezes o preço reentrou na zona durante a janela de
+    saída (mesma N_CANDLES_IMPULSO já usada pro impulso pós-toque). Cada
+    reentrada dilui a força do sinal de rejeição, mesmo que o toque tenha
+    tecnicamente "confirmado"."""
+    n = len(highs)
+    ini = idx_toque + 1
+    fim = min(idx_toque + 1 + n_candles, n)
+    if fim <= ini:
+        return 0
+    h, l = highs[ini:fim], lows[ini:fim]
+    dentro = (h >= zona_min) & (l <= zona_max)
+    return int(np.sum(dentro))
+
+
+def _analisar_aproximacao(idx_toque: int, highs, lows, opens, closes, atrs,
+                           fundo_simples, topo_simples, e_fundo: bool) -> dict:
+    """Bloco 2 — qualidade da perna de PREÇO que leva até o toque (candles
+    ANTES do toque, não o próprio candle de rejeição — isso é Bloco 3).
+    Peça inteiramente nova (não existia versão anterior). Retorna
+    `{'score': float, 'fatores': {...}}` — fatores expostos pra manter
+    rastreabilidade (seção 8 da spec, "nada de black box")."""
+    n = len(closes)
+    ini = max(0, idx_toque - cfg.JANELA_APROXIMACAO_CANDLES)
+    m = idx_toque - ini
+    if m < 4:
+        return {'score': 50.0, 'fatores': {}}
+
+    h, l = highs[ini:idx_toque], lows[ini:idx_toque]
+    o, c = opens[ini:idx_toque], closes[ini:idx_toque]
+    a = atrs[ini:idx_toque]
+    atr_medio = float(np.nanmean(a)) if np.any(~np.isnan(a)) else np.nan
+    atr_ref = atr_medio if (not np.isnan(atr_medio) and atr_medio > 0) else 1.0
+    ranges = h - l
+    corpos = np.abs(c - o)
+    meio = (h + l) / 2.0
+
+    # 1) esforço x resultado — eficiência = distância líquida / soma dos
+    # ranges percorridos; exaustão = perda de eficiência da 1ª pra 2ª metade
+    # da perna (esforço crescendo sem resultado equivalente)
+    esforco = float(np.sum(ranges))
+    resultado = float(abs(c[-1] - c[0]))
+    eficiencia = resultado / esforco if esforco > 0 else 0.0
+    metade = m // 2
+    if metade >= 2:
+        esforco_1 = float(np.sum(ranges[:metade])) or 1e-9
+        esforco_2 = float(np.sum(ranges[metade:])) or 1e-9
+        efic_1 = abs(c[metade - 1] - c[0]) / esforco_1
+        efic_2 = abs(c[-1] - c[metade]) / esforco_2
+        exaustao = float(np.clip(efic_1 - efic_2, 0.0, 1.0))
+    else:
+        exaustao = 0.0
+
+    # 2) estrutura impulsiva (poucos candles de corpo grande) vs. corretiva
+    limiar_corpo = cfg.LIMIAR_CORPO_DECISIVO_ATR * atr_ref
+    frac_decisiva = float(np.mean(corpos >= limiar_corpo))
+
+    # 3) canal (regressão linear sobre o preço médio) vs. errático, e
+    # "esticada" = desvio final além do canal normal (excesso especulativo)
+    x = np.arange(m, dtype=float)
+    if m >= 3 and np.std(meio) > 0:
+        coef = np.polyfit(x, meio, 1)
+        pred = np.polyval(coef, x)
+        ss_res = float(np.sum((meio - pred) ** 2))
+        ss_tot = float(np.sum((meio - np.mean(meio)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+        esticada = bool(abs(meio[-1] - pred[-1]) > cfg.LIMIAR_ESTICADA_CANAL_ATR * atr_ref)
+    else:
+        r2, esticada = 0.0, False
+    canal_definido = r2 >= cfg.LIMIAR_CANAL_R2
+
+    # 4) correção em tempo (candles "parados") vs. em preço (retração já
+    # sofrida sobre o deslocamento máximo da perna) — reportados separado,
+    # nunca combinados (exigência explícita da spec)
+    deslocamento_max = float(np.max(np.abs(meio - meio[0])))
+    correcao_preco = float(abs(meio[-1] - meio[0]) / deslocamento_max) if deslocamento_max > 0 else 1.0
+    parado = np.abs(np.diff(meio)) < (0.15 * atr_ref)
+    correcao_tempo = float(np.mean(parado)) if len(parado) else 0.0
+
+    # 5) estrutura de topos/fundos intermediários — reusa os pivôs simples
+    # já confirmados (mesmo fractal de detectar_pivos). Numa aproximação de
+    # ALTA rumo a resistência, o que importa são os FUNDOS intermediários
+    # (precisam subir); numa de BAIXA rumo a suporte, os TOPOS (precisam cair).
+    if e_fundo:
+        marca, precos_marca = topo_simples[ini:idx_toque], h
+    else:
+        marca, precos_marca = fundo_simples[ini:idx_toque], l
+    idxs_marca = np.where(marca)[0]
+    if len(idxs_marca) >= 2:
+        serie = precos_marca[idxs_marca]
+        diffs = np.diff(serie)
+        a_favor = float(np.mean(diffs < 0)) if e_fundo else float(np.mean(diffs > 0))
+    else:
+        a_favor = 0.5
+
+    # 6) velocidade da última perna — aceleração (clímax) vs. desaceleração
+    K = min(cfg.K_VELOCIDADE_ULTIMA_PERNA, m // 2)
+    if K >= 2 and m >= 2 * K:
+        range_final = float(np.mean(ranges[-K:]))
+        range_anterior = float(np.mean(ranges[-2 * K:-K]))
+        aceleracao = (range_final / range_anterior) if range_anterior > 0 else 1.0
+    else:
+        aceleracao = 1.0
+
+    score = 50.0
+    score += float(np.clip(eficiencia - 0.5, -0.5, 0.5)) * 20.0
+    score += exaustao * cfg.PESO_ESFORCO_RESULTADO
+    score += (frac_decisiva - 0.5) * 2 * cfg.PESO_ESTRUTURA_IMPULSIVA
+    score += cfg.PESO_CANAL_DEFINIDO if canal_definido else 0.0
+    score += cfg.PESO_CANAL_ESTICADO if esticada else 0.0
+    score += (a_favor - 0.5) * 2 * cfg.PESO_ESTRUTURA_TOPOS_FUNDOS_APROXIMACAO
+    score += cfg.PESO_VELOCIDADE_ULTIMA_PERNA if aceleracao > 1.3 else 0.0
+    score = float(np.clip(score, 0.0, 100.0))
+
+    return {
+        'score': round(score, 1),
+        'fatores': {
+            'eficiencia': round(eficiencia, 3),
+            'exaustao': round(exaustao, 3),
+            'estrutura_impulsiva': round(frac_decisiva, 3),
+            'canal_r2': round(r2, 3),
+            'esticada': esticada,
+            'correcao_tempo': round(correcao_tempo, 3),
+            'correcao_preco': round(correcao_preco, 3),
+            'estrutura_topos_fundos': round(a_favor, 3),
+            'aceleracao_ultima_perna': round(float(aceleracao), 3),
+        },
+    }
+
+
+def _compor_combustivel_score(forca_toques, decaimento_idade, profundidade_media,
+                               intensidade_origem, base_limpa):
+    """Bloco 1 (combustível) composto — vetorizado. `forca_toques` já vem
+    ponderada (_peso_toque, pico-e-queda); satura via tanh (nunca corta
+    abruptamente como o antigo TOQUES_TETO_SCORE=6, que igualava 6, 11, 14 e
+    84 toques). `decaimento_idade` já vem de `_decaimento_idade` (1=fresh,
+    ->0=velha)."""
+    forca = np.nan_to_num(np.asarray(forca_toques, dtype=float), nan=0.0)
+    score = np.full(forca.shape, 50.0)
+    score -= np.tanh(forca / cfg.ESCALA_FORCA_TOQUES_COMBUSTIVEL) * cfg.PESO_FORCA_TOQUES_COMBUSTIVEL
+    score += (np.asarray(decaimento_idade, dtype=float) - 0.5) * 2 * cfg.PESO_IDADE_COMBUSTIVEL
+    score += np.nan_to_num(np.asarray(profundidade_media, dtype=float), nan=0.0) * cfg.PESO_PROFUNDIDADE_MITIGACAO
+    score += np.nan_to_num(np.asarray(intensidade_origem, dtype=float), nan=0.5) * cfg.PESO_INTENSIDADE_ORIGEM
+    score += np.nan_to_num(np.asarray(base_limpa, dtype=float), nan=0.5) * cfg.PESO_BASE_LIMPA
+    return np.clip(score, 0.0, 100.0)
+
+
+def _compor_rejeicao_score(rejeicao_media, agressao_media, impulso_medio,
+                            pureza_corpo_media, retracoes_media):
+    """Bloco 3 (rejeição) composto — vetorizado. Refina o que já existia
+    (rejeição por wick, agressão via delta, impulso pós-toque) com pureza do
+    corpo e nº de retrações durante a saída."""
+    rej = np.nan_to_num(np.asarray(rejeicao_media, dtype=float), nan=0.0)
+    score = np.full(rej.shape, 50.0)
+    score += rej * 20.0
+    score += np.nan_to_num(np.asarray(agressao_media, dtype=float), nan=0.0) * 15.0
+    score += np.clip(np.nan_to_num(np.asarray(impulso_medio, dtype=float), nan=0.0), -2, 2) * 8.0
+    score += (np.nan_to_num(np.asarray(pureza_corpo_media, dtype=float), nan=0.5) - 0.5) * 2 * cfg.PESO_PUREZA_CORPO
+    score += np.nan_to_num(np.asarray(retracoes_media, dtype=float), nan=0.0) * cfg.PESO_RETRACOES_SAIDA
+    return np.clip(score, 0.0, 100.0)
+
+
+def montar_acao(combustivel: float, aproximacao: float, rejeicao: float,
+                 eh_resistencia: bool, zona_min: float, zona_max: float) -> dict:
+    """Camada de saída — 'ação' (seção 6.3 da spec): postura SEMPRE via regra
+    explícita combinando os 3 blocos (nunca texto livre), magnitude esperada
+    derivada do combustível (zona fresh = mais percurso potencial), e nível
+    de invalidação (só preenchido quando a postura favorece entrada) —
+    reaproveita a mesma definição de zona usada pelo rompimento estrutural,
+    não inventa um conceito novo."""
+    media = (combustivel + aproximacao + rejeicao) / 3.0
+    piso = min(combustivel, aproximacao, rejeicao)
+    if media >= cfg.LIMIAR_POSTURA_FAVORECE and piso >= cfg.LIMIAR_POSTURA_AGUARDAR:
+        postura = 'favorece_entrada'
+    elif media >= cfg.LIMIAR_POSTURA_AGUARDAR:
+        postura = 'aguardar_confirmacao'
+    elif media >= cfg.LIMIAR_POSTURA_FRACO:
+        postura = 'sinal_fraco'
+    else:
+        postura = 'evitar'
+
+    if combustivel <= cfg.MAGNITUDE_COMBUSTIVEL_CURTA_MAX:
+        magnitude = 'curta'
+    elif combustivel <= cfg.MAGNITUDE_COMBUSTIVEL_MODERADA_MAX:
+        magnitude = 'moderada'
+    else:
+        magnitude = 'longa'
+
+    invalidacao = None
+    if postura == 'favorece_entrada':
+        invalidacao = float(zona_max) if eh_resistencia else float(zona_min)
+
+    return {'postura': postura, 'magnitude_esperada': magnitude, 'invalidacao': invalidacao}
+
+
 def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
                              toques_min_forte: int = None) -> dict:
     """
@@ -675,7 +1033,11 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         return {'tipo': 'indefinido', 'toques': 0, 'forca_toques': 0.0,
                 'forte': False, 'violado': False, 'rejeicao_media': None,
                 'agressao_media': None, 'impulso_medio': None,
-                'prob_bounce': 50.0, 'janela': 0, 'linha_atual': None}
+                'prob_bounce': 50.0, 'janela': 0, 'linha_atual': None,
+                'pivo_em_formacao': None, 'eventos_regime': [],
+                'regime_atual_desde_idx': None, 'detalhes_toques': [],
+                'combustivel_score': 50.0, 'aproximacao_score': 50.0,
+                'rejeicao_score': 50.0, 'acao': None}
 
     toques_min_forte = toques_min_forte or cfg.TOQUES_MINIMOS_NIVEL_FORTE
     janela = min(janela, n)
@@ -724,6 +1086,8 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
 
     N_IMP = cfg.N_CANDLES_IMPULSO
     pesos, rejeicoes, agressoes, impulsos = [], [], [], []
+    profundidades, purezas, retracoes_lst, aproximacoes = [], [], [], []
+    detalhes_toques = []
     for ordem_n, idx in enumerate(idxs_touch, start=1):
         rej = sombra_inf[idx] if e_fundo else sombra_sup[idx]
         vol_i = vol_total_arr[idx] if tem_fluxo_arr[idx] else np.nan
@@ -741,16 +1105,53 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         atr_idx = atrs[idx] if (not np.isnan(atrs[idx]) and atrs[idx] > 0) else np.nan
         imp = (abs(closes[idx_alvo] - closes[idx]) / (atr_idx * N_IMP)) if not np.isnan(atr_idx) else np.nan
 
+        # "Zona" de uma linha genérica é a banda de tolerância em torno do
+        # valor da linha NAQUELE candle (mesma banda usada pra detectar o
+        # toque acima) — reaproveita os mesmos helpers do S/R automático.
+        preco_extremo = lows[idx] if e_fundo else highs[idx]
+        tol_idx = atr_idx * cfg.TOLERANCIA_LINHA_GENERICA_ATR if not np.isnan(atr_idx) else 0.0
+        z_min_idx, z_max_idx = linha[idx] - tol_idx, linha[idx] + tol_idx
+        profundidade = _profundidade_mitigacao(preco_extremo, z_min_idx, z_max_idx, e_fundo) if tol_idx > 0 else 0.0
+        pureza = _pureza_corpo(idx, opens, closes, highs, lows)
+        retr = _retracoes_na_saida(idx, highs, lows, z_min_idx, z_max_idx, N_IMP) if tol_idx > 0 else 0
+        aprox = _analisar_aproximacao(idx, highs, lows, opens, closes, atrs, fundo_simples, topo_simples, e_fundo)
+
         pesos.append(peso)
         rejeicoes.append(rej)
         agressoes.append(agr)
         impulsos.append(imp)
+        profundidades.append(profundidade)
+        purezas.append(pureza)
+        retracoes_lst.append(retr)
+        aproximacoes.append(aprox['score'])
+        detalhes_toques.append({
+            'idx': int(idx),
+            'timestamp': _ts_iso(df['datetime'].values[idx]),
+            'preco': float(preco_extremo),
+            'tipo_pivo': 'forte' if forte_toque else 'simples',
+            'rejeicao': round(float(rej), 3),
+            'agressao': round(float(agr), 3),
+            'impulso': None if np.isnan(imp) else round(float(imp), 3),
+            'peso': round(float(peso), 3),
+            'profundidade': round(profundidade, 3), 'pureza_corpo': round(pureza, 3),
+            'retracoes_saida': retr, 'aproximacao': aprox,
+        })
 
     pesos_arr = np.array(pesos)
     toques = len(idxs_touch)
     forca_toques = float(pesos_arr.sum()) if toques else 0.0
     rejeicao_media = float(np.average(rejeicoes, weights=pesos_arr)) if toques and pesos_arr.sum() > 0 else np.nan
     agressao_media = float(np.average(agressoes, weights=pesos_arr)) if toques and pesos_arr.sum() > 0 else np.nan
+    if toques and pesos_arr.sum() > 0:
+        profundidade_media = float(np.average(profundidades, weights=pesos_arr))
+        pureza_corpo_media = float(np.average(purezas, weights=pesos_arr))
+        retracoes_media = float(np.average(retracoes_lst, weights=pesos_arr))
+        aproximacao_media = float(np.average(aproximacoes, weights=pesos_arr))
+    else:
+        profundidade_media = np.nan
+        pureza_corpo_media = np.nan
+        retracoes_media = np.nan
+        aproximacao_media = np.nan
     if toques:
         impulsos_arr = np.array(impulsos)
         validos_imp = ~np.isnan(impulsos_arr)
@@ -764,6 +1165,7 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
     # isolado no meio do caminho (mesmo espírito do wick-sweep do S/R
     # estático, sem a máquina de estados completa de pullback/throwback). ---
     violado = False
+    eventos_regime = []
     for i in range(ini, n):
         atr_i = atrs[i]
         if np.isnan(atr_i) or atr_i <= 0:
@@ -771,27 +1173,77 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         corpo_i = abs(closes[i] - opens[i])
         rompeu = (closes[i] < linha[i]) if e_fundo else (closes[i] > linha[i])
         if rompeu and corpo_i >= cfg.CORPO_MINIMO_ROMPIMENTO_ATR * atr_i:
+            if not violado:
+                eventos_regime.append({'idx': int(i), 'timestamp': _ts_iso(df['datetime'].values[i]),
+                                        'tipo': 'rompimento', 'preco_fechamento': float(closes[i])})
             violado = True
         elif violado:
             recuperou = (closes[i] >= linha[i]) if e_fundo else (closes[i] <= linha[i])
             if recuperou:
+                eventos_regime.append({'idx': int(i), 'timestamp': _ts_iso(df['datetime'].values[i]),
+                                        'tipo': 'recuperacao', 'preco_fechamento': float(closes[i])})
                 violado = False
+
+    regime_atual_desde_idx = eventos_regime[-1]['idx'] if eventos_regime else None
+    for d in detalhes_toques:
+        if regime_atual_desde_idx is None:
+            d['regime'] = 'unico'
+        else:
+            d['regime'] = 'atual' if d['idx'] >= regime_atual_desde_idx else 'antigo'
+
+    # --- pivô em formação: o preço mais recente do lado certo (fundo pra
+    # suporte, topo pra resistência) ainda pode não ter confirmação
+    # suficiente pra contar como toque de verdade — ver detectar_pivo_em_formacao ---
+    pivo_em_formacao = None
+    candidato_formacao = detectar_pivo_em_formacao(df).get('fundo' if e_fundo else 'topo')
+    if candidato_formacao is not None:
+        idx_o = candidato_formacao['idx_origem']
+        atr_o = atrs[idx_o]
+        if not np.isnan(atr_o) and atr_o > 0 and \
+                abs(candidato_formacao['preco'] - linha[idx_o]) <= atr_o * cfg.TOLERANCIA_LINHA_GENERICA_ATR:
+            pivo_em_formacao = {
+                'tipo_pivo': 'fundo' if e_fundo else 'topo',
+                'idx_origem': int(idx_o),
+                'timestamp_origem': _ts_iso(df['datetime'].values[idx_o]),
+                'preco': candidato_formacao['preco'],
+                'confirmadas': candidato_formacao['confirmadas'],
+                'faltam': candidato_formacao['faltam'],
+            }
 
     forte = (toques >= toques_min_forte) and not violado
 
+    # --- Blocos de força (2026-07-13, mesma decomposição do S/R automático
+    # — ver calcular_prob_niveis_sr). Uma linha genérica não tem um "candle
+    # de origem" natural como um pivô automático (o traçado é desenhado à
+    # mão) — usa o 1º toque registrado como proxy de origem, e "idade" como
+    # candles desde esse 1º toque (0 = ainda sem toque, tratado como fresh). ---
+    idx_origem_proxy = idxs_touch[0] if toques else None
+    forca_origem_linha = _forca_origem(idx_origem_proxy, highs, lows, atrs) if idx_origem_proxy is not None \
+        else {'intensidade_origem': 0.5, 'base_limpa': 0.5}
+    idade_linha = (n - 1 - idx_origem_proxy) if idx_origem_proxy is not None else 0
+    decaimento_idade_linha = float(_decaimento_idade(idade_linha))
+
+    combustivel = float(_compor_combustivel_score(
+        np.array([forca_toques]), np.array([decaimento_idade_linha]), np.array([profundidade_media]),
+        np.array([forca_origem_linha['intensidade_origem']]), np.array([forca_origem_linha['base_limpa']]))[0])
+    aproximacao = float(aproximacao_media) if not np.isnan(aproximacao_media) else 50.0
+    rejeicao = float(_compor_rejeicao_score(
+        np.array([rejeicao_media]), np.array([agressao_media]), np.array([impulso_medio]),
+        np.array([pureza_corpo_media]), np.array([retracoes_media]))[0])
+
     score = 50.0
-    if toques:
-        score += 10.0 if forte else -5.0
-        score += min(forca_toques, 10) * 1.5
-        if not np.isnan(rejeicao_media):
-            score += rejeicao_media * 10
-        if not np.isnan(agressao_media):
-            score += agressao_media * 8  # já orientado favoravelmente (ver cálculo de `agr` acima)
-        if not np.isnan(impulso_medio):
-            score += min(impulso_medio, 2.0) * 3
+    score += (combustivel - 50) / 50 * cfg.AMPLITUDE_BLOCO_COMBUSTIVEL
+    score += (aproximacao - 50) / 50 * cfg.AMPLITUDE_BLOCO_APROXIMACAO
+    score += (rejeicao - 50) / 50 * cfg.AMPLITUDE_BLOCO_REJEICAO
+    score += 10.0 if (toques and forte) else (-5.0 if toques else 0.0)
     if violado:
         score -= 15.0
     prob_bounce = float(np.clip(score, cfg.SCORE_PROB_MIN, cfg.SCORE_PROB_MAX))
+
+    tol_atual = atrs[-1] * cfg.TOLERANCIA_LINHA_GENERICA_ATR if not np.isnan(atrs[-1]) else 0.0
+    eh_resistencia_linha = not e_fundo
+    acao = montar_acao(combustivel, aproximacao, rejeicao, eh_resistencia_linha,
+                        linha_atual - tol_atual, linha_atual + tol_atual)
 
     return {
         'tipo': tipo,
@@ -805,6 +1257,14 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         'prob_bounce': round(prob_bounce, 1),
         'janela': janela,
         'linha_atual': float(linha_atual),
+        'pivo_em_formacao': pivo_em_formacao,
+        'eventos_regime': eventos_regime,
+        'regime_atual_desde_idx': regime_atual_desde_idx,
+        'detalhes_toques': detalhes_toques,
+        'combustivel_score': round(combustivel, 1),
+        'aproximacao_score': round(aproximacao, 1),
+        'rejeicao_score': round(rejeicao, 1),
+        'acao': acao,
     }
 
 
@@ -875,12 +1335,15 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
     closes = df['close'].values
     highs = df['high'].values
     lows = df['low'].values
+    opens = df['open'].values
     atrs = df['atr'].values
     corpo = (df['close'] - df['open']).abs().values
     sombra_sup = df['sombra_sup_pct'].values if 'sombra_sup_pct' in df.columns else np.zeros(n)
     sombra_inf = df['sombra_inf_pct'].values if 'sombra_inf_pct' in df.columns else np.zeros(n)
     topo_forte_arr = df['topo_forte'].values if 'topo_forte' in df.columns else np.ones(n, dtype=bool)
     fundo_forte_arr = df['fundo_forte'].values if 'fundo_forte' in df.columns else np.ones(n, dtype=bool)
+    topo_simples_arr = df['topo_simples'].values if 'topo_simples' in df.columns else np.zeros(n, dtype=bool)
+    fundo_simples_arr = df['fundo_simples'].values if 'fundo_simples' in df.columns else np.zeros(n, dtype=bool)
     tem_fluxo_arr = df['fluxo_disponivel'].values if 'fluxo_disponivel' in df.columns else np.zeros(n, dtype=bool)
     delta_arr = pd.to_numeric(df['delta'], errors='coerce').fillna(0).values if 'delta' in df.columns else np.zeros(n)
     vol_c_arr = pd.to_numeric(df['vol_comprador'], errors='coerce').fillna(0).values if 'vol_comprador' in df.columns else np.zeros(n)
@@ -893,6 +1356,13 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
     rejeicao_media_zona = np.full(n_clusters, np.nan)
     agressao_media_zona = np.full(n_clusters, np.nan)
     impulso_medio_zona = np.full(n_clusters, np.nan)
+    profundidade_media_zona = np.full(n_clusters, np.nan)
+    pureza_corpo_media_zona = np.full(n_clusters, np.nan)
+    retracoes_media_zona = np.full(n_clusters, np.nan)
+    aproximacao_media_zona = np.full(n_clusters, np.nan)
+    intensidade_origem_zona = np.full(n_clusters, np.nan)
+    base_limpa_zona = np.full(n_clusters, np.nan)
+    detalhe_toques_zona = [[] for _ in range(n_clusters)]
     N_IMP = cfg.N_CANDLES_IMPULSO
 
     for k in range(n_clusters):
@@ -901,6 +1371,11 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
         tipo = membros_tipo[k]
         ordem_tempo = np.argsort(conf)
         pesos, rejeicoes, agressoes, impulsos = [], [], [], []
+        profundidades, purezas, retracoes_lst, aproximacoes = [], [], [], []
+        forca_origem_zona = _forca_origem(int(primeiro_idx_orig[k]), highs, lows, atrs)
+        intensidade_origem_zona[k] = forca_origem_zona['intensidade_origem']
+        base_limpa_zona[k] = forca_origem_zona['base_limpa']
+        z_min, z_max = zona_min_orig[k], zona_max_orig[k]
         for ordem_n, pos in enumerate(ordem_tempo, start=1):
             oi = origem[pos]
             e_fundo = tipo[pos] == 'fundo'
@@ -921,20 +1396,48 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
             atr_oi = atrs[oi] if (not np.isnan(atrs[oi]) and atrs[oi] > 0) else np.nan
             imp = (abs(closes[idx_alvo] - closes[oi]) / (atr_oi * N_IMP)) if not np.isnan(atr_oi) else np.nan
 
+            preco_extremo = lows[oi] if e_fundo else highs[oi]
+            profundidade = _profundidade_mitigacao(preco_extremo, z_min, z_max, e_fundo)
+            pureza = _pureza_corpo(oi, opens, closes, highs, lows)
+            retr = _retracoes_na_saida(oi, highs, lows, z_min, z_max, N_IMP)
+            aprox = _analisar_aproximacao(oi, highs, lows, opens, closes, atrs,
+                                           fundo_simples_arr, topo_simples_arr, e_fundo)
+
             pesos.append(peso)
             rejeicoes.append(rej)
             agressoes.append(agr)
             impulsos.append(imp)
+            profundidades.append(profundidade)
+            purezas.append(pureza)
+            retracoes_lst.append(retr)
+            aproximacoes.append(aprox['score'])
+            detalhe_toques_zona[k].append({
+                'idx': int(ci), 'idx_origem': int(oi),
+                'timestamp': _ts_iso(df['datetime'].values[ci]),
+                'preco': float(preco_extremo),
+                'tipo_pivo': 'forte' if forte_toque else 'simples',
+                'rejeicao': round(float(rej), 3), 'agressao': round(float(agr), 3),
+                'impulso': None if np.isnan(imp) else round(float(imp), 3),
+                'peso': round(float(peso), 3),
+                'profundidade': round(profundidade, 3), 'pureza_corpo': round(pureza, 3),
+                'retracoes_saida': retr, 'aproximacao': aprox,
+            })
 
         pesos = np.array(pesos)
         forca_toques_zona[k] = pesos.sum()
         if pesos.sum() > 0:
             rejeicao_media_zona[k] = float(np.average(rejeicoes, weights=pesos))
             agressao_media_zona[k] = float(np.average(agressoes, weights=pesos))
+            profundidade_media_zona[k] = float(np.average(profundidades, weights=pesos))
+            pureza_corpo_media_zona[k] = float(np.average(purezas, weights=pesos))
+            retracoes_media_zona[k] = float(np.average(retracoes_lst, weights=pesos))
+            aproximacao_media_zona[k] = float(np.average(aproximacoes, weights=pesos))
             impulsos_arr = np.array(impulsos)
             validos_imp = ~np.isnan(impulsos_arr)
             if validos_imp.any():
                 impulso_medio_zona[k] = float(np.average(impulsos_arr[validos_imp], weights=pesos[validos_imp]))
+
+    clusters['detalhe_toques_zona'] = _SemDeepcopy(detalhe_toques_zona)
 
     # --- B.6: máquina de estados de bipolaridade (uma vez por cluster,
     # janela limitada — O(n_zonas × JANELA_MAX_RETESTE), não O(n²)) ---
@@ -1084,7 +1587,7 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
         if reteste_idx is not None:
             status_timeline[k].append((reteste_idx, 'rompida'))
             novas_zonas.append({
-                'origem_k': k, 'idx_criacao': reteste_idx,
+                'origem_k': k, 'idx_criacao': reteste_idx, 'idx_rompimento': j,
                 'preco_referencia': centros_orig[k], 'zona_min': c_min, 'zona_max': c_max,
                 'forca_herdada': forca_toques_zona[k],
             })
@@ -1132,6 +1635,10 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
                          (preco_pool[idx_pool] >= c_min_z) & (preco_pool[idx_pool] <= c_max_z)]
 
         pesos, rejeicoes, agressoes, impulsos = [], [], [], []
+        profundidades, purezas, retracoes_lst, aproximacoes = [], [], [], []
+        detalhe_toques_espelho = []
+        e_fundo_espelho = (tipo_espelho == 'fundo')
+        forca_origem_espelho = _forca_origem(int(z['idx_criacao']), highs, lows, atrs)
         for ordem_n, conf_i in enumerate(cand, start=1):
             oi = _origem_pivo_espelho(conf_i, tipo_espelho)
             rej = sombra_inf[oi] if tipo_espelho == 'fundo' else sombra_sup[oi]
@@ -1147,18 +1654,48 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
             idx_alvo = min(oi + N_IMP, n - 1)
             atr_oi = atrs[oi] if (not np.isnan(atrs[oi]) and atrs[oi] > 0) else np.nan
             imp = (abs(closes[idx_alvo] - closes[oi]) / (atr_oi * N_IMP)) if not np.isnan(atr_oi) else np.nan
+
+            preco_extremo = lows[oi] if tipo_espelho == 'fundo' else highs[oi]
+            profundidade = _profundidade_mitigacao(preco_extremo, c_min_z, c_max_z, e_fundo_espelho)
+            pureza = _pureza_corpo(oi, opens, closes, highs, lows)
+            retr = _retracoes_na_saida(oi, highs, lows, c_min_z, c_max_z, N_IMP)
+            aprox = _analisar_aproximacao(oi, highs, lows, opens, closes, atrs,
+                                           fundo_simples_arr, topo_simples_arr, e_fundo_espelho)
+
             pesos.append(peso)
             rejeicoes.append(rej)
             agressoes.append(agr)
             impulsos.append(imp)
+            profundidades.append(profundidade)
+            purezas.append(pureza)
+            retracoes_lst.append(retr)
+            aproximacoes.append(aprox['score'])
+            detalhe_toques_espelho.append({
+                'idx': int(conf_i), 'idx_origem': int(oi),
+                'timestamp': _ts_iso(df['datetime'].values[conf_i]),
+                'preco': float(preco_extremo),
+                'tipo_pivo': 'forte' if forte_toque else 'simples',
+                'rejeicao': round(float(rej), 3), 'agressao': round(float(agr), 3),
+                'impulso': None if np.isnan(imp) else round(float(imp), 3),
+                'peso': round(float(peso), 3),
+                'profundidade': round(profundidade, 3), 'pureza_corpo': round(pureza, 3),
+                'retracoes_saida': retr, 'aproximacao': aprox,
+            })
 
         z['toques'] = len(cand)
         z['membros_conf'] = cand
+        z['detalhe_toques'] = detalhe_toques_espelho
+        z['intensidade_origem'] = forca_origem_espelho['intensidade_origem']
+        z['base_limpa'] = forca_origem_espelho['base_limpa']
         if pesos:
             pesos_arr = np.array(pesos)
             z['forca_toques'] = float(pesos_arr.sum())
             z['rejeicao_media'] = float(np.average(rejeicoes, weights=pesos_arr))
             z['agressao_media'] = float(np.average(agressoes, weights=pesos_arr))
+            z['profundidade_media'] = float(np.average(profundidades, weights=pesos_arr))
+            z['pureza_corpo_media'] = float(np.average(purezas, weights=pesos_arr))
+            z['retracoes_media'] = float(np.average(retracoes_lst, weights=pesos_arr))
+            z['aproximacao_media'] = float(np.average(aproximacoes, weights=pesos_arr))
             impulsos_arr = np.array(impulsos)
             validos_imp = ~np.isnan(impulsos_arr)
             z['impulso_medio'] = (float(np.average(impulsos_arr[validos_imp], weights=pesos_arr[validos_imp]))
@@ -1168,6 +1705,10 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
             z['rejeicao_media'] = np.nan
             z['agressao_media'] = np.nan
             z['impulso_medio'] = np.nan
+            z['profundidade_media'] = np.nan
+            z['pureza_corpo_media'] = np.nan
+            z['retracoes_media'] = np.nan
+            z['aproximacao_media'] = np.nan
 
     # --- Anexa zonas espelho como candidatas adicionais ao re-ranking ---
     n_espelhos = len(novas_zonas)
@@ -1189,6 +1730,12 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
         rejeicao_media_zona_full = np.concatenate([rejeicao_media_zona, [z['rejeicao_media'] for z in novas_zonas]])
         agressao_media_zona_full = np.concatenate([agressao_media_zona, [z['agressao_media'] for z in novas_zonas]])
         impulso_medio_zona_full = np.concatenate([impulso_medio_zona, [z['impulso_medio'] for z in novas_zonas]])
+        profundidade_media_zona_full = np.concatenate([profundidade_media_zona, [z['profundidade_media'] for z in novas_zonas]])
+        pureza_corpo_media_zona_full = np.concatenate([pureza_corpo_media_zona, [z['pureza_corpo_media'] for z in novas_zonas]])
+        retracoes_media_zona_full = np.concatenate([retracoes_media_zona, [z['retracoes_media'] for z in novas_zonas]])
+        aproximacao_media_zona_full = np.concatenate([aproximacao_media_zona, [z['aproximacao_media'] for z in novas_zonas]])
+        intensidade_origem_zona_full = np.concatenate([intensidade_origem_zona, [z['intensidade_origem'] for z in novas_zonas]])
+        base_limpa_zona_full = np.concatenate([base_limpa_zona, [z['base_limpa'] for z in novas_zonas]])
         membros_conf_full = membros_conf + [z['membros_conf'] for z in novas_zonas]
         for idx_novo, z in enumerate(novas_zonas):
             k_origem, k_novo = z['origem_k'], n_clusters + idx_novo
@@ -1205,6 +1752,12 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
         rejeicao_media_zona_full = rejeicao_media_zona
         agressao_media_zona_full = agressao_media_zona
         impulso_medio_zona_full = impulso_medio_zona
+        profundidade_media_zona_full = profundidade_media_zona
+        pureza_corpo_media_zona_full = pureza_corpo_media_zona
+        retracoes_media_zona_full = retracoes_media_zona
+        aproximacao_media_zona_full = aproximacao_media_zona
+        intensidade_origem_zona_full = intensidade_origem_zona
+        base_limpa_zona_full = base_limpa_zona
         membros_conf_full = membros_conf
 
     idx_criacao_por_cluster = primeiro_idx  # p/ cálculo de idade do espelho por candle
@@ -1243,6 +1796,12 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
             saida2[f'{pref}_forca_herdada'] = np.full(n, np.nan)
             saida2[f'{pref}_zona_espelho_id'] = np.full(n, np.nan)
             saida2[f'{pref}_rompimento_hoje'] = np.full(n, 'nenhum', dtype=object)
+            saida2[f'{pref}_profundidade_media'] = np.full(n, np.nan)
+            saida2[f'{pref}_pureza_corpo_media'] = np.full(n, np.nan)
+            saida2[f'{pref}_retracoes_media'] = np.full(n, np.nan)
+            saida2[f'{pref}_aproximacao_score'] = np.full(n, np.nan)
+            saida2[f'{pref}_intensidade_origem'] = np.full(n, np.nan)
+            saida2[f'{pref}_base_limpa'] = np.full(n, np.nan)
 
     for i in range(n):
         for r in range(N):
@@ -1257,6 +1816,12 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
                 saida2[f'{pref}_agressao_media'][i] = agressao_media_zona_full[k]
                 saida2[f'{pref}_impulso_medio'][i] = impulso_medio_zona_full[k]
                 saida2[f'{pref}_forca_toques'][i] = forca_toques_zona_full[k]
+                saida2[f'{pref}_profundidade_media'][i] = profundidade_media_zona_full[k]
+                saida2[f'{pref}_pureza_corpo_media'][i] = pureza_corpo_media_zona_full[k]
+                saida2[f'{pref}_retracoes_media'][i] = retracoes_media_zona_full[k]
+                saida2[f'{pref}_aproximacao_score'][i] = aproximacao_media_zona_full[k]
+                saida2[f'{pref}_intensidade_origem'][i] = intensidade_origem_zona_full[k]
+                saida2[f'{pref}_base_limpa'][i] = base_limpa_zona_full[k]
                 if k < n_clusters and zona_espelho_id[k] != -1:
                     saida2[f'{pref}_zona_espelho_id'][i] = zona_espelho_id[k]
                 elif n_espelhos and k >= n_clusters:
@@ -1269,6 +1834,8 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
     df.attrs['_rank_idx_acima'] = rank_idx_acima
     df.attrs['_rank_idx_abaixo'] = rank_idx_abaixo
     df.attrs['_zonas_sr_status_timeline'] = status_timeline
+    df.attrs['_zonas_espelho'] = _SemDeepcopy(novas_zonas)
+    df.attrs['_zona_espelho_id_por_cluster'] = zona_espelho_id
     return df
 
 
@@ -1336,12 +1903,36 @@ def calcular_prob_niveis_sr(df: pd.DataFrame) -> pd.DataFrame:
     """
     Score heurístico (0-100%) de probabilidade de BOUNCE (reação/respeito ao
     nível) em oposição a ROMPIMENTO, por nível rankeado (sr_acima_1..N,
-    sr_abaixo_1..N). Combina nivel_forte, força de toques com decaimento,
-    rejeição média da zona, distância em ATR, tendência/fase/saúde, status
-    de bipolaridade, fluxo/delta recente + agressão média da zona, impulso
-    médio da zona, e sinais simplificados de Big Players (absorção/volume
-    anômalo, recalculados aqui de forma vetorizada — sem duplicar a lógica
-    de UI de construir_big_players em dashboard.py).
+    sr_abaixo_1..N) — reescrito em 2026-07-13 (ver
+    especificacao_forca_zonas_price_action.md) pra compor 3 perguntas
+    distintas em vez de um score cego:
+
+    - `combustivel_score` (Bloco 1, `_compor_combustivel_score`): frescor da
+      zona — força de toques (satura via tanh, não mais um teto raso que
+      igualava 6/11/14/84 toques), decaimento por IDADE (agora aplicado a
+      QUALQUER zona, não só espelho), profundidade média de mitigação,
+      intensidade/limpeza na origem.
+    - `aproximacao_score` (Bloco 2, `_analisar_aproximacao`, já agregado por
+      calcular_zonas_sr): qualidade da perna de preço que levou aos toques
+      — esforço×resultado, estrutura impulsiva/corretiva, canal, correção
+      tempo/preço, estrutura de topos/fundos intermediários, velocidade da
+      última perna. Peça inteiramente nova, não existia antes desta entrega.
+    - `rejeicao_score` (Bloco 3, `_compor_rejeicao_score`): qualidade da
+      reação no toque em si — rejeição por wick, agressão, impulso
+      pós-toque, pureza do corpo, retrações na saída, e (deliberadamente
+      dobrados aqui pra dentro, não mais soltos por candle — ver achado da
+      investigação) alinhamento com tendência/fase/saúde, fluxo/delta
+      recente e sinais de Big Players.
+
+    Cada bloco é uma coluna própria (`{pref}_combustivel_score`,
+    `{pref}_aproximacao_score`, `{pref}_rejeicao_score`) pra manter
+    rastreabilidade (seção 8 da spec, "nada de black box") — o
+    `{pref}_prob_bounce` final combina os 3 (proporcional ao desvio de 50)
+    mais ajustes que não são responsabilidade de nenhum bloco específico
+    (força estrutural `nivel_forte`, atenuação por distância, status de
+    bipolaridade, rompimento intradiário) — estes últimos preservam a
+    mesma forma de antes, incluindo os pesos já calibrados empiricamente
+    (PESO_ROMPIMENTO_INTRADAY*, ver CHANGELOG.md).
 
     IMPORTANTE: é uma heurística de engenharia documentada, não uma
     probabilidade estatística calibrada — por isso o resultado é sempre
@@ -1386,6 +1977,12 @@ def calcular_prob_niveis_sr(df: pd.DataFrame) -> pd.DataFrame:
             pref = f'sr_{lado}_{r}'
             if f'{pref}_forte' not in df.columns:
                 df[f'{pref}_prob_bounce'] = np.nan
+                df[f'{pref}_combustivel_score'] = np.nan
+                df[f'{pref}_aproximacao_score'] = np.nan
+                df[f'{pref}_rejeicao_score'] = np.nan
+                df[f'{pref}_postura'] = None
+                df[f'{pref}_magnitude_esperada'] = None
+                df[f'{pref}_invalidacao'] = np.nan
                 continue
 
             toques = pd.to_numeric(df[f'{pref}_toques'], errors='coerce').fillna(0).values
@@ -1399,87 +1996,120 @@ def calcular_prob_niveis_sr(df: pd.DataFrame) -> pd.DataFrame:
             forca_herdada = pd.to_numeric(df.get(f'{pref}_forca_herdada', np.nan), errors='coerce').values
             idade = pd.to_numeric(df.get(f'{pref}_idade', np.nan), errors='coerce').values
             zona_espelho_id = df.get(f'{pref}_zona_espelho_id', pd.Series([np.nan] * n)).values
+            profundidade_media = pd.to_numeric(df.get(f'{pref}_profundidade_media', np.nan), errors='coerce').values
+            pureza_corpo_media = pd.to_numeric(df.get(f'{pref}_pureza_corpo_media', np.nan), errors='coerce').values
+            retracoes_media = pd.to_numeric(df.get(f'{pref}_retracoes_media', np.nan), errors='coerce').values
+            aproximacao_bruto = pd.to_numeric(df.get(f'{pref}_aproximacao_score', np.nan), errors='coerce').values
+            intensidade_origem = pd.to_numeric(df.get(f'{pref}_intensidade_origem', np.nan), errors='coerce').values
+            base_limpa = pd.to_numeric(df.get(f'{pref}_base_limpa', np.nan), errors='coerce').values
+            zona_min = pd.to_numeric(df.get(f'{pref}_zona_min', np.nan), errors='coerce').values
+            zona_max = pd.to_numeric(df.get(f'{pref}_zona_max', np.nan), errors='coerce').values
 
-            score = np.full(n, 50.0)
             valido = ~np.isnan(dist_atr)
 
-            score += np.where(forte, cfg.PESO_NIVEL_FORTE, cfg.PESO_NIVEL_FRACO_PENALIDADE)
+            # --- Bloco 1: combustível de liquidez ---
+            decaimento_idade = _decaimento_idade(idade)
+            combustivel = _compor_combustivel_score(forca_toques, decaimento_idade, profundidade_media,
+                                                     intensidade_origem, base_limpa)
+            # forca_herdada (zona espelho) — decaimento exponencial no tempo,
+            # agora dobrado pra dentro do combustível (é literalmente fuel
+            # herdado da zona-mãe, não um termo solto)
+            tem_herdada = ~np.isnan(forca_herdada)
+            if tem_herdada.any():
+                idade_espelho = np.where(tem_herdada, idade, np.nan)
+                tau = max(cfg.IDADE_MINIMA_NIVEL_FORTE, 1)
+                decaimento_herdada = np.exp(-np.nan_to_num(idade_espelho, nan=0.0) / tau)
+                combustivel = np.clip(combustivel + np.where(tem_herdada, forca_herdada * decaimento_herdada * 0.5, 0), 0, 100)
 
-            # Força de toques com decaimento (não a contagem bruta) — satura em TOQUES_TETO_SCORE
-            forca_p_score = np.where(np.isnan(forca_toques), np.minimum(toques, cfg.TOQUES_TETO_SCORE),
-                                      np.minimum(forca_toques, cfg.TOQUES_TETO_SCORE))
-            score += forca_p_score * cfg.PESO_TOQUE_UNIDADE
+            # --- Bloco 2: qualidade da aproximação (já agregado por zona em calcular_zonas_sr) ---
+            aproximacao = np.nan_to_num(aproximacao_bruto, nan=50.0)
 
-            # Rejeição média da zona reforça bounce
-            score += np.nan_to_num(rejeicao_media, nan=0.0) * 10
+            # --- Bloco 3: qualidade da rejeição no toque — refina o que já
+            # existia (wick/agressão/impulso) com pureza de corpo e
+            # retrações, e dobra pra dentro os termos que antes eram
+            # compartilhados por candle (tendência/fase/saúde, fluxo/delta,
+            # Big Players) — causa raiz do bug de "score idêntico entre
+            # zonas diferentes" (ver docstring acima e especificação).
+            rejeicao = _compor_rejeicao_score(rejeicao_media, agressao_media, impulso_medio,
+                                               pureza_corpo_media, retracoes_media)
 
-            # Atenuação p/ nível muito distante
-            longe = dist_atr > cfg.DIST_ATR_LONGE
-            score = np.where(longe, 50 + (score - 50) * cfg.ATENUACAO_NIVEL_DISTANTE, score)
-
-            # Tendência/fase/saúde (direcional)
             alta = tendencia == 'alta'
             baixa = tendencia == 'baixa'
             lateral = ~alta & ~baixa
             fase_inicio_meio = np.isin(fase, ['inicio', 'meio'])
             saude_forte = saude == 'forte'
+            alinhamento = np.zeros(n)
             if eh_resistencia:
-                score += np.where(alta & fase_inicio_meio, -cfg.PESO_TENDENCIA_FASE, 0)
-                score += np.where(baixa & saude_forte, cfg.PESO_TENDENCIA_FASE, np.where(baixa, cfg.PESO_TENDENCIA_FASE / 2, 0))
+                alinhamento += np.where(alta & fase_inicio_meio, -cfg.PESO_TENDENCIA_FASE, 0)
+                alinhamento += np.where(baixa & saude_forte, cfg.PESO_TENDENCIA_FASE, np.where(baixa, cfg.PESO_TENDENCIA_FASE / 2, 0))
             else:
-                score += np.where(alta & saude_forte, cfg.PESO_TENDENCIA_FASE, np.where(alta, cfg.PESO_TENDENCIA_FASE / 2, 0))
-                score += np.where(baixa & fase_inicio_meio, -cfg.PESO_TENDENCIA_FASE, 0)
-            score += np.where(lateral, cfg.PESO_LATERAL_BOUNCE, 0)
+                alinhamento += np.where(alta & saude_forte, cfg.PESO_TENDENCIA_FASE, np.where(alta, cfg.PESO_TENDENCIA_FASE / 2, 0))
+                alinhamento += np.where(baixa & fase_inicio_meio, -cfg.PESO_TENDENCIA_FASE, 0)
+            alinhamento += np.where(lateral, cfg.PESO_LATERAL_BOUNCE, 0)
 
-            # Status de bipolaridade
+            delta_favor_rompimento = ((eh_resistencia) & (delta_acum > 0)) | ((~eh_resistencia) & (delta_acum < 0))
+            tem_delta = ~np.isnan(delta_acum)
+            alinhamento += np.where(tem_delta & delta_favor_rompimento, -cfg.PESO_FLUXO_DELTA, 0)
+            alinhamento += np.where(tem_delta & ~delta_favor_rompimento, cfg.PESO_FLUXO_DELTA, 0)
+
+            razao_favor_rompimento = ((eh_resistencia) & (razao_agr > 0.65)) | ((~eh_resistencia) & (razao_agr < 0.35))
+            razao_favor_bounce = ((eh_resistencia) & (razao_agr < 0.35)) | ((~eh_resistencia) & (razao_agr > 0.65))
+            alinhamento += np.where(razao_favor_rompimento, -cfg.PESO_FLUXO_RAZAO, 0)
+            alinhamento += np.where(razao_favor_bounce, cfg.PESO_FLUXO_RAZAO, 0)
+
+            absorcao_favor_bounce = (eh_resistencia & absorcao_venda) | (~eh_resistencia & absorcao_compra)
+            alinhamento += np.where(absorcao_favor_bounce, cfg.PESO_BIG_PLAYERS_ABSORCAO, 0)
+            alinhamento += np.where(volume_anomalo, cfg.PESO_BIG_PLAYERS_VOLUME, 0)
+
+            rejeicao = np.clip(rejeicao + alinhamento, 0, 100)
+
+            df[f'{pref}_combustivel_score'] = np.where(valido, np.round(combustivel, 1), np.nan)
+            df[f'{pref}_aproximacao_score'] = np.where(valido, np.round(aproximacao, 1), np.nan)
+            df[f'{pref}_rejeicao_score'] = np.where(valido, np.round(rejeicao, 1), np.nan)
+
+            # --- Combinação final + ajustes que não pertencem a nenhum bloco específico ---
+            score = np.full(n, 50.0)
+            score += (combustivel - 50) / 50 * cfg.AMPLITUDE_BLOCO_COMBUSTIVEL
+            score += (aproximacao - 50) / 50 * cfg.AMPLITUDE_BLOCO_APROXIMACAO
+            score += (rejeicao - 50) / 50 * cfg.AMPLITUDE_BLOCO_REJEICAO
+
+            score += np.where(forte, cfg.PESO_NIVEL_FORTE, cfg.PESO_NIVEL_FRACO_PENALIDADE)
+
+            longe = dist_atr > cfg.DIST_ATR_LONGE
+            score = np.where(longe, 50 + (score - 50) * cfg.ATENUACAO_NIVEL_DISTANTE, score)
+
             aguardando = np.isin(status, ['aguardando_pullback', 'aguardando_throwback'])
             rompida_sem_espelho = (status == 'rompida') & np.isnan(zona_espelho_id)
             score += np.where(aguardando, cfg.PESO_STATUS_AGUARDANDO_RETESTE, 0)
             score += np.where(rompida_sem_espelho, cfg.PESO_STATUS_ROMPIDA_SEM_ESPELHO, 0)
 
-            # forca_herdada (zona espelho) — decaimento exponencial no tempo, nunca soma direta
-            tem_herdada = ~np.isnan(forca_herdada)
-            if tem_herdada.any():
-                idade_espelho = np.where(tem_herdada, idade, np.nan)
-                tau = max(cfg.IDADE_MINIMA_NIVEL_FORTE, 1)
-                decaimento = np.exp(-np.nan_to_num(idade_espelho, nan=0.0) / tau)
-                score += np.where(tem_herdada, forca_herdada * decaimento * 0.5, 0)
-
-            # Fluxo/delta recente (só se disponível)
-            delta_favor_rompimento = ((eh_resistencia) & (delta_acum > 0)) | ((~eh_resistencia) & (delta_acum < 0))
-            tem_delta = ~np.isnan(delta_acum)
-            score += np.where(tem_delta & delta_favor_rompimento, -cfg.PESO_FLUXO_DELTA, 0)
-            score += np.where(tem_delta & ~delta_favor_rompimento, cfg.PESO_FLUXO_DELTA, 0)
-
-            razao_favor_rompimento = ((eh_resistencia) & (razao_agr > 0.65)) | ((~eh_resistencia) & (razao_agr < 0.35))
-            razao_favor_bounce = ((eh_resistencia) & (razao_agr < 0.35)) | ((~eh_resistencia) & (razao_agr > 0.65))
-            score += np.where(razao_favor_rompimento, -cfg.PESO_FLUXO_RAZAO, 0)
-            score += np.where(razao_favor_bounce, cfg.PESO_FLUXO_RAZAO, 0)
-
-            # Agressão média histórica da zona (complementar ao fluxo recente)
-            score += np.nan_to_num(agressao_media, nan=0.0) * cfg.PESO_FLUXO_DELTA
-
-            # Impulso médio da zona — reforça a expectativa de reação também agora
-            score += np.nan_to_num(np.clip(impulso_medio, 0, 2), nan=0.0) * 3
-
-            # Big Players — bônus pequeno, nunca decide sozinho
-            absorcao_favor_bounce = (eh_resistencia & absorcao_venda) | (~eh_resistencia & absorcao_compra)
-            score += np.where(absorcao_favor_bounce, cfg.PESO_BIG_PLAYERS_ABSORCAO, 0)
-            score += np.where(volume_anomalo, cfg.PESO_BIG_PLAYERS_VOLUME, 0)
-
             # Rompimento intradiário (sinal ao vivo, escopo do próprio pregão —
             # ver comentário em calcular_zonas_sr sobre por que isso é
-            # diferente do status estrutural acima). "Rompeu hoje" ainda sem
-            # reteste = momentum de rompimento em curso, penaliza bounce.
-            # "Pullback confirmado hoje" = reteste já validado no próprio
-            # pregão, o sinal mais forte e mais recente que temos — reforça
-            # bounce (o nível, no papel atual, já provou que segura).
+            # diferente do status estrutural acima). Pesos CALIBRADOS
+            # empiricamente (ver CHANGELOG.md) — mantidos fora dos blocos,
+            # aplicados diretamente ao score final.
             rompimento_hoje = df.get(f'{pref}_rompimento_hoje', pd.Series(['nenhum'] * n)).values
             score += np.where(rompimento_hoje == 'rompeu_hoje', -cfg.PESO_ROMPIMENTO_INTRADAY, 0)
             score += np.where(rompimento_hoje == 'pullback_confirmado_hoje', cfg.PESO_ROMPIMENTO_INTRADAY_PULLBACK, 0)
 
             score = np.clip(score, cfg.SCORE_PROB_MIN, cfg.SCORE_PROB_MAX)
             df[f'{pref}_prob_bounce'] = np.where(valido, np.round(score, 1), np.nan)
+
+            # --- Camada de ação (postura/magnitude/invalidação) — por candle,
+            # via montar_acao (regra explícita, nunca texto livre) ---
+            posturas = np.full(n, None, dtype=object)
+            magnitudes = np.full(n, None, dtype=object)
+            invalidacoes = np.full(n, np.nan)
+            idx_validos = np.where(valido)[0]
+            for i in idx_validos:
+                acao = montar_acao(float(combustivel[i]), float(aproximacao[i]), float(rejeicao[i]),
+                                    eh_resistencia, float(zona_min[i]), float(zona_max[i]))
+                posturas[i] = acao['postura']
+                magnitudes[i] = acao['magnitude_esperada']
+                invalidacoes[i] = acao['invalidacao'] if acao['invalidacao'] is not None else np.nan
+            df[f'{pref}_postura'] = posturas
+            df[f'{pref}_magnitude_esperada'] = magnitudes
+            df[f'{pref}_invalidacao'] = invalidacoes
 
     return df
 
@@ -1638,10 +2268,18 @@ def calcular_todos_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFr
         ("Score de probabilidade S/R",  calcular_prob_niveis_sr),
     ]
 
+    _attrs_zonas_sr = {}
     for nome, func in etapas:
         if verbose:
             print(f"  → {nome}...")
         df = func(df)
+        if nome == "Zonas S/R e bipolaridade":
+            _attrs_zonas_sr = dict(df.attrs)  # snapshot — ver reaplicação abaixo
+
+    # Salvaguarda: propagação de df.attrs através de operações do pandas é
+    # "experimental" e não garantida em toda versão/etapa — reaplica
+    # explicitamente por garantia, caso alguma etapa seguinte não preserve.
+    df.attrs.update(_attrs_zonas_sr)
 
     if verbose:
         features_adicionadas = [c for c in df.columns

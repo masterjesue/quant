@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import dash
-from dash import dcc, html, Input, Output, State, callback_context, no_update
+from dash import dcc, html, Input, Output, State, callback_context, no_update, ALL
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
@@ -33,6 +33,9 @@ import persistencia
 import run_backtest
 import mt5_loader
 import diario_trade
+import tracados
+import indice_medo_ganancia
+import correlacao_ativos
 import calendario_economico as cal_eco
 import ai_analyst
 import gerenciador_processos as gp
@@ -67,8 +70,11 @@ estado = {
     'analise_ia':   '',
     'contrato_win': '—',
     'contrato_wdo': '—',
+    'cotacoes_correlacionadas': [],     # ver correlacao_ativos.obter_cotacoes_correlacionadas
+    'fechamentos_di': None,            # Series — ver correlacao_ativos.obter_fechamentos_di
     'posicoes_abertas': None,          # DataFrame — ver sincronizar_posicoes
     'sincronizando_posicoes': False,
+    'reconciliando': False,            # ver _reconciliar_background
 }
 lock = threading.Lock()
 
@@ -119,6 +125,12 @@ def carregar_bases():
                             w = mt5_loader.detectar_contrato_mais_recente('WDO')
                             estado['contrato_win'] = t or '—'
                             estado['contrato_wdo'] = w or '—'
+                            # Ativos correlacionados (DI1FUT/WINFUT/WDOFUT)
+                            # pro painel do hero — mesma cadência de 30s,
+                            # nunca no tick de 1s. Ver correlacao_ativos.py.
+                            estado['cotacoes_correlacionadas'] = correlacao_ativos.obter_cotacoes_correlacionadas(
+                                estado['bases'].get('WIN'), estado['bases'].get('WDO'))
+                            estado['fechamentos_di'] = correlacao_ativos.obter_fechamentos_di()
 
                         mt5_loader.desconectar()
                     except Exception as e:
@@ -155,6 +167,26 @@ def _fmt(val, decimais=0):
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return '—'
     return f"{val:,.{decimais}f}"
+
+def _fmt_ts(iso_str) -> str:
+    """Formata um timestamp ISO (de metricas.montar_regime/_info_bipolar)
+    como 'dd/mm HH:MM' pra leitura humana nos cards de regime/bipolaridade."""
+    if not iso_str:
+        return '—'
+    try:
+        return pd.Timestamp(iso_str).strftime('%d/%m %H:%M')
+    except (ValueError, TypeError):
+        return '—'
+
+def _linha_toque_html_98(d: dict) -> html.Div:
+    """Uma linha da timeline expandida de toques — data/hora, qualidade do
+    pivô (forte/fraco) e rejeição, formato compacto."""
+    return html.Div(
+        f"{_fmt_ts(d['timestamp'])} — toque {d['tipo_pivo']} em {d['preco']:,.0f} "
+        f"(rejeição {d['rejeicao']*100:.0f}%)",
+        style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['mono'],
+               'padding': '1px 0'},
+    )
 
 
 def gauge_cockpit(valor_norm: float, label: str, sub: str, cor: str) -> go.Figure:
@@ -234,6 +266,13 @@ def gauge_cockpit(valor_norm: float, label: str, sub: str, cor: str) -> go.Figur
         # Reduzido (era 200) — pedido em 2026-07-10 pra sobrar mais espaço
         # vertical pro gráfico de candles na janela Quant Lab.
         height=130,
+        # `responsive=True` no dcc.Graph (ver construir_hero) some sozinho
+        # sem isso quando `height` já vem fixo no layout (mesmo bug do
+        # radar da Roda da Vida, 2026-07-12) — sem `autosize`, o gauge mede
+        # o container só 1x na montagem e nunca corrige se pegar um width
+        # errado nessa hora, o que piora reconstruindo do zero a cada 1s
+        # (2026-07-16, achado real do Jesué).
+        autosize=True,
     )
     return fig
 
@@ -376,7 +415,7 @@ def secao(titulo: str, cor_titulo: str = None) -> html.Div:
 
 from metricas import (
     extrair_metricas, candles_para_grafico, niveis_sr_para_grafico,
-    mme21_para_grafico, mme21_ponto_live, analisar_mme21,
+    mme21_para_grafico, mme21_ponto_live, analisar_mme21, analisar_tracados,
 )
 
 
@@ -384,15 +423,92 @@ from metricas import (
 # CONSTRUÇÃO DOS BLOCOS DO DASHBOARD
 # =============================================================================
 
-def construir_hero(m_win: dict, m_wdo: dict, ativo: str) -> html.Div:
-    """Seção hero: velocímetros de força e contexto do ativo selecionado.
+# Balão explicativo dos velocímetros do hero (2026-07-16, pedido do Jesué —
+# ver diario_app_classico... não, ver dashboard.py::construir_hero pro
+# raciocínio completo de por que o clique é 100% client-side em vez de
+# `n_clicks` do Dash). Estilo aqui usa a paleta de tooltip clássica do
+# Windows 98 (`C['tooltip']`/`C['tooltip_text']`, InfoWindow) em vez do
+# balão arredondado do clássico — mais fiel ao skin.
+_EXPLICACAO_GAUGES = {
+    'forca': {
+        'titulo': 'Força — quem domina agora',
+        'indica': 'Compara volume/delta dos candles recentes pra ver quem pesa mais no fluxo: comprador, vendedor ou nenhum dos dois (neutro).',
+        'fazer': 'Puxado pra um lado = o fluxo imediato favorece essa direção, evite operar contra ele. Em NEUTRO, não force — espere o fluxo definir um lado.',
+    },
+    'contexto': {
+        'titulo': 'Contexto — o cenário estrutural favorece?',
+        'indica': 'Olha a estrutura de fundo (tendência, posição em relação aos níveis de S/R) pra dizer se o momento estrutural favorece continuar a favor do movimento.',
+        'fazer': 'FAVORÁVEL reforça manter o viés atual; DESFAVORÁVEL pede cautela mesmo se a Força parecer boa; NEUTRO = sem viés estrutural, decida mais pelo price action do momento.',
+    },
+    'medo_ganancia': {
+        'titulo': 'Medo/Ganância — o humor do mercado',
+        'indica': 'Índice adaptado (3 fatores: momentum, volatilidade, dólar x ações) — não é o oficial da CNN, é um primeiro palpite não calibrado do clima emocional do mercado.',
+        'fazer': 'Extremos de medo ou ganância costumam preceder reversões — não é sinal de entrada isolado, é contexto pra calibrar risco e desconfiar de euforia/pânico.',
+    },
+    'correlacao': {
+        'titulo': 'Correlação — DI1FUT×WINFUT×WDOFUT batem com a tese?',
+        'indica': 'Mede se o DI está seguindo o WDO (correlação positiva) e inverso ao WIN (negativa) nos últimos 20 pregões — a leitura de que isso indica direcionamento mais confiável.',
+        'fazer': 'Direcionamento Claro reforça confiança pra operar a favor do fluxo; Parcial/Neutra pedem mais cautela; Invertida é alerta — os 3 ativos se comportando ao contrário do esperado, considere reduzir tamanho ou ficar de fora.',
+    },
+}
+# Centro (px) de cada gauge na fileira — 130px + win98_sunken(padding=4px)
+# de cada lado = 138px efetivo, gap 8px, passo 146px.
+_POSICAO_TAIL_GAUGE = {'forca': 69, 'contexto': 215, 'medo_ganancia': 361, 'correlacao': 507}
 
-    Não inclui mais o seletor WIN/WDO/WIN×WDO — esse bloco virou estático em
-    app.layout (ver `_estilo_botao_ativo`) porque esta função é reconstruída
+
+def _balao_explicacao_gauge(gauge_selecionado: str) -> html.Div:
+    """Balão (paleta InfoWindow do '98) com "o que indica"/"o que fazer" do
+    velocímetro selecionado + seta apontando pro gauge de origem.
+    Renderizado pelo callback `renderizar_balao_gauge` — nunca por
+    `construir_hero` (ver comentário lá sobre por quê)."""
+    info = _EXPLICACAO_GAUGES.get(gauge_selecionado) or _EXPLICACAO_GAUGES['forca']
+    left_px = _POSICAO_TAIL_GAUGE.get(gauge_selecionado, 69)
+    return html.Div([
+        html.Div(style={
+            'position': 'absolute', 'top': '-8px', 'left': f'{left_px}px', 'transform': 'translateX(-50%)',
+            'width': '0', 'height': '0', 'borderLeft': '8px solid transparent',
+            'borderRight': '8px solid transparent', 'borderBottom': f"8px solid {C['shadow_dk']}",
+        }),
+        html.Div(style={
+            'position': 'absolute', 'top': '-6px', 'left': f'{left_px}px', 'transform': 'translateX(-50%)',
+            'width': '0', 'height': '0', 'borderLeft': '7px solid transparent',
+            'borderRight': '7px solid transparent', 'borderBottom': f"7px solid {C['tooltip']}",
+        }),
+        html.Div(info['titulo'], style={
+            'fontFamily': FONTS['display'], 'fontSize': '12px', 'fontWeight': 'bold',
+            'color': C['tooltip_text'], 'marginBottom': '8px',
+        }),
+        html.Div([
+            html.Span('O que indica: ', style={'fontWeight': 'bold'}),
+            html.Span(info['indica']),
+        ], style={'fontSize': '11px', 'fontFamily': FONTS['body'], 'lineHeight': '1.5',
+                   'marginBottom': '8px', 'color': C['tooltip_text']}),
+        html.Div([
+            html.Span('O que fazer: ', style={'fontWeight': 'bold'}),
+            html.Span(info['fazer']),
+        ], style={'fontSize': '11px', 'fontFamily': FONTS['body'], 'lineHeight': '1.5', 'color': C['tooltip_text']}),
+    ], style={
+        'position': 'relative', 'marginTop': '24px', 'padding': '14px 18px',
+        'background': C['tooltip'], 'border': f"1px solid {C['shadow_dk']}",
+    })
+
+
+def construir_hero(m_win: dict, m_wdo: dict, ativo: str, indice_mg: dict | None = None,
+                    correlacao: dict | None = None, cotacoes_correlacionadas: list | None = None) -> html.Div:
+    """Seção hero: velocímetros de força e contexto do ativo selecionado,
+    mais o Índice de Medo e Ganância e o alinhamento DI1FUT×WINFUT×WDOFUT
+    (ambos independem do ativo selecionado — ver `indice_medo_ganancia.py`
+    e `correlacao_ativos.py`), com um painel de variação % do dia dos 3
+    ativos ao lado do velocímetro de correlação (2026-07-16, simplificado
+    de 4 pra 3 ativos a pedido do Jesué).
+
+    Não inclui mais o seletor WIN/WDO — esse bloco virou estático no
+    cabeçalho (ver `_estilo_botao_ativo`) porque esta função é reconstruída
     a cada 1s (`atualizar_dashboard`), e recriar os `html.Button` com
     `n_clicks=0` a cada tick zerava o contador de cliques no browser — causa
     raiz do bug "troca pra WDO e volta sozinho pro WIN" (ver CHANGELOG.md
-    2026-07-04).
+    2026-07-04). O antigo botão "WIN × WDO" (puro placeholder, nunca
+    calculou nada) foi removido e substituído por este velocímetro real.
     """
     m = m_win if ativo == 'WIN' else m_wdo
 
@@ -408,24 +524,94 @@ def construir_hero(m_win: dict, m_wdo: dict, ativo: str) -> html.Div:
     label_forca = 'COMPRADORES' if sf > 0.6 else ('VENDEDORES' if sf < 0.4 else 'NEUTRO')
     label_ctx   = 'FAVORÁVEL' if sc > 0.6 else ('DESFAVORÁVEL' if sc < 0.4 else 'NEUTRO')
 
-    return html.Div([
+    gauges = [
         html.Div(dcc.Graph(id='gauge-forca',
                   figure=gauge_cockpit(sf, 'FORÇA', label_forca, cor_forca),
-                  config={'displayModeBar': False},
-                  style={'width': '130px'}), style=win98_sunken(padding='4px')),
+                  config={'displayModeBar': False, 'responsive': True},
+                  style={'width': '130px'}), className='gauge-clicavel', **{'data-gauge': 'forca'},
+                  style={**win98_sunken(padding='4px'), 'cursor': 'pointer'}),
         html.Div(dcc.Graph(id='gauge-contexto',
                   figure=gauge_cockpit(sc, 'CONTEXTO', label_ctx, cor_ctx),
-                  config={'displayModeBar': False},
-                  style={'width': '130px'}), style=win98_sunken(padding='4px')),
-    ], style={'display': 'flex', 'gap': '8px', 'alignItems': 'center'})
+                  config={'displayModeBar': False, 'responsive': True},
+                  style={'width': '130px'}), className='gauge-clicavel', **{'data-gauge': 'contexto'},
+                  style={**win98_sunken(padding='4px'), 'cursor': 'pointer'}),
+    ]
+    legendas = []
+    if indice_mg is not None:
+        cor_mg = indice_mg['cor']
+        cor_mg = C['amber'] if cor_mg == 'yellow' else C.get(cor_mg, C['amber'])
+        gauges.append(html.Div(dcc.Graph(
+            id='gauge-medo-ganancia',
+            figure=gauge_cockpit(indice_mg['valor'] / 100.0, 'MEDO/GANÂNCIA', indice_mg['nivel_nome'], cor_mg),
+            config={'displayModeBar': False, 'staticPlot': True, 'responsive': True},
+            style={'width': '130px'}), className='gauge-clicavel', **{'data-gauge': 'medo_ganancia'},
+            style={**win98_sunken(padding='4px'), 'cursor': 'pointer'}))
+        legendas.append(html.Div(
+            'Medo/Ganância: índice adaptado (3 fatores só com WIN/WDO — momentum, volatilidade, '
+            'dólar x ações — não é o índice oficial da CNN, primeiro palpite não calibrado)',
+            style={'fontSize': '9px', 'fontFamily': FONTS['display'], 'color': C['text2'],
+                   'marginTop': '2px', 'width': '100%'},
+        ))
+    if correlacao is not None:
+        cor_corr = correlacao['cor']
+        cor_corr = C['amber'] if cor_corr == 'yellow' else C.get(cor_corr, C['amber'])
+        gauges.append(html.Div(dcc.Graph(
+            id='gauge-correlacao',
+            figure=gauge_cockpit((correlacao['alinhamento'] + 1) / 2, 'CORRELAÇÃO', correlacao['nivel_nome'], cor_corr),
+            config={'displayModeBar': False, 'staticPlot': True, 'responsive': True},
+            style={'width': '130px'}), className='gauge-clicavel', **{'data-gauge': 'correlacao'},
+            style={**win98_sunken(padding='4px'), 'cursor': 'pointer'}))
+        legendas.append(html.Div(
+            f"DI1FUT×WDOFUT: {correlacao['corr_di_wdo']:+.2f} · DI1FUT×WINFUT: {correlacao['corr_di_win']:+.2f} "
+            f"(Pearson, últimos {correlacao['janela_dias']} pregões) — tese: DI acompanha o WDO e é inverso "
+            f"ao WIN; quanto mais perto disso, mais claro o direcionamento. Primeiro palpite, não calibrado.",
+            style={'fontSize': '9px', 'fontFamily': FONTS['display'], 'color': C['text2'],
+                   'marginTop': '2px', 'width': '100%'},
+        ))
+        legendas.append(html.Div([
+            html.Span('Faixas do alinhamento: ', style={'color': C['text2']}),
+            html.Span('≥0.6 Direcionamento Claro', style={'color': C['green'], 'fontWeight': 'bold'}),
+            html.Span(' · ', style={'color': C['text2']}),
+            html.Span('0.2–0.6 Parcial', style={'color': C['amber'], 'fontWeight': 'bold'}),
+            html.Span(' · ', style={'color': C['text2']}),
+            html.Span('-0.2–0.2 Neutra', style={'color': C['text2'], 'fontWeight': 'bold'}),
+            html.Span(' · ', style={'color': C['text2']}),
+            html.Span('≤-0.2 Invertida', style={'color': C['red'], 'fontWeight': 'bold'}),
+        ], style={'fontSize': '9px', 'fontFamily': FONTS['display'], 'marginTop': '2px', 'width': '100%'}))
+        if cotacoes_correlacionadas:
+            linhas = []
+            for cot in cotacoes_correlacionadas:
+                var = cot['variacao_pct']
+                cor_var = C['green'] if var >= 0 else C['red']
+                seta = '▲' if var >= 0 else '▼'
+                linhas.append(html.Div([
+                    html.Span(cot['label'], style={
+                        'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                    }),
+                    html.Span(f'{seta} {var:+.2f}%', style={
+                        'fontSize': '12px', 'fontWeight': '700', 'color': cor_var,
+                        'fontFamily': FONTS['mono'],
+                    }),
+                ], style={'display': 'flex', 'justifyContent': 'space-between', 'gap': '14px', 'padding': '2px 0'}))
+            gauges.append(html.Div([
+                html.Div('CORRELACIONADOS', style={
+                    'fontSize': '9px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                    'letterSpacing': '0.08em', 'marginBottom': '4px',
+                }),
+                *linhas,
+            ], style=win98_sunken(padding='6px 12px', extra={'minWidth': '130px'})))
+
+    filhos = [html.Div(gauges, style={'display': 'flex', 'gap': '8px', 'alignItems': 'center'})]
+    filhos += legendas
+    return html.Div(filhos)
 
 
 def _estilo_botao_ativo(nome: str, ativo_atual: str) -> dict:
-    """Estilo do botão seletor de ativo (WIN/WDO/CORRELACAO) dado o ativo
-    selecionado. Extraído do antigo `construir_hero` para ser reutilizado
-    tanto no layout estático inicial quanto no callback dedicado
-    `atualizar_estilo_ativo_selecionado` — o `html.Button` em si nunca é
-    recriado, só o `style` muda."""
+    """Estilo do botão seletor de ativo (WIN/WDO) dado o ativo selecionado.
+    Reutilizado tanto no layout estático do cabeçalho quanto no callback
+    dedicado `atualizar_estilo_ativo_selecionado` — o `html.Button` em si
+    nunca é recriado, só o `style` muda. Movido do hero pro cabeçalho fixo
+    em 2026-07-15 — fica visível em qualquer aba, não só no Quant Lab."""
     return win98_button(pressed=(ativo_atual == nome))
 
 
@@ -458,6 +644,24 @@ def _botao_toggle_mme21(id_botao: str) -> html.Button:
                             'width': '20px', 'height': '18px', 'fontSize': '11px',
                             'lineHeight': '18px', 'cursor': 'pointer', 'zIndex': '2',
                             'color': '#1B4F5C',
+                        })
+
+
+def _botao_reset_zoom(id_botao: str) -> html.Button:
+    """Botão "voltar ao zoom padrão" — mesmo motivo de
+    dashboard.py::_botao_reset_zoom: o zoom/pan manual agora sobrevive ao
+    refresh de 30s (ver window.SQ98_CHARTS.atualizarCandlesCompletos em
+    assets_98/lwchart.js), precisa de uma saída explícita. Posicionado à
+    esquerda do olho da MME21 (right: 48px). Puro DOM via classe
+    `.btn-reset-zoom-98` (wireBotaoResetZoom em assets_98/lwchart.js)."""
+    return html.Button('⟲', id=id_botao, type='button', n_clicks=0,
+                        className='btn-reset-zoom-98',
+                        title='Voltar ao zoom padrão',
+                        style={
+                            **win98_raised(padding='0'),
+                            'position': 'absolute', 'top': '4px', 'right': '48px',
+                            'width': '20px', 'height': '18px', 'fontSize': '12px',
+                            'lineHeight': '18px', 'cursor': 'pointer', 'zIndex': '2',
                         })
 
 
@@ -518,9 +722,9 @@ def construir_market_view(m: dict) -> html.Div:
     card_qm = _card_mv('Quem Manda', numero_qm, conclusao_qm, detalhe_qm, cor_qm)
 
     # --- CARD 2: TENDÊNCIA
-    tend   = m.get('tendencia', '—')
-    fase   = m.get('fase', '—')
-    saude  = m.get('saude', '—')
+    tend   = m.get('tendencia') or '—'
+    fase   = m.get('fase') or '—'
+    saude  = m.get('saude') or '—'
     cor_tend = C['green'] if tend == 'alta' else (C['red'] if tend == 'baixa' else C['amber'])
 
     mapa_conclusao_tend = {
@@ -641,7 +845,120 @@ def construir_market_view(m: dict) -> html.Div:
                      style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'})
 
 
-def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
+# =============================================================================
+# BLOCOS DE FORÇA (combustível/aproximação/rejeição) + camada de ação —
+# 2026-07-13, ver especificacao_forca_zonas_price_action.md. Módulo-level
+# (mirror de dashboard.py) — reaproveitado por _card_nivel_sr (dentro de
+# construir_price_action) e por _card_estudo_tracado_98 (top-level).
+# =============================================================================
+
+def _rotulo_bloco(v):
+    if pd.isna(v): return None
+    if v >= 65: return 'forte'
+    if v >= 45: return 'moderado(a)'
+    return 'fraco(a)'
+
+
+_POSTURA_TXT = {
+    'favorece_entrada': 'Confluência favorável entre os 3 blocos — favorece considerar entrada.',
+    'aguardar_confirmacao': 'Sinal presente, mas incompleto — aguardar confirmação adicional antes de operar.',
+    'sinal_fraco': 'Fatores conflitantes entre os blocos, ou zona já desgastada — sinal fraco, operar reduzido se operar.',
+    'evitar': 'Fatores predominantemente contrários, ou dados insuficientes — evitar operar nesta zona agora.',
+}
+_MAGNITUDE_TXT = {
+    'curta': 'Combustível baixo — se reagir, espere um movimento curto.',
+    'moderada': 'Combustível mediano — se reagir, espere um movimento moderado.',
+    'longa': 'Zona ainda fresh (pouco desgastada) — se reagir, há potencial pra um movimento mais longo.',
+}
+_POSTURA_LABEL = {
+    'favorece_entrada': ('FAVORECE ENTRADA', C['green']),
+    'aguardar_confirmacao': ('AGUARDAR CONFIRMAÇÃO', C['yellow']),
+    'sinal_fraco': ('SINAL FRACO', C['text2']),
+    'evitar': ('EVITAR', C['red']),
+}
+
+
+def _leitura_nivel(nivel: dict, eh_resistencia: bool) -> str:
+    """Leitura gerada A PARTIR dos 3 blocos de força desta zona específica
+    (2026-07-13) — substitui o texto fixo por tendência+lado que antes
+    produzia o MESMO parágrafo pra zonas com toques/idade bem diferentes
+    (achado real, ver especificacao_forca_zonas_price_action.md, seção 1 —
+    o texto antigo nunca usava `toques` no corpo)."""
+    comb, aprox, rej = nivel.get('combustivel_score'), nivel.get('aproximacao_score'), nivel.get('rejeicao_score')
+    partes = []
+    if not pd.isna(comb):
+        partes.append(f'Combustível {_rotulo_bloco(comb)} ({comb:.0f}) — ' + (
+            'zona ainda guarda potencial de percurso, pouco desgastada.' if comb >= 55 else
+            'zona já consumiu boa parte da liquidez represada (muitos toques/idade).' if comb < 45 else
+            'combustível mediano.'))
+    if not pd.isna(aprox):
+        partes.append(f'Aproximação {_rotulo_bloco(aprox)} ({aprox:.0f}) — ' + (
+            'a perna até aqui mostrou convicção (estrutura limpa, sem sinais de exaustão).' if aprox >= 55 else
+            'a perna até aqui mostrou sinais de esforço crescente sem resultado — possível exaustão.' if aprox < 45 else
+            'aproximação neutra.'))
+    if not pd.isna(rej):
+        partes.append(f'Rejeição {_rotulo_bloco(rej)} ({rej:.0f}) — ' + (
+            'reação decisiva nos toques mais recentes.' if rej >= 55 else
+            'reação fraca ou indecisa nos toques mais recentes.' if rej < 45 else
+            'reação mediana.'))
+    if not partes:
+        return 'Dados insuficientes pra decompor a força desta zona ainda.'
+
+    acao = nivel.get('acao') or {}
+    postura = acao.get('postura')
+    if postura in _POSTURA_TXT:
+        partes.append(_POSTURA_TXT[postura])
+    if postura in ('favorece_entrada', 'aguardar_confirmacao'):
+        mag = _MAGNITUDE_TXT.get(acao.get('magnitude_esperada'))
+        if mag:
+            partes.append(mag)
+    return ' '.join(partes)
+
+
+def _bloco_scores_html(nivel: dict) -> html.Div:
+    """Camada 'dados brutos' dos 3 blocos — números explícitos, não
+    escondidos dentro do texto de interpretação (seção 6.1/8 da spec: nada
+    de black box)."""
+    itens = [('Combustível', nivel.get('combustivel_score')),
+             ('Aproximação', nivel.get('aproximacao_score')),
+             ('Rejeição', nivel.get('rejeicao_score'))]
+    spans = [html.Span(f'{nome} {v:.0f}', style={
+        'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['mono'],
+        'border': f'1px solid {C["border"]}', 'borderRadius': '0',
+        'padding': '1px 6px', 'marginRight': '4px',
+    }) for nome, v in itens if not pd.isna(v)]
+    return html.Div(spans, style={'marginBottom': '6px'}) if spans else html.Div()
+
+
+def _acao_html(nivel: dict, eh_resistencia: bool) -> html.Div:
+    """Camada 'ação' (seção 6.3) — postura sempre via regra explícita
+    (montar_acao), nunca texto livre; invalidação só aparece quando a
+    postura favorece entrada."""
+    acao = nivel.get('acao') or {}
+    postura = acao.get('postura')
+    if postura not in _POSTURA_LABEL:
+        return html.Div()
+    label, cor_bg = _POSTURA_LABEL[postura]
+    partes = [html.Span(label, style={
+        'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(cor_bg),
+        'background': cor_bg, 'borderRadius': '0', 'padding': '2px 6px',
+        'marginRight': '6px', 'letterSpacing': '0.05em',
+    })]
+    mag = acao.get('magnitude_esperada')
+    if mag:
+        partes.append(html.Span(f'magnitude {mag}', style={
+            'fontSize': '10px', 'color': C['text2'], 'marginRight': '8px',
+        }))
+    inval = acao.get('invalidacao')
+    if inval is not None and not pd.isna(inval):
+        direcao_txt = 'acima de' if eh_resistencia else 'abaixo de'
+        partes.append(html.Span(f'invalida se romper {direcao_txt} {_fmt(inval, 0)}', style={
+            'fontSize': '10px', 'color': C['text2'],
+        }))
+    return html.Div(partes, style={'marginBottom': '6px'})
+
+
+def construir_price_action(df: pd.DataFrame, m: dict, expandidos: dict = None) -> html.Div:
     """
     Seção Price Action — sem gráfico de candles (Jesué já tem o seu no ProfitPRO).
     Mostra os N_NIVEIS_SR (default 3) níveis de S/R de cada lado — ordenados
@@ -657,12 +974,13 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
     prazo que só some quando NÃO está redundante com um dos níveis já
     rankeados acima.
     """
+    expandidos = expandidos or {}
     preco = m.get('preco', np.nan)
     preco_fmt = _fmt(preco, 0)
 
-    tend   = m.get('tendencia', '—')
-    fase   = m.get('fase', '—')
-    saude  = m.get('saude', '—')
+    tend   = m.get('tendencia') or '—'
+    fase   = m.get('fase') or '—'
+    saude  = m.get('saude') or '—'
     candle = str(m.get('tipo_candle', '—')).replace('_', ' ').title()
 
     def _nan(v): return v is None or (isinstance(v, float) and np.isnan(v))
@@ -672,28 +990,6 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
         if dist_atr <= 0.3: return 'muito próximo'
         if dist_atr <= 1.0: return f'{dist_atr:.1f} ATR de distância'
         return f'{dist_atr:.1f} ATR — longe'
-
-    def _leitura_nivel(toques, eh_resistencia, prob_bounce):
-        """Leitura interpretada do nível, incorporando a % de probabilidade calculada."""
-        prob_txt = f'{prob_bounce:.0f}%' if not _nan(prob_bounce) else '—'
-        romp_txt = f'{100-prob_bounce:.0f}%' if not _nan(prob_bounce) else '—'
-        if tend == 'baixa':
-            if eh_resistencia:
-                return f'Em tendência de baixa ({fase}), probabilidade estimada de {prob_txt} de rejeição ' \
-                       f'nesta resistência (vs. {romp_txt} de rompimento). Candle de força vendedora aqui é trigger potencial.'
-            else:
-                return f'Suporte sob pressão — em tendência de baixa, suportes tendem a ceder. ' \
-                       f'Probabilidade estimada de {prob_txt} de bounce. Observe rompimento com volume e candle forte.'
-        elif tend == 'alta':
-            if eh_resistencia:
-                return f'Resistência em tendência de alta, saúde {saude}. Probabilidade estimada de {romp_txt} ' \
-                       f'de rompimento com continuidade em fase de {fase} (vs. {prob_txt} de rejeição).'
-            else:
-                return f'Suporte em tendência de alta, saúde {saude}. Probabilidade estimada de {prob_txt} de bounce. ' \
-                       f'Procure candle de reversão ou pin comprador.'
-        else:
-            return f'Mercado lateral — S/R em lateralização tem comportamento de range. ' \
-                   f'Probabilidade estimada de {prob_txt} de reação nesta borda. Operar rejeições, não rompimentos.'
 
     _STATUS_LABEL = {
         'aguardando_pullback': ('AGUARDANDO PULLBACK', C['yellow']),
@@ -739,6 +1035,24 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
                 'background': C['blue'], 'borderRadius': '0',
                 'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
             }))
+        # Reversão de papel (bipolaridade) — diferente do badge acima: aquele
+        # marca a zona ANTIGA (que rompeu e gerou um espelho); este marca a
+        # zona NOVA (o espelho em si), que sem isso nunca contava a própria
+        # origem (achado real 2026-07-13, ver metricas._info_bipolar).
+        bip = nivel.get('bipolar')
+        narrativa_bipolar = None
+        if bip and bip.get('papel_no_cruzamento') == 'espelho':
+            badges.append(html.Span('REVERSÃO DE PAPEL', style={
+                'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(C['blue']),
+                'background': C['blue'], 'borderRadius': '0',
+                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
+            }))
+            papel_antigo = 'suporte' if eh_resistencia else 'resistência'
+            papel_novo = 'resistência' if eh_resistencia else 'suporte'
+            narrativa_bipolar = (
+                f'Nasceu de um(a) {papel_antigo} rompido(a) em {_fmt_ts(bip["timestamp_rompimento"])} '
+                f'— reteste confirmado às {_fmt_ts(bip["timestamp_reteste"])}, hoje opera como {papel_novo}.'
+            )
         # Sinal intradiário — escopo do próprio pregão, independente do status
         # estrutural acima (ver comentário em features.py::calcular_zonas_sr).
         romp_hoje = nivel.get('rompimento_hoje', 'nenhum')
@@ -756,6 +1070,33 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
             }))
 
         borda_cor = C['gold'] if destaque else cor
+
+        lado = 'acima' if eh_resistencia else 'abaixo'
+        chave = f'{lado}_{nivel["rank"]}'
+        expandido = bool(expandidos.get(chave, False))
+        regime = nivel.get('regime')
+        corpo_timeline = []
+        if regime and (regime['regime_atual']['detalhes'] or (regime['regime_antigo'] and regime['regime_antigo']['detalhes'])):
+            total = regime['regime_atual']['toques'] + (regime['regime_antigo']['toques'] if regime['regime_antigo'] else 0)
+            corpo_timeline.append(html.Button(
+                f"{'▾' if expandido else '▸'} Ver histórico de toques ({total})",
+                id={'type': 'timeline-toggle-98', 'index': chave}, n_clicks=0,
+                style={'background': 'transparent', 'border': 'none', 'color': C['text2'],
+                       'fontSize': '11px', 'cursor': 'pointer', 'padding': '4px 0', 'textAlign': 'left'},
+            ))
+            if expandido:
+                if regime['regime_atual']['detalhes']:
+                    corpo_timeline.append(html.Div('REGIME ATUAL', style={
+                        'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
+                        'letterSpacing': '0.06em', 'marginTop': '6px',
+                    }))
+                    corpo_timeline += [_linha_toque_html_98(d) for d in regime['regime_atual']['detalhes']]
+                if regime['regime_antigo'] and regime['regime_antigo']['detalhes']:
+                    corpo_timeline.append(html.Div('REGIME ANTERIOR', style={
+                        'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
+                        'letterSpacing': '0.06em', 'marginTop': '8px',
+                    }))
+                    corpo_timeline += [_linha_toque_html_98(d) for d in regime['regime_antigo']['detalhes']]
 
         corpo = html.Div([
             html.Div([
@@ -781,11 +1122,19 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
                 style={'fontSize': '12px', 'fontWeight': '600', 'color': cor,
                        'fontFamily': FONTS['display'], 'marginBottom': '6px'}
             ),
-            html.Div(_leitura_nivel(toques, eh_resistencia, prob), style={
+            _bloco_scores_html(nivel),
+            html.Div(narrativa_bipolar, style={
+                'fontSize': '11px', 'color': C['blue'], 'fontFamily': FONTS['body'],
+                'lineHeight': '1.4', 'marginBottom': '6px',
+            }) if narrativa_bipolar else html.Div(),
+            html.Div(_leitura_nivel(nivel, eh_resistencia), style={
                 'fontSize': '12px', 'color': C['text'],
                 'fontFamily': FONTS['body'], 'lineHeight': '1.5',
                 'borderLeft': f'3px solid {cor}', 'paddingLeft': '10px',
+                'marginBottom': '6px',
             }),
+            _acao_html(nivel, eh_resistencia),
+            html.Div(corpo_timeline, style={'marginTop': '8px'}) if corpo_timeline else html.Div(),
         ])
         return win98_groupbox(None, corpo, cor_led=borda_cor, estilo_extra={'marginBottom': '10px'})
 
@@ -804,6 +1153,38 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
             html.Span(f'  · {pivo["idade"]} candles atrás · 1º toque, sem reteste', style={
                 'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
             }),
+        ], style=win98_sunken(padding='8px 12px', extra={'marginBottom': '10px'}))
+
+    def _card_pivo_em_formacao(pivo: dict, eh_resistencia: bool) -> html.Div:
+        """Linha discreta (moldura afundada) pro candidato a topo/fundo
+        AINDA sem confirmação — distinto de `_card_pivo_imediato` (que só
+        mostra pivôs JÁ confirmados). Responde "esse preço extremo (ex.:
+        mínima do dia) já é um fundo validado, ou ainda está esperando
+        confirmação?" (achado real 2026-07-13 — ver
+        features.detectar_pivo_em_formacao)."""
+        cor = C['red'] if eh_resistencia else C['green']
+        label = 'Topo em formação' if eh_resistencia else 'Fundo em formação'
+        confirmadas, faltam = pivo['confirmadas'], pivo['faltam']
+        oposto = 'menores' if eh_resistencia else 'maiores'
+        return html.Div([
+            html.Span(f'{label}: ', style={
+                'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+            }),
+            html.Span(_fmt(pivo['preco'], 0), style={
+                'fontSize': '14px', 'fontWeight': '700',
+                'fontFamily': FONTS['mono'], 'color': cor,
+            }),
+            html.Span('  AINDA SEM CONFIRMAÇÃO', style={
+                'fontSize': '10px', 'fontWeight': '700', 'color': texto_sobre(C['yellow']),
+                'background': C['yellow'], 'padding': '1px 6px',
+                'letterSpacing': '0.05em', 'marginLeft': '4px',
+            }),
+            html.Div(
+                f'{confirmadas} de {confirmadas + faltam} candles de confirmação — faltam {faltam} '
+                f'candle{"s" if faltam != 1 else ""} com máxima e mínima {oposto} pra virar '
+                f'{"topo" if eh_resistencia else "fundo"} validado.',
+                style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'], 'marginTop': '4px'},
+            ),
         ], style=win98_sunken(padding='8px 12px', extra={'marginBottom': '10px'}))
 
     # Bloco de preço atual
@@ -874,6 +1255,13 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
     pivo_abaixo = m.get('pivo_imediato_abaixo')
     if pivo_abaixo:
         cards_suporte.append(_card_pivo_imediato(pivo_abaixo, eh_resistencia=False))
+
+    pivo_formacao_acima = m.get('pivo_em_formacao_acima')
+    if pivo_formacao_acima:
+        cards_resistencia.append(_card_pivo_em_formacao(pivo_formacao_acima, eh_resistencia=True))
+    pivo_formacao_abaixo = m.get('pivo_em_formacao_abaixo')
+    if pivo_formacao_abaixo:
+        cards_suporte.append(_card_pivo_em_formacao(pivo_formacao_abaixo, eh_resistencia=False))
 
     # Sem secao('PRICE ACTION') aqui — o título já vem da titlebar da janela
     # (win98_window('win-price-action', 'Price Action', ...) no app.layout).
@@ -1106,6 +1494,10 @@ app.layout = html.Div([
     # Store do ativo selecionado
     dcc.Store(id='store-ativo', data='WIN'),
     dcc.Store(id='store-metricas', data={}),
+    # Qual velocímetro do hero está com o balão explicativo aberto — setado
+    # via clique client-side (assets_98/hero_gauges.js), nunca por n_clicks
+    # do Dash (ver comentário em construir_hero sobre por quê).
+    dcc.Store(id='store-gauge-selecionado', data='forca'),
 
     # Candles pro gráfico Lightweight Charts (prévia + janela cheia) — dois
     # stores com cadências BEM diferentes de propósito (ver
@@ -1140,6 +1532,27 @@ app.layout = html.Div([
     dcc.Store(id='store-mme21-live', data={'ativo': None, 'ponto': None}),
     dcc.Store(id='store-mme21-visivel', data=True),
 
+    # Traçados manuais (janela "Traçados", ver tracados.py) — 2 direções,
+    # pra nunca a mão do usuário competir com um redraw do servidor no meio
+    # de um arraste (ver comentário completo em assets_98/lwchart.js):
+    # store-tracado-criar-98/store-tracado-mover-98 (cliente -> Python, via
+    # dash_clientside.set_props) só persistem + recalculam Estudos, NUNCA
+    # redesenham o gráfico; store-tracados-servidor-98 (Python -> cliente)
+    # é quem dispara o redesenho (carga inicial + depois de criar/apagar/
+    # editar).
+    dcc.Store(id='store-tracado-criar-98'),
+    dcc.Store(id='store-tracado-mover-98'),
+    dcc.Store(id='store-tracados-servidor-98', data=[]),
+
+    # Estado de expandir/colapsar a timeline de toques (Price Action E
+    # Estudos dos Traçados) — dict {chave_card: bool}, mesmo padrão do
+    # clássico (dashboard.py::store-timeline-expandida).
+    dcc.Store(id='store-timeline-expandida-98', data={}),
+
+    # Popup de edição (duplo clique numa linha, ver assets_98/lwchart.js) —
+    # guarda só o id_tracado sendo editado; None = popup fechado.
+    dcc.Store(id='store-tracado-editar-98'),
+
     # Interval rápido — 1s: atualiza preço, candle atual, fluxo
     dcc.Interval(id='interval-live', interval=1_000, n_intervals=0),
     # Interval lento — 30s: reconstrói features completas e blocos pesados
@@ -1147,6 +1560,10 @@ app.layout = html.Div([
     # Sincronização de posições abertas — cadência própria (ver comentário
     # junto de `sincronizar_posicoes`).
     dcc.Interval(id='interval-posicao-sync', interval=3_000, n_intervals=0),
+    # Reconciliação MT5×diário — 5min, roda em background e silencioso
+    # (feedback diário.txt, 2026-07-11: deixou de ser aba manual). Ver
+    # `_reconciliar_background`/`resumo_reconciliacao`.
+    dcc.Interval(id='interval-reconciliacao', interval=300_000, n_intervals=0),
 
     # =========================================================================
     # ÍCONES DE DESKTOP
@@ -1172,7 +1589,7 @@ app.layout = html.Div([
         'win-quantlab', 'Quant Lab', icone='/assets/icons/my-computer.png',
         width='32%', min_width='460px',
         default_top_pct=3, default_left_pct=2,
-        estilo_extra={'height': 'calc(100vh - 70px)'},
+        estilo_extra={'height': 'calc(100vh - 70px)'}, resizable=True,
         statusbar=[
             html.Div(id='status-conexao', children='Inicializando...', style={
                 **win98_sunken(padding='2px 8px'), 'fontSize': '11px',
@@ -1196,37 +1613,21 @@ app.layout = html.Div([
                         'fontSize': '14px', 'padding': '20px',
                     })
                 ]),
-                # Seletor WIN / WDO / WIN×WDO — estático, nunca recriado
-                # (só o `style` de cada botão muda, via callback dedicado
-                # `atualizar_estilo_ativo_selecionado`). Ver comentário em
-                # `construir_hero`.
-                html.Div([
-                    html.Div('ATIVO', style={
-                        'fontSize': '10px', 'color': C['text2'],
-                        'fontFamily': FONTS['display'], 'marginBottom': '8px',
-                        'letterSpacing': '0.08em',
-                    }),
-                    html.Div([
-                        html.Button('WIN', id='btn-win', n_clicks=0,
-                                    className='win98-btn',
-                                    style=_estilo_botao_ativo('WIN', 'WIN')),
-                        html.Button('WDO', id='btn-wdo', n_clicks=0,
-                                    className='win98-btn',
-                                    style=_estilo_botao_ativo('WDO', 'WIN')),
-                        html.Button('WIN × WDO', id='btn-correlacao', n_clicks=0,
-                                    className='win98-btn',
-                                    style=_estilo_botao_ativo('CORRELACAO', 'WIN')),
-                    ], style={'display': 'flex', 'gap': '8px'}),
-                ], style={'marginTop': '14px'}),
+                # Balão explicativo — estático (fora de hero-conteudo,
+                # nunca recriado pelo tick de 1s), só muda via clique num
+                # gauge (assets_98/hero_gauges.js + store-gauge-selecionado).
+                html.Div(_balao_explicacao_gauge('forca'), id='balao-gauge-explicacao'),
             ], style={'marginBottom': '16px'}),
 
             # Prévia do gráfico de candles (Lightweight Charts) — contexto
             # visual da formação dos candles junto da análise, sem precisar
             # alternar pra janela do ProfitPRO. Sem traçado/estudo, só
-            # pan/zoom/crosshair nativos da biblioteca. Ver janela "Gráfico"
-            # (win-grafico) pra versão cheia, e assets_98/lwchart.js.
+            # pan/zoom/crosshair nativos da biblioteca (a ferramenta de
+            # desenho fica só na janela grande "Traçados", win-tracados,
+            # de propósito). Ver assets_98/lwchart.js.
             html.Div([
                 html.Div(id='lw-chart-preview', style={'width': '100%', 'height': '100%'}),
+                _botao_reset_zoom('btn-reset-zoom-preview'),
                 _botao_toggle_sr('btn-sr-toggle-preview'),
                 _botao_toggle_mme21('btn-mme21-toggle-preview'),
             ],
@@ -1247,41 +1648,101 @@ app.layout = html.Div([
         'win-price-action', 'Price Action', icone='/assets/icons/find-file.png',
         width='32%', min_width='400px',
         default_top_pct=3, default_left_pct=35,
-        estilo_extra={'height': 'calc(100vh - 70px)'},
+        estilo_extra={'height': 'calc(100vh - 70px)'}, resizable=True,
         children=html.Div(id='price-action-conteudo'),
     ),
 
     # =========================================================================
     # JANELA — Big Players
-    # Ocupa metade de cima da coluna direita (a outra metade é o Gráfico,
-    # logo abaixo) — arranjo padrão pedido pelo Jesué (ver captura de tela
-    # em 2026-07-10), pra caber lado a lado com Quant Lab/Price Action sem
-    # precisar reduzir o zoom do navegador.
+    # Ocupava só metade de cima da coluna direita (a outra metade era o
+    # Gráfico, logo abaixo) — desde que "Traçados" (grande, fechada por
+    # padrão) substituiu o Gráfico na grade sempre-aberta (2026-07-12), Big
+    # Players preenche a coluna inteira, mesma altura de Quant Lab/Price
+    # Action (grade volta a ficar simétrica em 3 colunas).
     # =========================================================================
     win98_window(
         'win-big-players', 'Big Players', icone='/assets/icons/favorites.png',
         width='31%', min_width='420px',
         default_top_pct=3, default_left_pct=68,
-        estilo_extra={'height': 'calc(50vh - 55px)'},
+        estilo_extra={'height': 'calc(100vh - 70px)'}, resizable=True,
         children=html.Div(id='big-players-conteudo'),
     ),
 
     # =========================================================================
-    # JANELA — Gráfico (versão cheia da prévia da Quant Lab)
-    # Mesma fonte de dados (store-candles-grafico), instância separada do
-    # Lightweight Charts — ver assets_98/lwchart.js. Metade de baixo da
-    # coluna direita, aberta por padrão (visível no arranjo padrão).
+    # JANELA — Traçados (substituiu "Gráfico" em 2026-07-12 — mesmo
+    # container físico de gráfico, renomeado de lw-chart-full pra
+    # lw-chart-tracados, só maior e com a barra de ferramentas de desenho
+    # por cima do que já tinha: candles, MME21, níveis de S/R do Price
+    # Action, ambos com toggle de olho — nada disso mudou). Fechada por
+    # padrão (janela grande, uso deliberado — mesma categoria de Diário/
+    # Posição/Rastreador, não mais parte da grade sempre-aberta).
+    #
+    # Barra de ferramentas: só "Nível S/R" (linha horizontal) funciona por
+    # enquanto — criar/arrastar/apagar (ver assets_98/lwchart.js). LTA/LTB/
+    # Canal/Figura aparecem desabilitados ("em breve") — roadmap registrado
+    # em tracados.py, motor de análise (`analisar_linha_generica`) já
+    # suporta o shape de trendline, só falta a ferramenta de desenho.
     # =========================================================================
     win98_window(
-        'win-grafico', 'Gráfico', icone='/assets/icons/grafico.png',
-        width='31%', min_width='420px',
-        default_top_pct=53, default_left_pct=68,
-        estilo_extra={'height': 'calc(50vh - 55px)'}, resizable=True,
+        'win-tracados', 'Traçados', icone='/assets/icons/grafico.png',
+        width='62%', min_width='760px',
+        default_top_pct=6, default_left_pct=18, start_closed=True,
+        estilo_extra={'height': '80vh'}, resizable=True,
+        menubar=[
+            html.Button('🖱 Cursor', id='btn-tracado-cursor-98',
+                        className='tracado-tool-btn-98 tracado-tool-ativa-98',
+                        **{'data-tracado-tool': 'cursor'}),
+            html.Button('— Nível S/R', id='btn-tracado-horizontal-98',
+                        className='tracado-tool-btn-98',
+                        **{'data-tracado-tool': 'horizontal'}),
+            html.Button('↗ LTA/LTB', disabled=True, title='Em breve',
+                        className='tracado-tool-btn-98'),
+            html.Button('▱ Canal', disabled=True, title='Em breve',
+                        className='tracado-tool-btn-98'),
+            html.Button('△ Figura', disabled=True, title='Em breve',
+                        className='tracado-tool-btn-98'),
+        ],
         children=html.Div([
-            html.Div(id='lw-chart-full', style={'width': '100%', 'height': '100%'}),
-            _botao_toggle_sr('btn-sr-toggle-full'),
-            _botao_toggle_mme21('btn-mme21-toggle-full'),
-        ], style={**win98_sunken(padding='2px'), 'height': '100%', 'position': 'relative'}),
+            html.Div([
+                html.Div(id='lw-chart-tracados', style={'width': '100%', 'height': '100%'}),
+                _botao_reset_zoom('btn-reset-zoom-tracados'),
+                _botao_toggle_sr('btn-sr-toggle-tracados'),
+                _botao_toggle_mme21('btn-mme21-toggle-tracados'),
+            ], style={
+                **win98_sunken(padding='2px'),
+                # flex:1 (não mais altura fixa de 420px) — cresce/encolhe
+                # junto do redimensionar da janela (assets_98/lwchart.js já
+                # tem um ResizeObserver em cima de #lw-chart-tracados que
+                # chama chart.resize() sozinho; só faltava o container
+                # físico ter uma altura que reage ao tamanho da janela em
+                # vez de fixa). minHeight evita o gráfico sumir se a janela
+                # for encolhida bem pequena, com a seção Estudos abaixo
+                # tomando o espaço que sobra.
+                'flex': '1 1 auto', 'minHeight': '220px', 'position': 'relative',
+            }),
+            # dcc.Loading detecta sozinho quando o callback com
+            # 'estudos-conteudo-98' como Output está rodando (Input
+            # store-tracado-mover-98, ver atualizar_estudos_98) — sem isso,
+            # arrastar um traçado deixa a tela parada durante a trava de
+            # arquivo + releitura do histórico, parecendo travada (mesmo
+            # tratamento em dashboard.py/'estudos-conteudo').
+            # `maxHeight` + `overflowY` PRÓPRIOS (não só flexShrink:0) —
+            # bug relatado 2026-07-13: sem um teto, cada novo traçado
+            # adiciona um card aqui, a seção cresce, e como ela nunca
+            # encolhia o gráfico (flex:1 acima) é que ia sendo espremido
+            # pra caber tudo na altura fixa da janela. Com o teto, Estudos
+            # rola por conta própria e o gráfico para de ser afetado.
+            win98_groupbox('Estudos', dcc.Loading(
+                id='loading-estudos-98', type='dot', color=C['titlebar'],
+                children=html.Div(id='estudos-conteudo-98'),
+            ), estilo_extra={
+                'marginTop': '10px', 'flexShrink': '0',
+                'maxHeight': '260px', 'overflowY': 'auto',
+            }),
+        ], style={
+            'height': '100%', 'display': 'flex', 'flexDirection': 'column',
+            'overflowY': 'auto',
+        }),
     ),
 
     # =========================================================================
@@ -1298,9 +1759,14 @@ app.layout = html.Div([
         'win-diario', 'Diário', icone='/assets/icons/notepad.png',
         width='620px', min_width='480px',
         default_top_pct=10, default_left_pct=25, start_closed=True,
+        resizable=True,
+        estilo_extra={'height': '65vh'},
         children=html.Iframe(
             src='http://127.0.0.1:8052/',
-            style={'width': '100%', 'height': '65vh', 'border': 'none'},
+            # height:100% (não mais 65vh fixo) pra acompanhar o redimensionar
+            # da janela — '.win98-window-body' (flex:1) já constrange a
+            # altura disponível, só faltava o iframe preenchê-la de verdade.
+            style={'width': '100%', 'height': '100%', 'border': 'none'},
         ),
     ),
 
@@ -1318,9 +1784,14 @@ app.layout = html.Div([
         'win-posicao', 'Posição', icone='/assets/icons/network.png',
         width='480px', min_width='400px',
         default_top_pct=10, default_left_pct=40, start_closed=True,
+        resizable=True,
+        estilo_extra={'height': '65vh'},
         children=html.Iframe(
             src='http://127.0.0.1:8052/?aba=posicao',
-            style={'width': '100%', 'height': '65vh', 'border': 'none'},
+            # height:100% (ver win-diario acima pro mesmo raciocínio) —
+            # acompanha o redimensionar da janela em vez de ficar travado
+            # nos 65vh do primeiro carregamento.
+            style={'width': '100%', 'height': '100%', 'border': 'none'},
         ),
     ),
 
@@ -1336,6 +1807,7 @@ app.layout = html.Div([
         'win-rastreador', 'Rastreador de Tendência', icone='/assets/icons/rastreador.png',
         width='360px', min_width='320px',
         default_top_pct=10, default_left_pct=55, start_closed=True,
+        resizable=True,
         children=html.Div(id='rastreador-conteudo'),
     ),
 
@@ -1434,6 +1906,18 @@ app.layout = html.Div([
     # TASKBAR + START MENU
     # =========================================================================
     win98_taskbar(tray_children=[
+        # Seletor WIN / WDO — movido da janela Quant Lab pra bandeja em
+        # 2026-07-15 (mesmo motivo do status-calendario abaixo: importa
+        # independente de qual janela está em foco/minimizada/fechada).
+        # Estático, nunca recriado (só o `style` muda, via callback
+        # `atualizar_estilo_ativo_selecionado`) — ver docstring de
+        # `construir_hero`.
+        html.Button('WIN', id='btn-win', n_clicks=0,
+                    className='win98-btn',
+                    style=_estilo_botao_ativo('WIN', 'WIN')),
+        html.Button('WDO', id='btn-wdo', n_clicks=0,
+                    className='win98-btn',
+                    style=_estilo_botao_ativo('WDO', 'WIN')),
         # Janela de notícia (Copom/FOMC/NFP) — calendario_economico.py.
         # Registrado em 2026-07-02: não opera notícia, mas esses horários
         # distorcem a leitura de S/R (ver CHANGELOG.md). Vive na bandeja
@@ -1453,6 +1937,12 @@ app.layout = html.Div([
             ], className='win98-start-items'),
         ], className='win98-start-menu-inner'),
     ], id='start-menu', className='win98-start-menu'),
+
+    # Popup de edição de traçado (duplo clique numa linha) — fora da árvore
+    # das janelas, mesmo padrão de diario98-overlay-detalhe em
+    # diario_app_98.py: placeholder vazio, populado por callback quando
+    # store-tracado-editar-98 tem um id_tracado.
+    html.Div(id='tracado98-overlay-editar'),
 
 ], style={
     'background': C['bg'],
@@ -1516,20 +2006,22 @@ app.clientside_callback(
 # aqui (Python só entrega dado, nunca soube desenhar candle). `setData()`
 # reconstrói o gráfico inteiro — só dispara na cadência rara de
 # `store-candles-grafico` (ver `atualizar_candles_grafico_completo`).
+# Bug 2026-07-13: esse setData() a cada 30s resetava o zoom/pan manual do
+# usuário sozinho (comportamento da própria Lightweight Charts, não só o
+# refitEscala() explícito). `ativo` vai como State pra
+# `atualizarCandlesCompletos` (assets_98/lwchart.js) só resetar de verdade
+# na troca de ativo — no refresh periódico, preserva o zoom atual.
 app.clientside_callback(
     """
-    function(candles) {
+    function(candles, ativo) {
         var c = window.SQ98_CHARTS;
-        if (c && candles && candles.length) {
-            if (c.previewSeries) c.previewSeries.setData(candles);
-            if (c.fullSeries) c.fullSeries.setData(candles);
-            if (c.refitEscala) c.refitEscala();
-        }
+        if (c && c.atualizarCandlesCompletos) c.atualizarCandlesCompletos(candles, ativo);
         return '';
     }
     """,
     Output('scroll-dummy', 'children', allow_duplicate=True),
     Input('store-candles-grafico', 'data'),
+    State('store-ativo', 'data'),
     prevent_initial_call=True,
 )
 
@@ -1563,7 +2055,7 @@ app.clientside_callback(
         var c = window.SQ98_CHARTS;
         if (c && candle) {
             if (c.previewSeries) c.previewSeries.update(candle);
-            if (c.fullSeries) c.fullSeries.update(candle);
+            if (c.tracadosSeries) c.tracadosSeries.update(candle);
         }
         return '';
     }
@@ -1584,7 +2076,7 @@ app.clientside_callback(
     """,
     Output('store-sr-visivel', 'data'),
     Input('btn-sr-toggle-preview', 'n_clicks'),
-    Input('btn-sr-toggle-full', 'n_clicks'),
+    Input('btn-sr-toggle-tracados', 'n_clicks'),
     State('store-sr-visivel', 'data'),
     prevent_initial_call=True,
 )
@@ -1651,7 +2143,7 @@ app.clientside_callback(
     """,
     Output('store-mme21-visivel', 'data'),
     Input('btn-mme21-toggle-preview', 'n_clicks'),
-    Input('btn-mme21-toggle-full', 'n_clicks'),
+    Input('btn-mme21-toggle-tracados', 'n_clicks'),
     State('store-mme21-visivel', 'data'),
     prevent_initial_call=True,
 )
@@ -1668,27 +2160,41 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
+# Redesenho AUTORITATIVO dos traçados a partir do servidor (carga inicial +
+# depois de apagar) — ver desenharTracados em assets_98/lwchart.js e o
+# comentário nos stores acima pro porquê de criar/mover NUNCA disparar isso.
+app.clientside_callback(
+    """
+    function(lista) {
+        var c = window.SQ98_CHARTS;
+        if (c && c.desenharTracados) c.desenharTracados(lista || []);
+        return '';
+    }
+    """,
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Input('store-tracados-servidor-98', 'data'),
+    prevent_initial_call=True,
+)
+
 @app.callback(
     Output('store-ativo', 'data'),
     Input('btn-win', 'n_clicks'),
     Input('btn-wdo', 'n_clicks'),
-    Input('btn-correlacao', 'n_clicks'),
     State('store-ativo', 'data'),
     prevent_initial_call=True,
 )
-def selecionar_ativo(n_win, n_wdo, n_corr, ativo_atual):
+def selecionar_ativo(n_win, n_wdo, ativo_atual):
     ctx = callback_context
     if not ctx.triggered:
         return ativo_atual
     botao = ctx.triggered[0]['prop_id'].split('.')[0]
-    mapa = {'btn-win': 'WIN', 'btn-wdo': 'WDO', 'btn-correlacao': 'CORRELACAO'}
+    mapa = {'btn-win': 'WIN', 'btn-wdo': 'WDO'}
     return mapa.get(botao, ativo_atual)
 
 
 @app.callback(
     Output('btn-win', 'style'),
     Output('btn-wdo', 'style'),
-    Output('btn-correlacao', 'style'),
     Input('store-ativo', 'data'),
 )
 def atualizar_estilo_ativo_selecionado(ativo):
@@ -1698,8 +2204,19 @@ def atualizar_estilo_ativo_selecionado(ativo):
     return (
         _estilo_botao_ativo('WIN', ativo),
         _estilo_botao_ativo('WDO', ativo),
-        _estilo_botao_ativo('CORRELACAO', ativo),
     )
+
+
+@app.callback(
+    Output('balao-gauge-explicacao', 'children'),
+    Input('store-gauge-selecionado', 'data'),
+)
+def renderizar_balao_gauge(gauge_selecionado):
+    """Dispara só quando o clique client-side (assets_98/hero_gauges.js)
+    muda `store-gauge-selecionado` — nunca no tick de 1s (ver comentário em
+    construir_hero/_balao_explicacao_gauge sobre por quê o balão mora fora
+    de hero-conteudo)."""
+    return _balao_explicacao_gauge(gauge_selecionado or 'forca')
 
 
 @app.callback(
@@ -1712,7 +2229,7 @@ def atualizar_candle_atual(n, ativo):
     with lock:
         bases = estado['bases']
 
-    df = bases.get(ativo if ativo != 'CORRELACAO' else 'WIN')
+    df = bases.get(ativo)
     if df is None or df.empty:
         return {}
 
@@ -1723,7 +2240,7 @@ def atualizar_candle_atual(n, ativo):
     preco_atual = float(ultimo['close'])
     try:
         if MT5_OK:
-            ticker = estado.get('contrato_win') if ativo in ('WIN', 'CORRELACAO') else estado.get('contrato_wdo')
+            ticker = estado.get('contrato_win') if ativo == 'WIN' else estado.get('contrato_wdo')
             if ticker and ticker != '—':
                 tick = mt5.symbol_info_tick(ticker)
                 if tick:
@@ -1811,6 +2328,35 @@ def sincronizar_posicoes(n):
     return ''
 
 
+def _reconciliar_background():
+    """Roda em thread separada (mesmo padrão de _sincronizar_posicoes_
+    background) — compara trades logados contra execuções reais do MT5 dos
+    últimos 30 dias. Silencioso: `reconciliar_com_mt5` já salva o resultado
+    via `persistencia.salvar_reconciliacao`, a UI do Diário só lê esse
+    arquivo pra mostrar um badge discreto (ver `resumo_reconciliacao`) — não
+    é mais uma aba/botão manual (feedback diário.txt, 2026-07-11)."""
+    with lock:
+        estado['reconciliando'] = True
+    try:
+        diario_trade.reconciliar_com_mt5(dias_atras=30)
+    except Exception:
+        pass  # falha de rede/MT5 — próximo ciclo (5min) tenta de novo
+    finally:
+        with lock:
+            estado['reconciliando'] = False
+
+
+@app.callback(
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Input('interval-reconciliacao', 'n_intervals'),
+    prevent_initial_call=True,
+)
+def reconciliar_background(n):
+    if not estado['reconciliando']:
+        threading.Thread(target=_reconciliar_background, daemon=True).start()
+    return ''
+
+
 @app.callback(
     Output('store-candles-grafico', 'data'),
     Input('interval-slow', 'n_intervals'),
@@ -1826,8 +2372,221 @@ def atualizar_candles_grafico_completo(n_slow, ativo):
     competia direto com o arraste no mesmo frame)."""
     with lock:
         bases = estado['bases']
-    df_ativo = bases.get(ativo if ativo != 'CORRELACAO' else 'WIN')
+    df_ativo = bases.get(ativo)
     return candles_para_grafico(df_ativo) if df_ativo is not None else []
+
+
+# -----------------------------------------------------------------------------
+# TRAÇADOS — janela "Traçados" (ver tracados.py). `mover` só persiste + deixa
+# o recompute de Estudos reagir (Input compartilhado abaixo) — o cliente já
+# moveu a linha sozinho antes mesmo do round-trip terminar (ver
+# assets_98/lwchart.js). `criar` é diferente: o clique não desenha nada no
+# cliente sozinho, então esse Output extra faz a linha aparecer
+# imediatamente em vez de só no próximo tick de 30s (bug relatado
+# 2026-07-13) — round-trip local, na prática instantâneo.
+# -----------------------------------------------------------------------------
+
+@app.callback(
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Output('store-tracados-servidor-98', 'data', allow_duplicate=True),
+    Input('store-tracado-criar-98', 'data'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def criar_tracado_98(payload, ativo):
+    if not payload or not ativo:
+        return no_update, no_update
+    ativo_real = ativo
+    tracados.criar_tracado(ativo_real, 'horizontal', payload['preco'])
+    return '', tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Input('store-tracado-mover-98', 'data'),
+    prevent_initial_call=True,
+)
+def mover_tracado_98(payload):
+    if not payload:
+        return no_update
+    tracados.atualizar_preco_tracado(payload['id_tracado'], payload['preco'])
+    return ''
+
+
+@app.callback(
+    Output('store-tracados-servidor-98', 'data'),
+    Input('interval-slow', 'n_intervals'),
+    Input('store-ativo', 'data'),
+)
+def carregar_tracados_servidor_98(n_slow, ativo):
+    """Carga autoritativa da lista de traçados — dispara na mesma cadência
+    de `atualizar_candles_grafico_completo` (30s/troca de ativo), nunca no
+    tick de 1s. Alimenta tanto o redesenho do gráfico (clientside_callback
+    acima) quanto o recompute de Estudos (abaixo)."""
+    ativo_real = ativo or 'WIN'
+    return tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('store-tracados-servidor-98', 'data', allow_duplicate=True),
+    Input({'type': 'del-tracado-98', 'index': ALL}, 'n_clicks'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def apagar_tracado_98(n_clicks_lista, ativo):
+    """Mesmo padrão de `clicar_dia_calendario` (diario_app_98.py) — pattern-
+    matching, guarda contra o disparo fantasma de quando os N botões são
+    recriados (n_clicks de todos em 0 nesse caso, `any()` falso)."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    componente_id = json.loads(prop_id)
+    tracados.remover_tracado(componente_id['index'])
+    ativo_real = ativo or 'WIN'
+    return tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('store-timeline-expandida-98', 'data'),
+    Input({'type': 'timeline-toggle-98', 'index': ALL}, 'n_clicks'),
+    State('store-timeline-expandida-98', 'data'),
+    prevent_initial_call=True,
+)
+def alternar_timeline_expandida_98(n_clicks_lista, expandidos):
+    """Botão "Ver histórico de toques" — Price Action E Estudos dos
+    Traçados usam o mesmo tipo de id (`timeline-toggle-98`), chave estável
+    por card. Mesmo padrão/guarda de `apagar_tracado_98`."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    chave = json.loads(prop_id)['index']
+    expandidos = dict(expandidos or {})
+    expandidos[chave] = not expandidos.get(chave, False)
+    return expandidos
+
+
+@app.callback(
+    Output('estudos-conteudo-98', 'children'),
+    Input('interval-slow', 'n_intervals'),
+    Input('store-tracado-criar-98', 'data'),
+    Input('store-tracado-mover-98', 'data'),
+    Input('store-tracados-servidor-98', 'data'),
+    Input('store-timeline-expandida-98', 'data'),
+    State('store-ativo', 'data'),
+)
+def atualizar_estudos_98(n_slow, _criar, _mover, _servidor, expandidos, ativo):
+    """Recomputa a leitura quantitativa de cada traçado — nunca no tick de
+    1s (os toques podem mudar passivamente conforme novos candles se
+    formam, daí o Input em interval-slow também, não só nas ações do
+    usuário). `store-timeline-expandida-98` também é Input aqui (diferente
+    do tick de 1s da Price Action, que usa State)."""
+    ativo_real = ativo or 'WIN'
+    with lock:
+        bases = estado['bases']
+    df_ativo = bases.get(ativo_real)
+    if df_ativo is None:
+        return no_update
+    tracs = tracados.listar_tracados(ativo_real)
+    analises = analisar_tracados(df_ativo, tracs)
+    return construir_estudos_tracados_98(analises, expandidos or {})
+
+
+# -----------------------------------------------------------------------------
+# POPUP DE EDIÇÃO DO TRAÇADO — duplo clique na linha (ver
+# assets_98/lwchart.js::wireFerramentaDesenho, store-tracado-editar-98).
+# Mesmo padrão de store+overlay+callback de `diario98-trade-detalhe-id` em
+# diario_app_98.py.
+# -----------------------------------------------------------------------------
+
+@app.callback(
+    Output('tracado98-overlay-editar', 'children'),
+    Input('store-tracado-editar-98', 'data'),
+    State('store-ativo', 'data'),
+)
+def renderizar_modal_editar_tracado_98(id_tracado, ativo):
+    if not id_tracado:
+        return None
+    return _modal_editar_tracado_98(id_tracado, ativo)
+
+
+@app.callback(
+    Output('store-tracado-editar-98', 'data', allow_duplicate=True),
+    Input('btn-tracado98-editar-cancelar', 'n_clicks'),
+    Input('tracado98-editar-backdrop', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def fechar_modal_editar_tracado_98(n1, n2):
+    return None
+
+
+@app.callback(
+    Output('tracado98-editar-cor', 'data'),
+    Input({'type': 'tracado-cor-swatch-98', 'cor': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def selecionar_cor_tracado_98(n_clicks_lista):
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    componente_id = json.loads(ctx.triggered[0]['prop_id'].rsplit('.', 1)[0])
+    return componente_id['cor']
+
+
+@app.callback(
+    Output('tracado98-editar-cor-swatches', 'children'),
+    Input('tracado98-editar-cor', 'data'),
+)
+def destacar_cor_selecionada_tracado_98(cor_atual):
+    return _swatches_cor_tracado_98(cor_atual)
+
+
+@app.callback(
+    Output('store-tracado-editar-98', 'data', allow_duplicate=True),
+    Output('store-tracados-servidor-98', 'data', allow_duplicate=True),
+    Input('btn-tracado98-editar-salvar', 'n_clicks'),
+    State('store-tracado-editar-98', 'data'),
+    State('tracado98-editar-preco', 'value'),
+    State('tracado98-editar-cor', 'data'),
+    State('tracado98-editar-espessura', 'value'),
+    State('tracado98-editar-estilo', 'value'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def salvar_edicao_tracado_98(n_clicks, id_tracado, preco, cor, espessura, estilo, ativo):
+    if not id_tracado or preco is None or preco == '':
+        return no_update, no_update
+    # str(preco).replace(',', '.') — campo numérico nativo, em máquina com
+    # configuração regional pt-BR, pode devolver o valor com vírgula
+    # decimal em vez de ponto (bug relatado 2026-07-14: 'não salva' era
+    # esse ValueError silencioso derrubando o callback inteiro, sem
+    # feedback nenhum pro usuário). try/except em vez de deixar estourar —
+    # um valor ilegível não deve travar o popup aberto pra sempre.
+    try:
+        preco_float = float(str(preco).replace(',', '.'))
+        espessura_int = int(espessura)
+    except (TypeError, ValueError):
+        return no_update, no_update
+    tracados.atualizar_tracado(id_tracado, preco_float, cor, espessura_int, estilo)
+    ativo_real = ativo or 'WIN'
+    return None, tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('store-tracado-editar-98', 'data', allow_duplicate=True),
+    Output('store-tracados-servidor-98', 'data', allow_duplicate=True),
+    Input('btn-tracado98-editar-excluir', 'n_clicks'),
+    State('store-tracado-editar-98', 'data'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def excluir_tracado_do_modal_98(n_clicks, id_tracado, ativo):
+    if not id_tracado:
+        return no_update, no_update
+    tracados.remover_tracado(id_tracado)
+    ativo_real = ativo or 'WIN'
+    return None, tracados.listar_tracados(ativo_real).to_dict('records')
 
 
 @app.callback(
@@ -1843,7 +2602,7 @@ def atualizar_mme21_serie_completo(n_slow, ativo):
     comentário lá): descarta respostas atrasadas de um ativo já trocado."""
     with lock:
         bases = estado['bases']
-    df_ativo = bases.get(ativo if ativo != 'CORRELACAO' else 'WIN')
+    df_ativo = bases.get(ativo)
     serie = mme21_para_grafico(df_ativo) if df_ativo is not None else []
     return {'ativo': ativo, 'serie': serie}
 
@@ -1865,8 +2624,9 @@ def atualizar_mme21_serie_completo(n_slow, ativo):
     Input('interval-live', 'n_intervals'),
     Input('store-ativo', 'data'),
     Input('store-candle-atual', 'data'),
+    State('store-timeline-expandida-98', 'data'),
 )
-def atualizar_dashboard(n_intervals, ativo, candle_atual):
+def atualizar_dashboard(n_intervals, ativo, candle_atual, timeline_expandida):
     """
     Callback principal — dispara a cada 1s via interval-live.
     A leitura das métricas é leve (só lê o DataFrame já em memória).
@@ -1880,14 +2640,18 @@ def atualizar_dashboard(n_intervals, ativo, candle_atual):
         erro        = estado['erro']
         c_win       = estado['contrato_win']
         c_wdo       = estado['contrato_wdo']
+        cotacoes_correlacionadas = estado['cotacoes_correlacionadas']
+        fechamentos_di = estado['fechamentos_di']
 
     df_win   = bases.get('WIN')
     df_wdo   = bases.get('WDO')
-    df_ativo = df_win if ativo in ('WIN', 'CORRELACAO') else df_wdo
+    df_ativo = df_win if ativo == 'WIN' else df_wdo
 
     m_win = extrair_metricas(df_win) if df_win is not None else {}
     m_wdo = extrair_metricas(df_wdo) if df_wdo is not None else {}
-    m     = m_win if ativo in ('WIN', 'CORRELACAO') else m_wdo
+    m     = m_win if ativo == 'WIN' else m_wdo
+    indice_mg = indice_medo_ganancia.calcular_indice_medo_ganancia(df_win, df_wdo)
+    correlacao = correlacao_ativos.calcular_correlacao_di(df_win, df_wdo, fechamentos_di)
 
     # Injeta preço em tempo real do store rápido (atualizado a 1s)
     if candle_atual and candle_atual.get('preco'):
@@ -1933,9 +2697,9 @@ def atualizar_dashboard(n_intervals, ativo, candle_atual):
                 status, contrato_str, upd_str, cal_str, cal_style, None,
                 {'ativo': ativo, 'niveis': []}, {'ativo': ativo, 'ponto': None}, placeholder)
 
-    hero         = construir_hero(m_win, m_wdo, ativo)
+    hero         = construir_hero(m_win, m_wdo, ativo, indice_mg, correlacao, cotacoes_correlacionadas)
     market_view  = construir_market_view(m)
-    price_action = construir_price_action(df_ativo, m)
+    price_action = construir_price_action(df_ativo, m, timeline_expandida or {})
     big_players  = construir_big_players(df_ativo)
     # Marcado com o `ativo` que gerou esses níveis — o clientside_callback
     # de desenho (assets_98/lwchart.js::desenharNiveisSR) descarta a
@@ -2066,6 +2830,271 @@ def construir_rastreador_tendencia(analise: dict) -> html.Div:
     ], style=win98_sunken(padding='14px'))
 
 
+def _card_estudo_tracado_98(analise: dict, expandido: bool = False) -> html.Div:
+    """Um card por traçado manual — mesma linguagem de
+    `construir_rastreador_tendencia`, mais um botão de apagar. Badge FORTE
+    e leitura vêm do REGIME ATUAL (`metricas.montar_regime`), não mais do
+    agregado do histórico inteiro — achado real (2026-07-13): níveis
+    dentro de uma consolidação longa vinham sempre "FORTE" contando toques
+    fracos (1 candle de confirmação) espalhados por meses. Mostra também a
+    narrativa de bipolaridade quando o traçado coincide com uma zona do
+    motor automático que já reverteu de papel (`cruzamento_automatico`)."""
+    tipo = analise.get('tipo', 'suporte')
+    eh_suporte = (tipo == 'suporte')
+    cor = C['green'] if eh_suporte else C['red']
+    prob = analise.get('prob_bounce', 50.0)
+    violado = analise.get('violado', False)
+    janela = analise.get('janela', 0)
+
+    regime = analise.get('regime') or {
+        'tem_divisao': False, 'fronteira_timestamp': None,
+        'regime_atual': {'toques': analise.get('toques', 0), 'toques_fortes': 0,
+                          'forte': analise.get('forte', False), 'detalhes': []},
+        'regime_antigo': None,
+    }
+    atual = regime['regime_atual']
+    antigo = regime['regime_antigo']
+    forte = atual['forte']
+    toques_total = atual['toques'] + (antigo['toques'] if antigo else 0)
+
+    badges = []
+    if forte:
+        badges.append(html.Span('FORTE', style={
+            'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(C['gold']),
+            'background': C['gold'], 'padding': '2px 6px', 'marginRight': '6px',
+            'letterSpacing': '0.05em',
+        }))
+    if violado:
+        badges.append(html.Span('VIOLADO', style={
+            'fontSize': '9px', 'fontWeight': '700', 'color': C['text'],
+            'background': C['red'], 'padding': '2px 6px', 'marginRight': '6px',
+            'letterSpacing': '0.05em',
+        }))
+
+    cruzamento = analise.get('cruzamento_automatico')
+    bip = cruzamento.get('bipolar') if cruzamento else None
+    narrativa_bipolar = None
+    # Diferente de _card_nivel_sr (Price Action): aqui não existe card da
+    # zona antiga (o traçado é um preço isolado) — qualquer bipolaridade
+    # encontrada já é a informação nova. `localizar_zona_automatica` só
+    # casa pelo zona_min/zona_max da zona ORIGINAL (mesma faixa da
+    # espelho), então `papel_no_cruzamento` vem sempre 'origem' pra um
+    # traçado — exigir 'espelho' aqui nunca disparava (bug real, corrigido
+    # 2026-07-13).
+    if bip:
+        badges.append(html.Span('REVERSÃO DE PAPEL', style={
+            'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(C['blue']),
+            'background': C['blue'], 'padding': '2px 6px', 'marginRight': '6px',
+            'letterSpacing': '0.05em',
+        }))
+        papel_antigo = 'resistência' if eh_suporte else 'suporte'
+        narrativa_bipolar = (
+            f'Esta região era {papel_antigo} até romper em {_fmt_ts(bip["timestamp_rompimento"])} '
+            f'— reteste confirmado às {_fmt_ts(bip["timestamp_reteste"])}, hoje atua como {tipo}.'
+        )
+
+    if violado:
+        leitura = (f'Nível rompido — perdeu o papel de {"suporte" if eh_suporte else "resistência"} '
+                   f'no histórico analisado.')
+    elif regime['tem_divisao']:
+        fronteira_fmt = _fmt_ts(regime['fronteira_timestamp'])
+        if forte:
+            leitura = (f'Testado {atual["toques"]}x e respeitado no regime atual (desde {fronteira_fmt}) '
+                       f'— mesma doutrina do S/R automático ({"suporte" if eh_suporte else "resistência"} estrutural).')
+        elif atual['toques'] == 0:
+            if antigo and antigo['toques']:
+                leitura = (f'Sem toque ainda no regime atual (desde {fronteira_fmt}). Havia '
+                           f'{antigo["toques"]} toques num regime anterior, mas isso não conta pra '
+                           f'doutrina de nível estrutural — o comportamento do mercado mudou aqui.')
+            else:
+                leitura = f'Sem toque registrado desde {fronteira_fmt} — sem histórico recente pra confirmar.'
+        else:
+            leitura = (f'Tocado {atual["toques"]}x no regime atual (desde {fronteira_fmt}), ainda sem '
+                       f'confirmação forte — acompanhar antes de considerar operacional.')
+    elif atual['toques'] == 0:
+        leitura = 'Ainda sem toque registrado nesse nível — sem histórico pra confirmar se seria respeitado.'
+    elif forte:
+        leitura = (f'Testado {atual["toques"]}x e respeitado — mesma doutrina do S/R automático '
+                   f'({"suporte" if eh_suporte else "resistência"} estrutural).')
+    else:
+        leitura = f'Tocado {atual["toques"]}x, ainda sem confirmação forte — acompanhar antes de considerar operacional.'
+
+    corpo_timeline = []
+    if toques_total:
+        corpo_timeline.append(html.Button(
+            f"{'▾' if expandido else '▸'} Ver histórico de toques ({toques_total})",
+            id={'type': 'timeline-toggle-98', 'index': analise['id_tracado']}, n_clicks=0,
+            style={'background': 'transparent', 'border': 'none', 'color': C['text2'],
+                   'fontSize': '11px', 'cursor': 'pointer', 'padding': '4px 0', 'textAlign': 'left'},
+        ))
+        if expandido:
+            if atual['detalhes']:
+                corpo_timeline.append(html.Div('REGIME ATUAL', style={
+                    'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
+                    'letterSpacing': '0.06em', 'marginTop': '6px',
+                }))
+                corpo_timeline += [_linha_toque_html_98(d) for d in atual['detalhes']]
+            if antigo and antigo['detalhes']:
+                corpo_timeline.append(html.Div('REGIME ANTERIOR', style={
+                    'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
+                    'letterSpacing': '0.06em', 'marginTop': '8px',
+                }))
+                corpo_timeline += [_linha_toque_html_98(d) for d in antigo['detalhes']]
+
+    return html.Div([
+        html.Div([
+            html.Div([
+                html.Div(_fmt(analise['linha_atual'], 0), style={
+                    'fontSize': '20px', 'fontWeight': '700', 'fontFamily': FONTS['mono'], 'color': cor,
+                }),
+                html.Div(tipo.upper(), style={
+                    'fontSize': '10px', 'color': cor, 'fontFamily': FONTS['display'],
+                    'fontWeight': '700', 'letterSpacing': '0.05em',
+                }),
+            ], style={'flex': '1'}),
+            html.Button('🗑', id={'type': 'del-tracado-98', 'index': analise['id_tracado']},
+                        n_clicks=0, className='win98-btn', title='Remover traçado',
+                        style={**win98_button(), 'minWidth': '0', 'padding': '2px 8px'}),
+        ], style={'display': 'flex', 'alignItems': 'flex-start', 'marginBottom': '8px'}),
+        html.Div(badges, style={'marginBottom': '8px'}) if badges else html.Div(),
+        html.Div(f'{toques_total} toque{"s" if toques_total != 1 else ""} no histórico analisado ({janela} candles)', style={
+            'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'], 'marginBottom': '6px',
+        }),
+        html.Div(f'Probabilidade: {prob:.0f}% bounce · {100-prob:.0f}% rompimento', style={
+            'fontSize': '12px', 'fontWeight': '600', 'color': cor,
+            'fontFamily': FONTS['display'], 'marginBottom': '8px',
+        }),
+        _bloco_scores_html(analise),
+        html.Div(narrativa_bipolar, style={
+            'fontSize': '11px', 'color': C['blue'], 'fontFamily': FONTS['body'],
+            'lineHeight': '1.4', 'marginBottom': '8px',
+        }) if narrativa_bipolar else html.Div(),
+        html.Div(leitura, style={
+            'fontSize': '12px', 'color': C['text'], 'fontFamily': FONTS['body'],
+            'lineHeight': '1.5', 'borderLeft': f'3px solid {cor}', 'paddingLeft': '10px',
+            'marginBottom': '8px',
+        }),
+        _acao_html(analise, not eh_suporte),
+        html.Div(corpo_timeline, style={'marginTop': '10px'}) if corpo_timeline else html.Div(),
+    ], style={**win98_sunken(padding='14px'), 'marginBottom': '10px'})
+
+
+def construir_estudos_tracados_98(analises: list, expandidos: dict = None) -> html.Div:
+    """Seção "Estudos" da janela Traçados — um card por traçado manual (ver
+    `_card_estudo_tracado_98`). Mesma informação da aba Price Action, mas
+    capturando os traçados do gráfico em vez dos níveis automáticos do
+    motor de S/R."""
+    if not analises:
+        return html.Div(
+            'Nenhum traçado ainda — use a ferramenta "Nível S/R" na barra acima '
+            'para marcar um nível no gráfico.',
+            style={'padding': '16px', 'textAlign': 'center', 'color': C['text2'], 'fontSize': '12px'},
+        )
+    expandidos = expandidos or {}
+    return html.Div([_card_estudo_tracado_98(a, expandidos.get(a['id_tracado'], False)) for a in analises])
+
+
+_OPCOES_ESPESSURA_TRACADO_98 = [{'label': f'{n}px', 'value': n} for n in (1, 2, 3, 4)]
+_OPCOES_ESTILO_TRACADO_98 = [
+    {'label': 'Sólida', 'value': 'solid'},
+    {'label': 'Tracejada', 'value': 'dashed'},
+    {'label': 'Pontilhada', 'value': 'dotted'},
+]
+# Paleta curada em vez de um seletor de cor nativo — mesmo motivo de
+# dashboard.py::_CORES_TRACADO (Dash 4.3 não tem html.Input, e dcc.Input
+# não aceita type='color'). Selecionada = "afundada" (win98_sunken), igual
+# ao resto do projeto usa pra indicar botão pressionado/ativo.
+_CORES_TRACADO_98 = [
+    (C['titlebar'], 'Azul marinho (padrão)'), ('#008000', 'Verde'), ('#FF0000', 'Vermelho'),
+    ('#808080', 'Cinza'), ('#FFFFFF', 'Branco'), ('#000000', 'Preto'),
+]
+
+
+def _swatch_cor_tracado_98(hexcor: str, titulo: str, selecionada: bool) -> html.Button:
+    estilo = (win98_sunken(bg=hexcor, padding='0') if selecionada
+              else win98_raised(bg=hexcor, padding='0'))
+    estilo.update({'width': '24px', 'height': '24px', 'cursor': 'pointer'})
+    return html.Button('', id={'type': 'tracado-cor-swatch-98', 'cor': hexcor}, n_clicks=0,
+                        className='win98-btn', title=titulo, style=estilo)
+
+
+def _swatches_cor_tracado_98(cor_atual: str) -> list:
+    return [_swatch_cor_tracado_98(hexcor, titulo, hexcor == cor_atual) for hexcor, titulo in _CORES_TRACADO_98]
+
+
+def _modal_editar_tracado_98(id_tracado: str, ativo: str) -> html.Div | None:
+    """Popup de edição de um traçado — aberto por duplo clique na linha
+    (ver assets_98/lwchart.js::wireFerramentaDesenho). Mesmo padrão de
+    overlay (backdrop + painel centralizado) de `_overlay_98` em
+    diario_app_98.py, conteúdo num win98_groupbox como
+    `_modal_detalhe_trade_98`."""
+    ativo_real = ativo or 'WIN'
+    df = tracados.listar_tracados(ativo_real)
+    linha = df[df['id_tracado'] == id_tracado]
+    if linha.empty:
+        return None
+    t = linha.iloc[0]
+    cor_atual = t['cor'] if pd.notna(t['cor']) else C['titlebar']
+
+    def _campo(rotulo, componente):
+        return html.Div([
+            html.Div(rotulo, style={
+                'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                'marginBottom': '4px',
+            }),
+            componente,
+        ], style={'marginBottom': '12px'})
+
+    conteudo = win98_groupbox('Editar Traçado', html.Div([
+        _campo('Preço', dcc.Input(
+            # round() — `coordinateToPrice()` no clique original devolve
+            # até 10+ casas decimais de ruído de ponto flutuante (nunca um
+            # preço "redondo"); mostrar isso cru no campo é só lixo visual
+            # e piora o risco de erro de digitação. `step='any'` evita o
+            # navegador marcar o campo como inválido (e devolver '' pro
+            # Dash) em qualquer valor decimal, independente de locale.
+            id='tracado98-editar-preco', type='number', value=round(float(t['preco']), 2),
+            step='any', style={**win98_field(), 'width': '100%', 'boxSizing': 'border-box'},
+        )),
+        dcc.Store(id='tracado98-editar-cor', data=cor_atual),
+        _campo('Cor', html.Div(
+            _swatches_cor_tracado_98(cor_atual),
+            id='tracado98-editar-cor-swatches',
+            style={'display': 'flex', 'gap': '6px'},
+        )),
+        _campo('Espessura', dcc.Dropdown(
+            id='tracado98-editar-espessura', options=_OPCOES_ESPESSURA_TRACADO_98,
+            value=int(t['espessura']), clearable=False, searchable=False,
+            style={'fontFamily': FONTS['body'], 'fontSize': '12px'},
+        )),
+        _campo('Tipo de linha', dcc.Dropdown(
+            id='tracado98-editar-estilo', options=_OPCOES_ESTILO_TRACADO_98,
+            value=t['estilo'], clearable=False, searchable=False,
+            style={'fontFamily': FONTS['body'], 'fontSize': '12px'},
+        )),
+        html.Div([
+            html.Button('Excluir', id='btn-tracado98-editar-excluir', n_clicks=0,
+                        className='win98-btn', style={**win98_button(), 'color': C['red']}),
+            html.Div(style={'flex': '1'}),
+            html.Button('Cancelar', id='btn-tracado98-editar-cancelar', n_clicks=0,
+                        className='win98-btn', style={**win98_button(), 'marginRight': '6px'}),
+            html.Button('Salvar', id='btn-tracado98-editar-salvar', n_clicks=0,
+                        className='win98-btn', style=win98_button()),
+        ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '4px'}),
+    ]), estilo_extra={'width': '300px'})
+
+    return html.Div([
+        html.Div(id='tracado98-editar-backdrop', n_clicks=0, style={
+            'position': 'fixed', 'top': 0, 'left': 0, 'right': 0, 'bottom': 0,
+            'background': 'rgba(0,0,0,0.6)', 'zIndex': 9998,
+        }),
+        html.Div(conteudo, style={
+            'position': 'fixed', 'top': '50%', 'left': '50%', 'transform': 'translate(-50%, -50%)',
+            'zIndex': 9999,
+        }),
+    ])
+
+
 def _linha_chat(quem: str, texto: str, cor: str = None) -> html.Div:
     """Uma linha de transcript estilo IRC — sem bolhas arredondadas, que são
     linguagem visual pós-2010. `quem` já vem com o rótulo (ex. 'Você:',
@@ -2102,7 +3131,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
     # Chama a IA (bloqueante — resposta real vem aqui mesmo)
     with lock:
         bases = estado['bases']
-    df = bases.get(ativo if ativo != 'CORRELACAO' else 'WIN')
+    df = bases.get(ativo)
     m = extrair_metricas(df) if df is not None else {}
 
     try:

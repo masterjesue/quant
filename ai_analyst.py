@@ -73,6 +73,31 @@ def montar_contexto(metricas: dict, ativo: str, diario_recente: str | None = Non
         romp_hoje = r.get('rompimento_hoje', 'nenhum')
         if romp_hoje != 'nenhum':
             extras.append(romp_hoje.upper().replace('_', ' '))
+        # Bipolaridade (2026-07-13) — sem isso, o modelo não sabia que o
+        # nível #1 rankeado É uma reversão de papel confirmada (nasceu de
+        # uma zona rompida), mesmo já mandando o status/badge isolado —
+        # mesmo espírito do reforço de 2026-07-08 acima: dar o sinal já
+        # validado, não deixar o modelo "recalcular" cautela genérica.
+        bip = r.get('bipolar')
+        if bip and bip.get('papel_no_cruzamento') == 'espelho':
+            extras.append(
+                f"REVERSÃO CONFIRMADA (rompeu {bip['timestamp_rompimento']}, "
+                f"reteste {bip['timestamp_reteste']})"
+            )
+        # Camada de ação (2026-07-13, ver
+        # especificacao_forca_zonas_price_action.md) — postura já vem
+        # decidida por regra explícita (montar_acao), não texto livre; dar
+        # isso pronto ao modelo evita que ele "recalcule" uma leitura
+        # própria a partir só da probabilidade agregada.
+        acao = r.get('acao') or {}
+        postura = acao.get('postura')
+        if postura:
+            extras.append(f"AÇÃO: {postura.upper().replace('_', ' ')}")
+            if acao.get('magnitude_esperada'):
+                extras.append(f"magnitude esperada {acao['magnitude_esperada']}")
+            inval = acao.get('invalidacao')
+            if inval is not None and not (isinstance(inval, float) and np.isnan(inval)):
+                extras.append(f"invalidação em {_f(inval, 0)}")
         prob = r.get('prob_bounce')
         prob_txt = ''
         if prob is not None and not (isinstance(prob, float) and np.isnan(prob)):

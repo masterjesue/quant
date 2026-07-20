@@ -335,37 +335,41 @@ def carregar_padroes_comportamentais() -> pd.DataFrame | None:
 
 
 # -----------------------------------------------------------------------------
-# POSIÇÕES ABERTAS (rascunho ao vivo do Diário) — ver plano em
-# C:\Users\jesue\.claude\plans\analise-o-bloco-de-glimmering-marble.md
-# -----------------------------------------------------------------------------
-# Tabela SEPARADA de `diario_trades.parquet` (que continua append-only/
-# imutável) — aqui uma linha = 1 posição atualmente aberta ou recém-fechada
-# aguardando confirmação, escrita tanto pelo dashboard principal (campos
-# vindos do MT5, a cada ciclo de sincronização) quanto pelo processo do
-# Diário (notas/tags/imagens do usuário, enquanto ele acompanha a operação)
-# — dois escritores diferentes, por isso a trava própria e a escrita
-# atômica (`_salvar_parquet_atomico`) desde o primeiro dia, diferente de
-# `salvar_diario` (que hoje tem um único escritor por vez).
+# ESTRATÉGIAS / PRESETS R:R / TAGS SETUP-ERRO (cadastro editável, aba
+# "Estratégias" — feedback diário.txt, 2026-07-11) — ao contrário das tabelas
+# acima (recomputáveis a qualquer momento), estas são editadas diretamente
+# pelo usuário (CRUD), então levam trava própria (mesmo padrão de
+# `lock_diario`) — escrita disparada por clique, não por um ciclo automático,
+# então quem chama deve mostrar erro/retry visível se ocupada. Uma trava só
+# cobre as 3 tabelas (mesma tela "Estratégias", nunca editadas
+# concorrentemente por dois escritores).
 
-def _caminho_posicoes_abertas() -> Path:
-    return cfg.PASTA_BASE_PROCESSADA / "posicoes_abertas.parquet"
+def _caminho_estrategias() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_estrategias.parquet"
 
 
-def _caminho_posicoes_abertas_lock() -> Path:
-    return cfg.PASTA_BASE_PROCESSADA / '.posicoes_abertas.lock'
+def _caminho_rr_presets() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_rr_presets.parquet"
+
+
+def _caminho_tags_setup_erro() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_tags_setup_erro.parquet"
+
+
+def _caminho_tags_emocionais() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_tags_emocionais.parquet"
+
+
+def _caminho_estrategias_lock() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / '.estrategias.lock'
 
 
 @contextmanager
-def lock_posicoes_abertas():
-    """
-    Mesmo mecanismo de `lock_atualizacao()`/`lock_diario()` (criação atômica
-    via O_EXCL). Uso: `with persistencia.lock_posicoes_abertas() as adquirida:
-    if adquirida: ...`. O sync automático (dashboard principal, a cada poucos
-    segundos) deve pular o ciclo em silêncio se ocupado, igual ao lock de
-    candle; já uma ação do usuário (salvar nota/imagem no Diário) deve
-    mostrar erro/retry visível, igual ao `lock_diario()`.
-    """
-    caminho = _caminho_posicoes_abertas_lock()
+def lock_estrategias():
+    """Mesmo mecanismo de `lock_diario()` (criação atômica via O_EXCL) —
+    cobre as 3 tabelas de cadastro (estratégias, presets R:R, tags de
+    setup/erro), editadas na mesma tela."""
+    caminho = _caminho_estrategias_lock()
     caminho.parent.mkdir(parents=True, exist_ok=True)
 
     if caminho.exists():
@@ -395,6 +399,128 @@ def lock_posicoes_abertas():
             pass
 
 
+def salvar_estrategias(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_estrategias(), index=False)
+
+
+def carregar_estrategias() -> pd.DataFrame | None:
+    caminho = _caminho_estrategias()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def salvar_rr_presets(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_rr_presets(), index=False)
+
+
+def carregar_rr_presets() -> pd.DataFrame | None:
+    caminho = _caminho_rr_presets()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def salvar_tags_setup_erro(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_tags_setup_erro(), index=False)
+
+
+def carregar_tags_setup_erro() -> pd.DataFrame | None:
+    caminho = _caminho_tags_setup_erro()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def salvar_tags_emocionais(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_tags_emocionais(), index=False)
+
+
+def carregar_tags_emocionais() -> pd.DataFrame | None:
+    caminho = _caminho_tags_emocionais()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# POSIÇÕES ABERTAS (rascunho ao vivo do Diário) — ver plano em
+# C:\Users\jesue\.claude\plans\analise-o-bloco-de-glimmering-marble.md
+# -----------------------------------------------------------------------------
+# Tabela SEPARADA de `diario_trades.parquet` (que continua append-only/
+# imutável) — aqui uma linha = 1 posição atualmente aberta ou recém-fechada
+# aguardando confirmação, escrita tanto pelo dashboard principal (campos
+# vindos do MT5, a cada ciclo de sincronização) quanto pelo processo do
+# Diário (notas/tags/imagens do usuário, enquanto ele acompanha a operação)
+# — dois escritores diferentes, por isso a trava própria e a escrita
+# atômica (`_salvar_parquet_atomico`) desde o primeiro dia, diferente de
+# `salvar_diario` (que hoje tem um único escritor por vez).
+
+def _caminho_posicoes_abertas() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "posicoes_abertas.parquet"
+
+
+def _caminho_posicoes_abertas_lock() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / '.posicoes_abertas.lock'
+
+
+@contextmanager
+def lock_posicoes_abertas(tentativas: int = 1, espera_segundos: float = 0.15):
+    """
+    Mesmo mecanismo de `lock_atualizacao()`/`lock_diario()` (criação atômica
+    via O_EXCL). Uso: `with persistencia.lock_posicoes_abertas() as adquirida:
+    if adquirida: ...`. O sync automático (dashboard principal, a cada poucos
+    segundos) deve pular o ciclo em silêncio se ocupado — usa o default
+    (`tentativas=1`, sem espera), igual de sempre.
+
+    `tentativas`/`espera_segundos`: ações do usuário (salvar campo, colar
+    print, finalizar) devem pedir algumas tentativas com espera curta antes
+    de desistir. Achado real 2026-07-20: o auto-save contínuo (cada campo
+    salva sozinho, ver `atualizar_rascunho`) aumentou muito a frequência de
+    disputa por esta trava contra o ciclo de sync (que roda a cada poucos
+    segundos) — sem nenhuma espera, isso virava "⚠ Ocupado — tente de novo"
+    com frequência real, inclusive no clique de "Finalizar e gravar no
+    Diário" (que parecia "não fazer nada" — na verdade estava sendo
+    recusado na hora por essa disputa)."""
+    caminho = _caminho_posicoes_abertas_lock()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+
+    if caminho.exists():
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+        except FileNotFoundError:
+            idade = 0
+        if idade > _LOCK_STALE_SEGUNDOS:
+            try:
+                caminho.unlink()
+            except FileNotFoundError:
+                pass
+
+    fd = None
+    for tentativa in range(max(1, tentativas)):
+        try:
+            fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if tentativa + 1 >= max(1, tentativas):
+                yield False
+                return
+            time.sleep(espera_segundos)
+    os.close(fd)
+
+    try:
+        yield True
+    finally:
+        try:
+            caminho.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def salvar_posicoes_abertas(df: pd.DataFrame):
     """Salva a tabela de posições abertas/rascunhos — escrita atômica
     (dois escritores possíveis, ver comentário da seção)."""
@@ -406,6 +532,33 @@ def carregar_posicoes_abertas() -> pd.DataFrame | None:
     """Carrega a tabela de posições abertas/rascunhos. Retorna None se
     ainda não existir (nenhuma posição foi sincronizada ainda)."""
     caminho = _caminho_posicoes_abertas()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# TICKETS FINALIZADOS — "tumbas" de tickets MT5 que já viraram trade
+# definitivo no Diário (bug real 2026-07-16: um par de hedge pode ser
+# finalizado no Diário mas continuar aparecendo como ABERTO no MT5 por 1-2h
+# até o BTG cruzar as 2 pernas via DEAL_ENTRY_OUT_BY — sem essa lista,
+# `sincronizar_posicoes_abertas` redescobria o ticket como posição "nova" e
+# a mesma operação virava pendente de novo, podendo ser finalizada em
+# DUPLICIDADE se o usuário clicasse Finalizar outra vez). Ver
+# `diario_trade._marcar_tickets_finalizados`/`_tickets_ja_finalizados`.
+# -----------------------------------------------------------------------------
+
+def _caminho_tickets_finalizados() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "tickets_finalizados.parquet"
+
+
+def salvar_tickets_finalizados(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    _salvar_parquet_atomico(_caminho_tickets_finalizados(), df)
+
+
+def carregar_tickets_finalizados() -> pd.DataFrame | None:
+    caminho = _caminho_tickets_finalizados()
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)
@@ -433,6 +586,153 @@ def salvar_ordens_pendentes(df: pd.DataFrame):
 def carregar_ordens_pendentes() -> pd.DataFrame | None:
     """Carrega a tabela de ordens pendentes. Retorna None se ainda não existir."""
     caminho = _caminho_ordens_pendentes()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# CHECK-IN DIÁRIO / RODA DA VIDA (aba "Bem-Estar", Fase E — feedback
+# diário.txt, 2026-07-11) — primeiras tabelas do projeto chaveadas por DATA
+# em vez de `id_trade`/slug. Check-in é upsert (uma linha por dia, editável);
+# Roda da Vida é append-only (cada registro é um retrato no tempo). As duas
+# vivem na mesma tela, editadas por clique do usuário — uma trava só, mesmo
+# padrão de `lock_estrategias` cobrindo várias tabelas da mesma aba.
+
+def _caminho_checkin_diario() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_checkin.parquet"
+
+
+def _caminho_roda_vida() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_roda_vida.parquet"
+
+
+def _caminho_checkin_diario_lock() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / '.checkin_diario.lock'
+
+
+@contextmanager
+def lock_checkin_diario():
+    """Mesmo mecanismo de `lock_diario()`/`lock_estrategias()` (criação
+    atômica via O_EXCL) — cobre check-in e Roda da Vida, editados na mesma
+    aba "Bem-Estar"."""
+    caminho = _caminho_checkin_diario_lock()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+
+    if caminho.exists():
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+        except FileNotFoundError:
+            idade = 0
+        if idade > _LOCK_STALE_SEGUNDOS:
+            try:
+                caminho.unlink()
+            except FileNotFoundError:
+                pass
+
+    try:
+        fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        try:
+            caminho.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def salvar_checkin_diario(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_checkin_diario(), index=False)
+
+
+def carregar_checkin_diario() -> pd.DataFrame | None:
+    caminho = _caminho_checkin_diario()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def salvar_roda_vida(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_roda_vida(), index=False)
+
+
+def carregar_roda_vida() -> pd.DataFrame | None:
+    caminho = _caminho_roda_vida()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# TRAÇADOS (níveis de S/R desenhados à mão no gráfico — aba/janela "Traçados",
+# ver tracados.py) — dois escritores possíveis (o próprio dashboard, ação do
+# usuário desenhando/arrastando/apagando; nunca simultâneo de fato, mas mesma
+# cautela de `posicoes_abertas`) — trava própria + escrita atômica.
+# -----------------------------------------------------------------------------
+
+def _caminho_tracados() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "tracados.parquet"
+
+
+def _caminho_tracados_lock() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / '.tracados.lock'
+
+
+@contextmanager
+def lock_tracados():
+    """Mesmo mecanismo de `lock_posicoes_abertas()` (criação atômica via
+    O_EXCL) — ação do usuário (criar/mover/apagar um traçado), deve
+    mostrar erro/retry visível se ocupado, mas colisão real é rara (um
+    usuário, uma aba por vez)."""
+    caminho = _caminho_tracados_lock()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+
+    if caminho.exists():
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+        except FileNotFoundError:
+            idade = 0
+        if idade > _LOCK_STALE_SEGUNDOS:
+            try:
+                caminho.unlink()
+            except FileNotFoundError:
+                pass
+
+    try:
+        fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        try:
+            caminho.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def salvar_tracados(df: pd.DataFrame):
+    """Salva a tabela de traçados — escrita atômica (mesmo motivo de
+    `salvar_posicoes_abertas`: nunca expor um arquivo parcial a um leitor
+    concorrente)."""
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    _salvar_parquet_atomico(_caminho_tracados(), df)
+
+
+def carregar_tracados() -> pd.DataFrame | None:
+    """Carrega a tabela de traçados. Retorna None se ainda não existir
+    (nenhum traçado foi criado ainda)."""
+    caminho = _caminho_tracados()
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)

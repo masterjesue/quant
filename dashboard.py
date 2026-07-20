@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 import dash
-from dash import dcc, html, Input, Output, State, callback_context, no_update
+from dash import dcc, html, Input, Output, State, callback_context, no_update, ALL
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
@@ -27,6 +27,9 @@ import persistencia
 import run_backtest
 import mt5_loader
 import diario_trade
+import tracados
+import indice_medo_ganancia
+import correlacao_ativos
 import calendario_economico as cal_eco
 import ai_analyst
 import gerenciador_processos as gp
@@ -42,17 +45,39 @@ except ImportError:
 # PALETA E TOKENS
 # =============================================================================
 
+# 2026-07-17: os valores viraram `var(--x)` (definidas em assets/style.css,
+# com override em `:root[data-theme="light"]`) pro modo claro/escuro do
+# SQ Padrão — o navegador resolve sozinho, ao vivo, sem tocar em nenhum dos
+# ~300 usos de `C['x']` espalhados pelo arquivo. EXCEÇÃO: Plotly
+# (`gauge_cockpit`) não entende `var(...)` — usa `PALETA_GAUGE` abaixo, que
+# mantém os hex literais de verdade por tema.
 C = {
-    'bg':        '#0A0A0F',
-    'panel':     '#12121A',
-    'border':    '#1C1C28',
-    'gold':      '#C8A96E',
-    'green':     '#2ECC8A',
-    'red':       '#E05C5C',
-    'text':      '#E8E8F0',
-    'text2':     '#8888AA',
-    'blue':      '#4A90D9',
-    'yellow':    '#F0C040',
+    'bg':        'var(--bg)',
+    'panel':     'var(--panel)',
+    'border':    'var(--border)',
+    'gold':      'var(--gold)',
+    'green':     'var(--green)',
+    'red':       'var(--red)',
+    'text':      'var(--text)',
+    'text2':     'var(--text2)',
+    'blue':      'var(--blue)',
+    'yellow':    'var(--yellow)',
+}
+
+# Paleta paralela em hex literal — só pra Plotly (SVG renderizado a partir
+# do JSON da figura, não entende `var(--x)`). Mesmos 10 tokens de `C`/
+# assets/style.css, mantidos em sincronia manualmente (ver comentário lá).
+PALETA_GAUGE = {
+    'dark': {
+        'bg': '#0A0A0F', 'panel': '#12121A', 'border': '#1C1C28',
+        'gold': '#C8A96E', 'green': '#2ECC8A', 'red': '#E05C5C',
+        'text': '#E8E8F0', 'text2': '#8888AA', 'blue': '#4A90D9', 'yellow': '#F0C040',
+    },
+    'light': {
+        'bg': '#E4E7F0', 'panel': '#FFFFFF', 'border': '#C7CCDC',
+        'gold': '#A87C2E', 'green': '#128A55', 'red': '#B33A3A',
+        'text': '#14141C', 'text2': '#5B5B78', 'blue': '#3573B5', 'yellow': '#8A6508',
+    },
 }
 
 FONTS = {
@@ -74,8 +99,11 @@ estado = {
     'analise_ia':   '',
     'contrato_win': '—',
     'contrato_wdo': '—',
+    'cotacoes_correlacionadas': [],     # ver correlacao_ativos.obter_cotacoes_correlacionadas
+    'fechamentos_di': None,            # Series — ver correlacao_ativos.obter_fechamentos_di
     'posicoes_abertas': None,          # DataFrame — ver sincronizar_posicoes
     'sincronizando_posicoes': False,
+    'reconciliando': False,            # ver _reconciliar_background
 }
 lock = threading.Lock()
 
@@ -126,6 +154,13 @@ def carregar_bases():
                             w = mt5_loader.detectar_contrato_mais_recente('WDO')
                             estado['contrato_win'] = t or '—'
                             estado['contrato_wdo'] = w or '—'
+                            # Ativos correlacionados (DI1FUT/WINFUT/WDOFUT)
+                            # pro painel do hero — mesma cadência de 30s,
+                            # nunca no tick de 1s (evita chamadas MT5
+                            # extras por segundo). Ver correlacao_ativos.py.
+                            estado['cotacoes_correlacionadas'] = correlacao_ativos.obter_cotacoes_correlacionadas(
+                                estado['bases'].get('WIN'), estado['bases'].get('WDO'))
+                            estado['fechamentos_di'] = correlacao_ativos.obter_fechamentos_di()
 
                         mt5_loader.desconectar()
                     except Exception as e:
@@ -163,12 +198,29 @@ def _fmt(val, decimais=0):
         return '—'
     return f"{val:,.{decimais}f}"
 
+def _fmt_ts(iso_str) -> str:
+    """Formata um timestamp ISO (de metricas.montar_regime/_info_bipolar)
+    como 'dd/mm HH:MM' pra leitura humana nos cards de regime/bipolaridade."""
+    if not iso_str:
+        return '—'
+    try:
+        return pd.Timestamp(iso_str).strftime('%d/%m %H:%M')
+    except (ValueError, TypeError):
+        return '—'
 
-def gauge_cockpit(valor_norm: float, label: str, sub: str, cor: str) -> go.Figure:
+
+def gauge_cockpit(valor_norm: float, label: str, sub: str, cor: str, tema: str = 'light') -> go.Figure:
     """
     Velocímetro estilo cockpit aeronáutico — arco angular com agulha.
     valor_norm: 0.0 (mínimo) a 1.0 (máximo), 0.5 = neutro.
+
+    `tema` (2026-07-17) seleciona `PALETA_GAUGE['dark'|'light']` — Plotly
+    renderiza em SVG a partir do JSON da figura, não entende `var(--x)`
+    (ao contrário do resto da UI, que usa `C['x']` = 'var(--x)' e reage
+    sozinho a data-theme). `cor` continua vindo já resolvido em hex
+    literal pelo chamador (ver construir_hero).
     """
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
     ang_min, ang_max = 225, -45  # graus, sentido horário no SVG
     ang = ang_min + (ang_max - ang_min) * valor_norm
 
@@ -176,10 +228,10 @@ def gauge_cockpit(valor_norm: float, label: str, sub: str, cor: str) -> go.Figur
 
     # Arco de fundo (zona vermelha → amarela → verde)
     for i, (a_start, a_end, c) in enumerate([
-        (225, 165, C['red']),
-        (165, 105, C['yellow']),
-        (105, 45,  C['green']),
-        (45,  -45, C['green']),
+        (225, 165, p['red']),
+        (165, 105, p['yellow']),
+        (105, 45,  p['green']),
+        (45,  -45, p['green']),
     ]):
         thetas = np.linspace(np.radians(a_start), np.radians(a_end), 30)
         x_out = [0.85 * np.cos(t) for t in thetas]
@@ -213,7 +265,7 @@ def gauge_cockpit(valor_norm: float, label: str, sub: str, cor: str) -> go.Figur
     fig.add_trace(go.Scatter(
         x=[0, 0.72 * np.cos(ang_rad)],
         y=[0, 0.72 * np.sin(ang_rad)],
-        mode='lines', line=dict(color=C['text'], width=3),
+        mode='lines', line=dict(color=p['text'], width=3),
         showlegend=False, hoverinfo='skip'
     ))
 
@@ -229,7 +281,7 @@ def gauge_cockpit(valor_norm: float, label: str, sub: str, cor: str) -> go.Figur
                        font=dict(family=FONTS['mono'], size=13, color=cor),
                        showarrow=False)
     fig.add_annotation(x=0, y=-0.75, text=label,
-                       font=dict(family=FONTS['display'], size=11, color=C['text2']),
+                       font=dict(family=FONTS['display'], size=11, color=p['text2']),
                        showarrow=False)
 
     fig.update_layout(
@@ -239,6 +291,13 @@ def gauge_cockpit(valor_norm: float, label: str, sub: str, cor: str) -> go.Figur
         xaxis=dict(visible=False, range=[-1.1, 1.1]),
         yaxis=dict(visible=False, range=[-1.1, 1.1], scaleanchor='x'),
         height=200,
+        # `responsive=True` no dcc.Graph (ver construir_hero) some sozinho
+        # sem isso quando `height` já vem fixo no layout (mesmo bug do
+        # radar da Roda da Vida, 2026-07-12) — sem `autosize`, o gauge
+        # mede o container só 1x na montagem e nunca corrige se pegar um
+        # width errado nessa hora, o que piora reconstruindo do zero a
+        # cada 1s (2026-07-16, achado real do Jesué).
+        autosize=True,
     )
     return fig
 
@@ -361,6 +420,7 @@ def card(titulo: str, valor: str, sub: str = '', cor: str = None,
     ], style={
         'background': C['panel'],
         'border': f'1px solid {C["border"]}',
+        'boxShadow': 'var(--shadow-card)',
         'borderRadius': '10px',
         'padding': '14px 16px',
         'minWidth': largura,
@@ -392,7 +452,7 @@ def secao(titulo: str, cor_titulo: str = None) -> html.Div:
 
 from metricas import (
     extrair_metricas, candles_para_grafico, niveis_sr_para_grafico,
-    mme21_para_grafico, mme21_ponto_live, analisar_mme21,
+    mme21_para_grafico, mme21_ponto_live, analisar_mme21, analisar_tracados,
 )
 
 
@@ -400,70 +460,215 @@ from metricas import (
 # CONSTRUÇÃO DOS BLOCOS DO DASHBOARD
 # =============================================================================
 
-def construir_hero(m_win: dict, m_wdo: dict, ativo: str) -> html.Div:
-    """Seção hero: velocímetros de força e contexto do ativo selecionado.
+# Balão explicativo dos velocímetros do hero (2026-07-16, pedido do Jesué:
+# "o que indica e o que fazer com isso", num balão que aponta pro
+# velocímetro clicado). Os gauges vivem dentro de `construir_hero()`
+# (reconstruído a cada 1s) — clicá-los com `n_clicks` do Dash sofreria o
+# MESMO bug já documentado acima (contador zerado a cada recriação), então
+# o clique é 100% client-side (`assets/hero_gauges.js`, delegação de evento
+# em `document` + `dash_clientside.set_props` direto no
+# `store-gauge-selecionado`) — o balão em si (`balao-gauge-explicacao`)
+# mora FORA de `hero-conteudo` no layout estático, então nunca é recriado
+# pelo tick de 1s, só pelo callback `renderizar_balao_gauge` abaixo.
+_EXPLICACAO_GAUGES = {
+    'forca': {
+        'titulo': 'Força — quem domina agora',
+        'indica': 'Compara volume/delta dos candles recentes pra ver quem pesa mais no fluxo: comprador, vendedor ou nenhum dos dois (neutro).',
+        'fazer': 'Puxado pra um lado = o fluxo imediato favorece essa direção, evite operar contra ele. Em NEUTRO, não force — espere o fluxo definir um lado.',
+    },
+    'contexto': {
+        'titulo': 'Contexto — o cenário estrutural favorece?',
+        'indica': 'Olha a estrutura de fundo (tendência, posição em relação aos níveis de S/R) pra dizer se o momento estrutural favorece continuar a favor do movimento.',
+        'fazer': 'FAVORÁVEL reforça manter o viés atual; DESFAVORÁVEL pede cautela mesmo se a Força parecer boa; NEUTRO = sem viés estrutural, decida mais pelo price action do momento.',
+    },
+    'medo_ganancia': {
+        'titulo': 'Medo/Ganância — o humor do mercado',
+        'indica': 'Índice adaptado (3 fatores: momentum, volatilidade, dólar x ações) — não é o oficial da CNN, é um primeiro palpite não calibrado do clima emocional do mercado.',
+        'fazer': 'Extremos de medo ou ganância costumam preceder reversões — não é sinal de entrada isolado, é contexto pra calibrar risco e desconfiar de euforia/pânico.',
+    },
+    'correlacao': {
+        'titulo': 'Correlação — DI1FUT×WINFUT×WDOFUT batem com a tese?',
+        'indica': 'Mede se o DI está seguindo o WDO (correlação positiva) e inverso ao WIN (negativa) nos últimos 20 pregões — a leitura de que isso indica direcionamento mais confiável.',
+        'fazer': 'Direcionamento Claro reforça confiança pra operar a favor do fluxo; Parcial/Neutra pedem mais cautela; Invertida é alerta — os 3 ativos se comportando ao contrário do esperado, considere reduzir tamanho ou ficar de fora.',
+    },
+}
+# Posição horizontal (px) do centro de cada gauge dentro da fileira, pra
+# posicionar a "seta" do balão apontando pro velocímetro certo — gauges de
+# 200px + gap de 8px (ver `gauges` em `construir_hero`), centros em
+# 100/308/516/724.
+_POSICAO_TAIL_GAUGE = {'forca': 100, 'contexto': 308, 'medo_ganancia': 516, 'correlacao': 724}
 
-    Não inclui mais o seletor WIN/WDO/WIN×WDO — esse bloco virou estático em
-    app.layout (ver `_estilo_botao_ativo`) porque esta função é reconstruída
+
+def _gauge_clicavel(chave: str, grafico: dcc.Graph) -> html.Div:
+    """Envolve um gauge num `html.Div` com `data-gauge` — o clique é
+    capturado por delegação de evento em `assets/hero_gauges.js`, não por
+    `n_clicks` do Dash (ver comentário acima sobre por que)."""
+    return html.Div(grafico, className='gauge-clicavel', **{'data-gauge': chave},
+                     style={'cursor': 'pointer'})
+
+
+def _balao_explicacao_gauge(gauge_selecionado: str) -> html.Div:
+    """Balão com "o que indica" / "o que fazer" do velocímetro selecionado,
+    com uma seta (2 triângulos CSS empilhados) apontando pro gauge de
+    origem. Renderizado pelo callback `renderizar_balao_gauge` — nunca por
+    `construir_hero`, ver comentário acima."""
+    info = _EXPLICACAO_GAUGES.get(gauge_selecionado) or _EXPLICACAO_GAUGES['forca']
+    left_px = _POSICAO_TAIL_GAUGE.get(gauge_selecionado, 100)
+    return html.Div([
+        html.Div(style={
+            'position': 'absolute', 'top': '-8px', 'left': f'{left_px}px', 'transform': 'translateX(-50%)',
+            'width': '0', 'height': '0', 'borderLeft': '8px solid transparent',
+            'borderRight': '8px solid transparent', 'borderBottom': f'8px solid {C["border"]}',
+        }),
+        html.Div(style={
+            'position': 'absolute', 'top': '-6px', 'left': f'{left_px}px', 'transform': 'translateX(-50%)',
+            'width': '0', 'height': '0', 'borderLeft': '7px solid transparent',
+            'borderRight': '7px solid transparent', 'borderBottom': f'7px solid {C["bg"]}',
+        }),
+        html.Div(info['titulo'], style={
+            'fontFamily': FONTS['display'], 'fontSize': '12px', 'fontWeight': '700',
+            'color': C['gold'], 'marginBottom': '8px',
+        }),
+        html.Div([
+            html.Span('O que indica: ', style={'fontWeight': '700', 'color': C['text']}),
+            html.Span(info['indica'], style={'color': C['text2']}),
+        ], style={'fontSize': '11px', 'fontFamily': FONTS['body'], 'lineHeight': '1.5', 'marginBottom': '8px'}),
+        html.Div([
+            html.Span('O que fazer: ', style={'fontWeight': '700', 'color': C['text']}),
+            html.Span(info['fazer'], style={'color': C['text2']}),
+        ], style={'fontSize': '11px', 'fontFamily': FONTS['body'], 'lineHeight': '1.5'}),
+    ], style={
+        'position': 'relative', 'marginTop': '24px', 'padding': '16px 20px',
+        'background': C['bg'], 'border': f'1px solid {C["border"]}', 'borderRadius': '10px',
+    })
+
+
+def construir_hero(m_win: dict, m_wdo: dict, ativo: str, indice_mg: dict | None = None,
+                    correlacao: dict | None = None, cotacoes_correlacionadas: list | None = None,
+                    tema: str = 'light') -> html.Div:
+    """Seção hero: velocímetros de força e contexto do ativo selecionado,
+    mais o Índice de Medo e Ganância e o alinhamento DI1FUT×WINFUT×WDOFUT
+    (ambos independem do ativo selecionado — ver `indice_medo_ganancia.py`
+    e `correlacao_ativos.py`), com um painel de variação % do dia dos 3
+    ativos ao lado do velocímetro de correlação (2026-07-16, simplificado
+    de 4 pra 3 ativos a pedido do Jesué).
+
+    Não inclui mais o seletor WIN/WDO — esse bloco virou estático no
+    cabeçalho (ver `_estilo_botao_ativo`) porque esta função é reconstruída
     a cada 1s (`atualizar_dashboard`), e recriar os `html.Button` com
     `n_clicks=0` a cada tick zerava o contador de cliques no browser — causa
     raiz do bug "troca pra WDO e volta sozinho pro WIN" (ver CHANGELOG.md
-    2026-07-04).
+    2026-07-04). O antigo botão "WIN × WDO" (puro placeholder, nunca
+    calculou nada) foi removido e substituído por este velocímetro real.
     """
     m = m_win if ativo == 'WIN' else m_wdo
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
 
-    # Cores dos gauges
+    # Cores dos gauges — hex literal de PALETA_GAUGE (Plotly, ver
+    # gauge_cockpit), não C['x'] (esse é 'var(--x)', não resolvido em SVG).
     sf = m.get('score_forca', 0.5)
     sc = m.get('score_contexto', 0.5)
-    cor_forca   = C['green'] if sf > 0.6 else (C['red'] if sf < 0.4 else C['yellow'])
-    cor_ctx     = C['green'] if sc > 0.6 else (C['red'] if sc < 0.4 else C['yellow'])
+    cor_forca   = p['green'] if sf > 0.6 else (p['red'] if sf < 0.4 else p['yellow'])
+    cor_ctx     = p['green'] if sc > 0.6 else (p['red'] if sc < 0.4 else p['yellow'])
 
     label_forca = 'COMPRADORES' if sf > 0.6 else ('VENDEDORES' if sf < 0.4 else 'NEUTRO')
     label_ctx   = 'FAVORÁVEL' if sc > 0.6 else ('DESFAVORÁVEL' if sc < 0.4 else 'NEUTRO')
 
-    return html.Div([
-        dcc.Graph(id='gauge-forca',
-                  figure=gauge_cockpit(sf, 'FORÇA', label_forca, cor_forca),
-                  config={'displayModeBar': False},
-                  style={'width': '200px'}),
-        dcc.Graph(id='gauge-contexto',
-                  figure=gauge_cockpit(sc, 'CONTEXTO', label_ctx, cor_ctx),
-                  config={'displayModeBar': False},
-                  style={'width': '200px'}),
-    ], style={'display': 'flex', 'gap': '8px', 'alignItems': 'center'})
+    gauges = [
+        _gauge_clicavel('forca', dcc.Graph(id='gauge-forca',
+                  figure=gauge_cockpit(sf, 'FORÇA', label_forca, cor_forca, tema),
+                  config={'displayModeBar': False, 'responsive': True},
+                  style={'width': '200px'})),
+        _gauge_clicavel('contexto', dcc.Graph(id='gauge-contexto',
+                  figure=gauge_cockpit(sc, 'CONTEXTO', label_ctx, cor_ctx, tema),
+                  config={'displayModeBar': False, 'responsive': True},
+                  style={'width': '200px'})),
+    ]
+    legendas = []
+    if indice_mg is not None:
+        cor_mg = p.get(indice_mg['cor'], p['yellow'])
+        gauges.append(_gauge_clicavel('medo_ganancia', dcc.Graph(
+            id='gauge-medo-ganancia',
+            figure=gauge_cockpit(indice_mg['valor'] / 100.0, 'MEDO/GANÂNCIA', indice_mg['nivel_nome'], cor_mg, tema),
+            config={'displayModeBar': False, 'staticPlot': True, 'responsive': True},
+            style={'width': '200px'},
+        )))
+        legendas.append(html.Div(
+            'Medo/Ganância: índice adaptado (3 fatores só com WIN/WDO — momentum, volatilidade, '
+            'dólar x ações — não é o índice oficial da CNN, primeiro palpite não calibrado)',
+            style={'fontSize': '9px', 'fontFamily': FONTS['display'], 'color': C['text2'],
+                   'marginTop': '2px', 'width': '100%'},
+        ))
+    if correlacao is not None:
+        cor_corr = p.get(correlacao['cor'], p['yellow'])
+        gauges.append(_gauge_clicavel('correlacao', dcc.Graph(
+            id='gauge-correlacao',
+            figure=gauge_cockpit((correlacao['alinhamento'] + 1) / 2, 'CORRELAÇÃO', correlacao['nivel_nome'], cor_corr, tema),
+            config={'displayModeBar': False, 'staticPlot': True, 'responsive': True},
+            style={'width': '200px'},
+        )))
+        legendas.append(html.Div(
+            f"DI1FUT×WDOFUT: {correlacao['corr_di_wdo']:+.2f} · DI1FUT×WINFUT: {correlacao['corr_di_win']:+.2f} "
+            f"(Pearson, últimos {correlacao['janela_dias']} pregões) — tese: DI acompanha o WDO e é inverso "
+            f"ao WIN; quanto mais perto disso, mais claro o direcionamento. Primeiro palpite, não calibrado.",
+            style={'fontSize': '9px', 'fontFamily': FONTS['display'], 'color': C['text2'],
+                   'marginTop': '2px', 'width': '100%'},
+        ))
+        legendas.append(html.Div([
+            html.Span('Faixas do alinhamento: ', style={'color': C['text2']}),
+            html.Span('≥0.6 Direcionamento Claro', style={'color': C['green'], 'fontWeight': '700'}),
+            html.Span(' · ', style={'color': C['text2']}),
+            html.Span('0.2–0.6 Parcial', style={'color': C['yellow'], 'fontWeight': '700'}),
+            html.Span(' · ', style={'color': C['text2']}),
+            html.Span('-0.2–0.2 Neutra', style={'color': C['text2'], 'fontWeight': '700'}),
+            html.Span(' · ', style={'color': C['text2']}),
+            html.Span('≤-0.2 Invertida', style={'color': C['red'], 'fontWeight': '700'}),
+        ], style={'fontSize': '9px', 'fontFamily': FONTS['display'], 'marginTop': '2px', 'width': '100%'}))
+        if cotacoes_correlacionadas:
+            linhas = []
+            for cot in cotacoes_correlacionadas:
+                var = cot['variacao_pct']
+                cor_var = C['green'] if var >= 0 else C['red']
+                seta = '▲' if var >= 0 else '▼'
+                linhas.append(html.Div([
+                    html.Span(cot['label'], style={
+                        'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                    }),
+                    html.Span(f'{seta} {var:+.2f}%', style={
+                        'fontSize': '12px', 'fontWeight': '700', 'color': cor_var,
+                        'fontFamily': FONTS['mono'],
+                    }),
+                ], style={'display': 'flex', 'justifyContent': 'space-between', 'gap': '14px', 'padding': '3px 0'}))
+            gauges.append(html.Div([
+                html.Div('CORRELACIONADOS', style={
+                    'fontSize': '9px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                    'letterSpacing': '0.08em', 'marginBottom': '4px',
+                }),
+                *linhas,
+            ], style={'minWidth': '140px', 'padding': '2px 16px', 'borderLeft': f'1px solid {C["border"]}'}))
+
+    filhos = [html.Div(gauges, style={'display': 'flex', 'gap': '8px', 'alignItems': 'center'})]
+    filhos += legendas
+    return html.Div(filhos)
 
 
 def _estilo_botao_ativo(nome: str, ativo_atual: str) -> dict:
-    """Estilo do botão seletor de ativo (WIN/WDO/CORRELACAO) dado o ativo
-    selecionado. Extraído do antigo `construir_hero` para ser reutilizado
-    tanto no layout estático inicial quanto no callback dedicado
-    `atualizar_estilo_ativo_selecionado` — o `html.Button` em si nunca é
-    recriado, só o `style` muda."""
+    """Estilo do botão seletor de ativo (WIN/WDO) dado o ativo selecionado.
+    Reutilizado tanto no layout estático do cabeçalho quanto no callback
+    dedicado `atualizar_estilo_ativo_selecionado` — o `html.Button` em si
+    nunca é recriado, só o `style` muda (ver docstring de `construir_hero`
+    sobre por que isso é obrigatório). Movido do hero pro cabeçalho fixo em
+    2026-07-15 — fica visível em qualquer aba, não só no Quant Lab."""
     ativo_flag = (ativo_atual == nome)
     base = {
-        'padding': '8px 20px', 'borderRadius': '6px',
+        'padding': '4px 14px', 'borderRadius': '6px',
         'cursor': 'pointer', 'fontFamily': FONTS['display'],
-        'fontSize': '13px', 'transition': 'transform 0.08s ease, background 0.15s ease',
+        'fontSize': '12px', 'fontWeight': '700',
+        'transition': 'transform 0.08s ease, background 0.15s ease',
+        'background': C['green'] if ativo_flag else C['panel'],
+        'color': C['bg'] if ativo_flag else C['text2'],
+        'border': f'1px solid {C["green"] if nome == "WIN" else C["border"]}',
     }
-    if nome == 'WIN':
-        base.update({
-            'background': C['green'] if ativo_flag else C['panel'],
-            'color': C['bg'] if ativo_flag else C['text2'],
-            'border': f'1px solid {C["green"]}',
-            'fontWeight': '700',
-        })
-    elif nome == 'WDO':
-        base.update({
-            'background': C['green'] if ativo_flag else C['panel'],
-            'color': C['bg'] if ativo_flag else C['text2'],
-            'border': f'1px solid {C["border"]}',
-            'fontWeight': '700',
-        })
-    else:  # 'CORRELACAO'
-        base.update({
-            'background': C['panel'], 'color': C['text2'],
-            'border': f'1px solid {C["border"]}',
-        })
     return base
 
 
@@ -493,7 +698,27 @@ def _botao_toggle_mme21(id_botao: str) -> html.Button:
                             'position': 'absolute', 'top': '8px', 'right': '38px',
                             'width': '26px', 'height': '24px', 'fontSize': '13px',
                             'lineHeight': '24px', 'cursor': 'pointer', 'zIndex': '2',
-                            'background': C['panel'], 'color': '#1B4F5C',
+                            'background': C['panel'], 'color': 'var(--mme21)',
+                            'border': f'1px solid {C["border"]}', 'borderRadius': '6px',
+                            'padding': '0',
+                        })
+
+
+def _botao_reset_zoom(id_botao: str) -> html.Button:
+    """Botão "voltar ao zoom padrão" — o zoom/pan manual do usuário agora
+    sobrevive ao refresh de 30s (ver window.SQ_CHART.atualizarCandlesCompletos
+    em assets/lwchart.js), então precisa de uma saída explícita quando ele
+    quiser voltar à visão padrão (fitContent). Puro DOM via classe
+    `.btn-reset-zoom` (wireBotaoResetZoom em assets/lwchart.js) — sem
+    round-trip Dash, mesma ideia dos botões da barra de Traçados."""
+    return html.Button('⟲', id=id_botao, type='button', n_clicks=0,
+                        className='btn-reset-zoom',
+                        title='Voltar ao zoom padrão',
+                        style={
+                            'position': 'absolute', 'top': '8px', 'right': '68px',
+                            'width': '26px', 'height': '24px', 'fontSize': '14px',
+                            'lineHeight': '24px', 'cursor': 'pointer', 'zIndex': '2',
+                            'background': C['panel'], 'color': C['text'],
                             'border': f'1px solid {C["border"]}', 'borderRadius': '6px',
                             'padding': '0',
                         })
@@ -544,6 +769,7 @@ def construir_market_view(m: dict) -> html.Div:
         ], style={
             'background': C['panel'],
             'border': f'1px solid {C["border"]}',
+            'boxShadow': 'var(--shadow-card)',
             'borderLeft': f'3px solid {cor}',
             'borderRadius': '10px', 'padding': '12px 14px',
             'minWidth': '160px', 'flex': '1',
@@ -584,9 +810,9 @@ def construir_market_view(m: dict) -> html.Div:
     card_qm = _card_mv('Quem Manda', numero_qm, conclusao_qm, detalhe_qm, cor_qm)
 
     # --- CARD 2: TENDÊNCIA
-    tend   = m.get('tendencia', '—')
-    fase   = m.get('fase', '—')
-    saude  = m.get('saude', '—')
+    tend   = m.get('tendencia') or '—'
+    fase   = m.get('fase') or '—'
+    saude  = m.get('saude') or '—'
     cor_tend = C['green'] if tend == 'alta' else (C['red'] if tend == 'baixa' else C['yellow'])
 
     mapa_conclusao_tend = {
@@ -708,7 +934,122 @@ def construir_market_view(m: dict) -> html.Div:
     ])
 
 
-def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
+# =============================================================================
+# BLOCOS DE FORÇA (combustível/aproximação/rejeição) + camada de ação —
+# 2026-07-13, ver especificacao_forca_zonas_price_action.md. Módulo-level
+# (não fechado sobre nenhum escopo) pra ser reaproveitado tanto por
+# _card_nivel_sr (Price Action, dentro de construir_price_action) quanto por
+# _card_estudo_tracado (Estudos/Traçados, função top-level) — mesmos dados
+# (metricas._extrair_niveis/analisar_tracados), mesma leitura.
+# =============================================================================
+
+def _rotulo_bloco(v):
+    if pd.isna(v): return None
+    if v >= 65: return 'forte'
+    if v >= 45: return 'moderado(a)'
+    return 'fraco(a)'
+
+
+_POSTURA_TXT = {
+    'favorece_entrada': 'Confluência favorável entre os 3 blocos — favorece considerar entrada.',
+    'aguardar_confirmacao': 'Sinal presente, mas incompleto — aguardar confirmação adicional antes de operar.',
+    'sinal_fraco': 'Fatores conflitantes entre os blocos, ou zona já desgastada — sinal fraco, operar reduzido se operar.',
+    'evitar': 'Fatores predominantemente contrários, ou dados insuficientes — evitar operar nesta zona agora.',
+}
+_MAGNITUDE_TXT = {
+    'curta': 'Combustível baixo — se reagir, espere um movimento curto.',
+    'moderada': 'Combustível mediano — se reagir, espere um movimento moderado.',
+    'longa': 'Zona ainda fresh (pouco desgastada) — se reagir, há potencial pra um movimento mais longo.',
+}
+_POSTURA_LABEL = {
+    'favorece_entrada': ('FAVORECE ENTRADA', C['green'], C['bg']),
+    'aguardar_confirmacao': ('AGUARDAR CONFIRMAÇÃO', C['yellow'], C['bg']),
+    'sinal_fraco': ('SINAL FRACO', C['text2'], C['text']),
+    'evitar': ('EVITAR', C['red'], C['text']),
+}
+
+
+def _leitura_nivel(nivel: dict, eh_resistencia: bool) -> str:
+    """Leitura gerada A PARTIR dos 3 blocos de força desta zona específica
+    (2026-07-13) — substitui o texto fixo por tendência+lado que antes
+    produzia o MESMO parágrafo pra zonas com toques/idade bem diferentes
+    (achado real, ver especificacao_forca_zonas_price_action.md, seção 1 —
+    o texto antigo nunca usava `toques` no corpo)."""
+    comb, aprox, rej = nivel.get('combustivel_score'), nivel.get('aproximacao_score'), nivel.get('rejeicao_score')
+    partes = []
+    if not pd.isna(comb):
+        partes.append(f'Combustível {_rotulo_bloco(comb)} ({comb:.0f}) — ' + (
+            'zona ainda guarda potencial de percurso, pouco desgastada.' if comb >= 55 else
+            'zona já consumiu boa parte da liquidez represada (muitos toques/idade).' if comb < 45 else
+            'combustível mediano.'))
+    if not pd.isna(aprox):
+        partes.append(f'Aproximação {_rotulo_bloco(aprox)} ({aprox:.0f}) — ' + (
+            'a perna até aqui mostrou convicção (estrutura limpa, sem sinais de exaustão).' if aprox >= 55 else
+            'a perna até aqui mostrou sinais de esforço crescente sem resultado — possível exaustão.' if aprox < 45 else
+            'aproximação neutra.'))
+    if not pd.isna(rej):
+        partes.append(f'Rejeição {_rotulo_bloco(rej)} ({rej:.0f}) — ' + (
+            'reação decisiva nos toques mais recentes.' if rej >= 55 else
+            'reação fraca ou indecisa nos toques mais recentes.' if rej < 45 else
+            'reação mediana.'))
+    if not partes:
+        return 'Dados insuficientes pra decompor a força desta zona ainda.'
+
+    acao = nivel.get('acao') or {}
+    postura = acao.get('postura')
+    if postura in _POSTURA_TXT:
+        partes.append(_POSTURA_TXT[postura])
+    if postura in ('favorece_entrada', 'aguardar_confirmacao'):
+        mag = _MAGNITUDE_TXT.get(acao.get('magnitude_esperada'))
+        if mag:
+            partes.append(mag)
+    return ' '.join(partes)
+
+
+def _bloco_scores_html(nivel: dict) -> html.Div:
+    """Camada 'dados brutos' dos 3 blocos — números explícitos, não
+    escondidos dentro do texto de interpretação (seção 6.1/8 da spec: nada
+    de black box)."""
+    itens = [('Combustível', nivel.get('combustivel_score')),
+             ('Aproximação', nivel.get('aproximacao_score')),
+             ('Rejeição', nivel.get('rejeicao_score'))]
+    spans = [html.Span(f'{nome} {v:.0f}', style={
+        'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['mono'],
+        'border': f'1px solid {C["border"]}', 'borderRadius': '4px',
+        'padding': '1px 6px', 'marginRight': '4px',
+    }) for nome, v in itens if not pd.isna(v)]
+    return html.Div(spans, style={'marginBottom': '6px'}) if spans else html.Div()
+
+
+def _acao_html(nivel: dict, eh_resistencia: bool) -> html.Div:
+    """Camada 'ação' (seção 6.3) — postura sempre via regra explícita
+    (montar_acao), nunca texto livre; invalidação só aparece quando a
+    postura favorece entrada."""
+    acao = nivel.get('acao') or {}
+    postura = acao.get('postura')
+    if postura not in _POSTURA_LABEL:
+        return html.Div()
+    label, cor_bg, cor_texto = _POSTURA_LABEL[postura]
+    partes = [html.Span(label, style={
+        'fontSize': '9px', 'fontWeight': '700', 'color': cor_texto,
+        'background': cor_bg, 'borderRadius': '4px', 'padding': '2px 6px',
+        'marginRight': '6px', 'letterSpacing': '0.05em',
+    })]
+    mag = acao.get('magnitude_esperada')
+    if mag:
+        partes.append(html.Span(f'magnitude {mag}', style={
+            'fontSize': '10px', 'color': C['text2'], 'marginRight': '8px',
+        }))
+    inval = acao.get('invalidacao')
+    if inval is not None and not pd.isna(inval):
+        direcao_txt = 'acima de' if eh_resistencia else 'abaixo de'
+        partes.append(html.Span(f'invalida se romper {direcao_txt} {_fmt(inval, 0)}', style={
+            'fontSize': '10px', 'color': C['text2'],
+        }))
+    return html.Div(partes, style={'marginBottom': '6px'})
+
+
+def construir_price_action(df: pd.DataFrame, m: dict, expandidos: dict = None) -> html.Div:
     """
     Seção Price Action — sem gráfico de candles (Jesué já tem o seu no ProfitPRO).
     Mostra os N_NIVEIS_SR (default 3) níveis de S/R de cada lado — ordenados
@@ -724,12 +1065,13 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
     prazo que só some quando NÃO está redundante com um dos níveis já
     rankeados acima.
     """
+    expandidos = expandidos or {}
     preco = m.get('preco', np.nan)
     preco_fmt = _fmt(preco, 0)
 
-    tend   = m.get('tendencia', '—')
-    fase   = m.get('fase', '—')
-    saude  = m.get('saude', '—')
+    tend   = m.get('tendencia') or '—'
+    fase   = m.get('fase') or '—'
+    saude  = m.get('saude') or '—'
     candle = str(m.get('tipo_candle', '—')).replace('_', ' ').title()
 
     def _nan(v): return v is None or (isinstance(v, float) and np.isnan(v))
@@ -739,28 +1081,6 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
         if dist_atr <= 0.3: return 'muito próximo'
         if dist_atr <= 1.0: return f'{dist_atr:.1f} ATR de distância'
         return f'{dist_atr:.1f} ATR — longe'
-
-    def _leitura_nivel(toques, eh_resistencia, prob_bounce):
-        """Leitura interpretada do nível, incorporando a % de probabilidade calculada."""
-        prob_txt = f'{prob_bounce:.0f}%' if not _nan(prob_bounce) else '—'
-        romp_txt = f'{100-prob_bounce:.0f}%' if not _nan(prob_bounce) else '—'
-        if tend == 'baixa':
-            if eh_resistencia:
-                return f'Em tendência de baixa ({fase}), probabilidade estimada de {prob_txt} de rejeição ' \
-                       f'nesta resistência (vs. {romp_txt} de rompimento). Candle de força vendedora aqui é trigger potencial.'
-            else:
-                return f'Suporte sob pressão — em tendência de baixa, suportes tendem a ceder. ' \
-                       f'Probabilidade estimada de {prob_txt} de bounce. Observe rompimento com volume e candle forte.'
-        elif tend == 'alta':
-            if eh_resistencia:
-                return f'Resistência em tendência de alta, saúde {saude}. Probabilidade estimada de {romp_txt} ' \
-                       f'de rompimento com continuidade em fase de {fase} (vs. {prob_txt} de rejeição).'
-            else:
-                return f'Suporte em tendência de alta, saúde {saude}. Probabilidade estimada de {prob_txt} de bounce. ' \
-                       f'Procure candle de reversão ou pin comprador.'
-        else:
-            return f'Mercado lateral — S/R em lateralização tem comportamento de range. ' \
-                   f'Probabilidade estimada de {prob_txt} de reação nesta borda. Operar rejeições, não rompimentos.'
 
     _STATUS_LABEL = {
         'aguardando_pullback': ('AGUARDANDO PULLBACK', C['yellow']),
@@ -806,6 +1126,24 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
                 'background': C['blue'], 'borderRadius': '4px',
                 'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
             }))
+        # Reversão de papel (bipolaridade) — diferente do badge acima: aquele
+        # marca a zona ANTIGA (que rompeu e gerou um espelho); este marca a
+        # zona NOVA (o espelho em si), que sem isso nunca contava a própria
+        # origem (achado real 2026-07-13, ver metricas._info_bipolar).
+        bip = nivel.get('bipolar')
+        narrativa_bipolar = None
+        if bip and bip.get('papel_no_cruzamento') == 'espelho':
+            badges.append(html.Span('REVERSÃO DE PAPEL', style={
+                'fontSize': '9px', 'fontWeight': '700', 'color': '#fff',
+                'background': C['blue'], 'borderRadius': '4px',
+                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
+            }))
+            papel_antigo = 'suporte' if eh_resistencia else 'resistência'
+            papel_novo = 'resistência' if eh_resistencia else 'suporte'
+            narrativa_bipolar = (
+                f'Nasceu de um(a) {papel_antigo} rompido(a) em {_fmt_ts(bip["timestamp_rompimento"])} '
+                f'— reteste confirmado às {_fmt_ts(bip["timestamp_reteste"])}, hoje opera como {papel_novo}.'
+            )
         # Sinal intradiário — escopo do próprio pregão, independente do status
         # estrutural acima (ver comentário em features.py::calcular_zonas_sr).
         romp_hoje = nivel.get('rompimento_hoje', 'nenhum')
@@ -823,6 +1161,33 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
             }))
 
         borda_cor = C['gold'] if destaque else cor
+
+        lado = 'acima' if eh_resistencia else 'abaixo'
+        chave = f'{lado}_{nivel["rank"]}'
+        expandido = bool(expandidos.get(chave, False))
+        regime = nivel.get('regime')
+        corpo_timeline = []
+        if regime and (regime['regime_atual']['detalhes'] or (regime['regime_antigo'] and regime['regime_antigo']['detalhes'])):
+            total = regime['regime_atual']['toques'] + (regime['regime_antigo']['toques'] if regime['regime_antigo'] else 0)
+            corpo_timeline.append(html.Button(
+                f"{'▾' if expandido else '▸'} Ver histórico de toques ({total})",
+                id={'type': 'timeline-toggle', 'index': chave}, n_clicks=0,
+                style={'background': 'transparent', 'border': 'none', 'color': C['text2'],
+                       'fontSize': '11px', 'cursor': 'pointer', 'padding': '4px 0', 'textAlign': 'left'},
+            ))
+            if expandido:
+                if regime['regime_atual']['detalhes']:
+                    corpo_timeline.append(html.Div('REGIME ATUAL', style={
+                        'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
+                        'letterSpacing': '0.06em', 'marginTop': '6px',
+                    }))
+                    corpo_timeline += [_linha_toque_html(d) for d in regime['regime_atual']['detalhes']]
+                if regime['regime_antigo'] and regime['regime_antigo']['detalhes']:
+                    corpo_timeline.append(html.Div('REGIME ANTERIOR', style={
+                        'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
+                        'letterSpacing': '0.06em', 'marginTop': '8px',
+                    }))
+                    corpo_timeline += [_linha_toque_html(d) for d in regime['regime_antigo']['detalhes']]
 
         return html.Div([
             html.Div([
@@ -848,13 +1213,22 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
                 style={'fontSize': '12px', 'fontWeight': '600', 'color': cor,
                        'fontFamily': FONTS['display'], 'marginBottom': '6px'}
             ),
-            html.Div(_leitura_nivel(toques, eh_resistencia, prob), style={
+            _bloco_scores_html(nivel),
+            html.Div(narrativa_bipolar, style={
+                'fontSize': '11px', 'color': C['blue'], 'fontFamily': FONTS['body'],
+                'lineHeight': '1.4', 'marginBottom': '6px',
+            }) if narrativa_bipolar else html.Div(),
+            html.Div(_leitura_nivel(nivel, eh_resistencia), style={
                 'fontSize': '12px', 'color': C['text'],
                 'fontFamily': FONTS['body'], 'lineHeight': '1.5',
                 'borderLeft': f'3px solid {cor}', 'paddingLeft': '10px',
+                'marginBottom': '6px',
             }),
+            _acao_html(nivel, eh_resistencia),
+            html.Div(corpo_timeline, style={'marginTop': '8px'}) if corpo_timeline else html.Div(),
         ], style={
             'background': C['panel'], 'border': f'1px solid {C["border"]}',
+            'boxShadow': 'var(--shadow-card)',
             'borderLeft': f'3px solid {borda_cor}',
             'borderRadius': '10px', 'padding': '14px', 'marginBottom': '10px',
         })
@@ -876,6 +1250,40 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
             }),
         ], style={
             'background': C['bg'], 'border': f'1px dashed {C["border"]}',
+            'borderRadius': '8px', 'padding': '8px 12px', 'marginBottom': '10px',
+        })
+
+    def _card_pivo_em_formacao(pivo: dict, eh_resistencia: bool) -> html.Div:
+        """Card discreto (borda pontilhada) pro candidato a topo/fundo AINDA
+        sem confirmação — distinto de `_card_pivo_imediato` (que só mostra
+        pivôs JÁ confirmados). Responde "esse preço extremo (ex.: mínima do
+        dia) já é um fundo validado, ou ainda está esperando confirmação?"
+        (achado real 2026-07-13 — ver features.detectar_pivo_em_formacao)."""
+        cor = C['red'] if eh_resistencia else C['green']
+        label = 'Topo em formação' if eh_resistencia else 'Fundo em formação'
+        confirmadas, faltam = pivo['confirmadas'], pivo['faltam']
+        oposto = 'menores' if eh_resistencia else 'maiores'
+        return html.Div([
+            html.Span(f'{label}: ', style={
+                'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+            }),
+            html.Span(_fmt(pivo['preco'], 0), style={
+                'fontSize': '14px', 'fontWeight': '700',
+                'fontFamily': FONTS['mono'], 'color': cor,
+            }),
+            html.Span('  AINDA SEM CONFIRMAÇÃO', style={
+                'fontSize': '10px', 'fontWeight': '700', 'color': C['bg'],
+                'background': C['yellow'], 'borderRadius': '4px', 'padding': '1px 6px',
+                'letterSpacing': '0.05em', 'marginLeft': '4px',
+            }),
+            html.Div(
+                f'{confirmadas} de {confirmadas + faltam} candles de confirmação — faltam {faltam} '
+                f'candle{"s" if faltam != 1 else ""} com máxima e mínima {oposto} pra virar '
+                f'{"topo" if eh_resistencia else "fundo"} validado.',
+                style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'], 'marginTop': '4px'},
+            ),
+        ], style={
+            'background': C['bg'], 'border': f'1px dotted {C["border"]}',
             'borderRadius': '8px', 'padding': '8px 12px', 'marginBottom': '10px',
         })
 
@@ -916,6 +1324,7 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
     ], style={
         'display': 'flex', 'gap': '24px',
         'background': C['panel'], 'border': f'1px solid {C["border"]}',
+        'boxShadow': 'var(--shadow-card)',
         'borderRadius': '12px', 'padding': '20px',
         'marginBottom': '12px',
     })
@@ -949,6 +1358,13 @@ def construir_price_action(df: pd.DataFrame, m: dict) -> html.Div:
     pivo_abaixo = m.get('pivo_imediato_abaixo')
     if pivo_abaixo:
         cards_suporte.append(_card_pivo_imediato(pivo_abaixo, eh_resistencia=False))
+
+    pivo_formacao_acima = m.get('pivo_em_formacao_acima')
+    if pivo_formacao_acima:
+        cards_resistencia.append(_card_pivo_em_formacao(pivo_formacao_acima, eh_resistencia=True))
+    pivo_formacao_abaixo = m.get('pivo_em_formacao_abaixo')
+    if pivo_formacao_abaixo:
+        cards_suporte.append(_card_pivo_em_formacao(pivo_formacao_abaixo, eh_resistencia=False))
 
     return html.Div([
         secao('PRICE ACTION'),
@@ -1002,6 +1418,7 @@ def construir_big_players(df: pd.DataFrame) -> html.Div:
         ], style={
             'background': C['panel'],
             'border': f'1px solid {C["border"]}',
+            'boxShadow': 'var(--shadow-card)',
             'borderLeft': f'3px solid {cor}',
             'borderRadius': '10px', 'padding': '12px 14px',
             'flex': '1', 'minWidth': '200px',
@@ -1023,6 +1440,7 @@ def construir_big_players(df: pd.DataFrame) -> html.Div:
                 ),
             ], style={
                 'background': C['panel'], 'border': f'1px solid {C["border"]}',
+                'boxShadow': 'var(--shadow-card)',
                 'borderRadius': '10px', 'padding': '14px',
             }),
         ])
@@ -1166,6 +1584,7 @@ def construir_big_players(df: pd.DataFrame) -> html.Div:
     ], style={
         'background': C['panel'],
         'border': f'1px solid {C["border"]}',
+        'boxShadow': 'var(--shadow-card)',
         'borderLeft': f'3px solid {C["gold"]}',
         'borderRadius': '10px', 'padding': '14px',
         'marginTop': '12px',
@@ -1207,6 +1626,7 @@ def construir_rastreador_tendencia(analise: dict) -> html.Div:
             }),
         ], style={
             'background': C['panel'], 'border': f'1px solid {C["border"]}',
+            'boxShadow': 'var(--shadow-card)',
             'borderRadius': '10px', 'padding': '16px',
         })
 
@@ -1275,8 +1695,326 @@ def construir_rastreador_tendencia(analise: dict) -> html.Div:
         }),
     ], style={
         'background': C['panel'], 'border': f'1px solid {C["border"]}',
+        'boxShadow': 'var(--shadow-card)',
         'borderRadius': '10px', 'padding': '16px',
     })
+
+
+def _linha_toque_html(d: dict) -> html.Div:
+    """Uma linha da timeline expandida de toques — data/hora, qualidade do
+    pivô (forte/fraco) e rejeição, formato compacto."""
+    return html.Div(
+        f"{_fmt_ts(d['timestamp'])} — toque {d['tipo_pivo']} em {d['preco']:,.0f} "
+        f"(rejeição {d['rejeicao']*100:.0f}%)",
+        style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['mono'],
+               'padding': '1px 0'},
+    )
+
+
+def _card_estudo_tracado(analise: dict, expandido: bool = False) -> html.Div:
+    """Um card por traçado manual — mesma linguagem de
+    `construir_rastreador_tendencia`, mais um botão de apagar. Badge FORTE
+    e leitura vêm do REGIME ATUAL (`metricas.montar_regime`), não mais do
+    agregado do histórico inteiro — achado real (2026-07-13): níveis
+    dentro de uma consolidação longa vinham sempre "FORTE" contando toques
+    fracos (1 candle de confirmação) espalhados por meses. Mostra também a
+    narrativa de bipolaridade quando o traçado coincide com uma zona do
+    motor automático que já reverteu de papel (`cruzamento_automatico`)."""
+    tipo = analise.get('tipo', 'suporte')
+    eh_suporte = (tipo == 'suporte')
+    cor = C['green'] if eh_suporte else C['red']
+    prob = analise.get('prob_bounce', 50.0)
+    violado = analise.get('violado', False)
+    janela = analise.get('janela', 0)
+
+    regime = analise.get('regime') or {
+        'tem_divisao': False, 'fronteira_timestamp': None,
+        'regime_atual': {'toques': analise.get('toques', 0), 'toques_fortes': 0,
+                          'forte': analise.get('forte', False), 'detalhes': []},
+        'regime_antigo': None,
+    }
+    atual = regime['regime_atual']
+    antigo = regime['regime_antigo']
+    forte = atual['forte']
+    toques_total = atual['toques'] + (antigo['toques'] if antigo else 0)
+
+    badges = []
+    if forte:
+        badges.append(html.Span('FORTE', style={
+            'fontSize': '10px', 'fontWeight': '700', 'color': C['bg'],
+            'background': C['gold'], 'borderRadius': '4px',
+            'padding': '2px 8px', 'marginRight': '6px', 'letterSpacing': '0.05em',
+        }))
+    if violado:
+        badges.append(html.Span('VIOLADO', style={
+            'fontSize': '10px', 'fontWeight': '700', 'color': '#fff',
+            'background': C['red'], 'borderRadius': '4px',
+            'padding': '2px 8px', 'marginRight': '6px', 'letterSpacing': '0.05em',
+        }))
+
+    cruzamento = analise.get('cruzamento_automatico')
+    bip = cruzamento.get('bipolar') if cruzamento else None
+    narrativa_bipolar = None
+    # Diferente de _card_nivel_sr (Price Action): ali o gate em 'espelho'
+    # evita duplicar a badge "ZONA ESPELHO" já mostrada no card da zona
+    # ANTIGA. Aqui não existe card da zona antiga — o traçado é um preço
+    # isolado — então QUALQUER bipolaridade encontrada (origem ou espelho)
+    # já é a informação nova que falta mostrar. `localizar_zona_automatica`
+    # hoje só casa pelo zona_min/zona_max da zona ORIGINAL (mesma faixa da
+    # espelho, herdada), então `papel_no_cruzamento` vem sempre 'origem'
+    # pra um traçado — exigir 'espelho' aqui nunca disparava (bug real,
+    # corrigido 2026-07-13).
+    if bip:
+        badges.append(html.Span('REVERSÃO DE PAPEL', style={
+            'fontSize': '10px', 'fontWeight': '700', 'color': '#fff',
+            'background': C['blue'], 'borderRadius': '4px',
+            'padding': '2px 8px', 'marginRight': '6px', 'letterSpacing': '0.05em',
+        }))
+        papel_antigo = 'resistência' if eh_suporte else 'suporte'
+        narrativa_bipolar = (
+            f'Esta região era {papel_antigo} até romper em {_fmt_ts(bip["timestamp_rompimento"])} '
+            f'— reteste confirmado às {_fmt_ts(bip["timestamp_reteste"])}, hoje atua como {tipo}.'
+        )
+
+    if violado:
+        leitura = (f'Nível rompido — perdeu o papel de {"suporte" if eh_suporte else "resistência"} '
+                   f'no histórico analisado.')
+    elif regime['tem_divisao']:
+        fronteira_fmt = _fmt_ts(regime['fronteira_timestamp'])
+        if forte:
+            leitura = (f'Testado {atual["toques"]}x e respeitado no regime atual (desde {fronteira_fmt}) '
+                       f'— mesma doutrina do S/R automático ({"suporte" if eh_suporte else "resistência"} estrutural).')
+        elif atual['toques'] == 0:
+            if antigo and antigo['toques']:
+                leitura = (f'Sem toque ainda no regime atual (desde {fronteira_fmt}). Havia '
+                           f'{antigo["toques"]} toques num regime anterior, mas isso não conta pra '
+                           f'doutrina de nível estrutural — o comportamento do mercado mudou aqui.')
+            else:
+                leitura = f'Sem toque registrado desde {fronteira_fmt} — sem histórico recente pra confirmar.'
+        else:
+            leitura = (f'Tocado {atual["toques"]}x no regime atual (desde {fronteira_fmt}), ainda sem '
+                       f'confirmação forte — acompanhar antes de considerar operacional.')
+    elif atual['toques'] == 0:
+        leitura = 'Ainda sem toque registrado nesse nível — sem histórico pra confirmar se seria respeitado.'
+    elif forte:
+        leitura = (f'Testado {atual["toques"]}x e respeitado — mesma doutrina do S/R automático '
+                   f'({"suporte" if eh_suporte else "resistência"} estrutural).')
+    else:
+        leitura = f'Tocado {atual["toques"]}x, ainda sem confirmação forte — acompanhar antes de considerar operacional.'
+
+    corpo_timeline = []
+    if toques_total:
+        corpo_timeline.append(html.Button(
+            f"{'▾' if expandido else '▸'} Ver histórico de toques ({toques_total})",
+            id={'type': 'timeline-toggle', 'index': analise['id_tracado']}, n_clicks=0,
+            style={'background': 'transparent', 'border': 'none', 'color': C['text2'],
+                   'fontSize': '11px', 'cursor': 'pointer', 'padding': '4px 0', 'textAlign': 'left'},
+        ))
+        if expandido:
+            if atual['detalhes']:
+                corpo_timeline.append(html.Div('REGIME ATUAL', style={
+                    'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
+                    'letterSpacing': '0.06em', 'marginTop': '6px',
+                }))
+                corpo_timeline += [_linha_toque_html(d) for d in atual['detalhes']]
+            if antigo and antigo['detalhes']:
+                corpo_timeline.append(html.Div('REGIME ANTERIOR', style={
+                    'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
+                    'letterSpacing': '0.06em', 'marginTop': '8px',
+                }))
+                corpo_timeline += [_linha_toque_html(d) for d in antigo['detalhes']]
+
+    return html.Div([
+        html.Div([
+            html.Div([
+                html.Div(f"{analise['linha_atual']:,.0f}", style={
+                    'fontSize': '22px', 'fontWeight': '700', 'fontFamily': FONTS['mono'], 'color': cor,
+                }),
+                html.Div(tipo.upper(), style={
+                    'fontSize': '11px', 'color': cor, 'fontFamily': FONTS['display'],
+                    'fontWeight': '700', 'letterSpacing': '0.05em',
+                }),
+            ], style={'flex': '1'}),
+            html.Button('🗑', id={'type': 'del-tracado', 'index': analise['id_tracado']},
+                        n_clicks=0, title='Remover traçado', style={
+                            'background': 'transparent', 'border': f'1px solid {C["border"]}',
+                            'borderRadius': '6px', 'color': C['text2'], 'cursor': 'pointer',
+                            'padding': '4px 10px', 'fontSize': '13px',
+                        }),
+        ], style={'display': 'flex', 'alignItems': 'flex-start', 'marginBottom': '10px'}),
+        html.Div(badges, style={'marginBottom': '8px'}) if badges else html.Div(),
+        html.Div(f'{toques_total} toque{"s" if toques_total != 1 else ""} no histórico analisado ({janela} candles)', style={
+            'fontSize': '13px', 'color': C['text2'], 'fontFamily': FONTS['display'], 'marginBottom': '6px',
+        }),
+        html.Div(f'Probabilidade: {prob:.0f}% bounce · {100-prob:.0f}% rompimento', style={
+            'fontSize': '13px', 'fontWeight': '600', 'color': cor,
+            'fontFamily': FONTS['display'], 'marginBottom': '8px',
+        }),
+        _bloco_scores_html(analise),
+        html.Div(narrativa_bipolar, style={
+            'fontSize': '12px', 'color': C['blue'], 'fontFamily': FONTS['body'],
+            'lineHeight': '1.4', 'marginBottom': '8px',
+        }) if narrativa_bipolar else html.Div(),
+        html.Div(leitura, style={
+            'fontSize': '13px', 'color': C['text'], 'fontFamily': FONTS['body'],
+            'lineHeight': '1.5', 'borderLeft': f'3px solid {cor}', 'paddingLeft': '10px',
+            'marginBottom': '8px',
+        }),
+        _acao_html(analise, not eh_suporte),
+        html.Div(corpo_timeline, style={'marginTop': '10px'}) if corpo_timeline else html.Div(),
+    ], style={
+        'background': C['panel'], 'border': f'1px solid {C["border"]}',
+        'boxShadow': 'var(--shadow-card)',
+        'borderRadius': '10px', 'padding': '16px', 'marginBottom': '12px',
+    })
+
+
+def construir_estudos_tracados(analises: list, expandidos: dict = None) -> html.Div:
+    """Seção "Estudos" da aba Traçados — um card por traçado manual (ver
+    `_card_estudo_tracado`). Mesma informação da aba Price Action, mas
+    capturando os traçados do gráfico em vez dos níveis automáticos do
+    motor de S/R."""
+    if not analises:
+        return html.Div(
+            'Nenhum traçado ainda — use a ferramenta "Nível S/R" na barra acima '
+            'para marcar um nível no gráfico.',
+            style={'padding': '20px', 'textAlign': 'center', 'color': C['text2'], 'fontSize': '13px'},
+        )
+    expandidos = expandidos or {}
+    return html.Div([_card_estudo_tracado(a, expandidos.get(a['id_tracado'], False)) for a in analises])
+
+
+_OPCOES_ESPESSURA_TRACADO = [{'label': f'{n}px', 'value': n} for n in (1, 2, 3, 4)]
+_OPCOES_ESTILO_TRACADO = [
+    {'label': 'Sólida', 'value': 'solid'},
+    {'label': 'Tracejada', 'value': 'dashed'},
+    {'label': 'Pontilhada', 'value': 'dotted'},
+]
+# Paleta curada em vez de um seletor de cor nativo — Dash 4.3 não tem
+# `html.Input` (não existe no pacote `dash.html` desta versão) e o `type`
+# de `dcc.Input` não aceita 'color' (só text/number/password/email/range/
+# search/tel/url/hidden, checado em runtime). Swatches reaproveitam as
+# cores já usadas no resto do projeto (S/R automático + destaque padrão),
+# então cada opção já tem um significado reconhecível, não é decoração.
+_CORES_TRACADO = [
+    ('#C8A96E', 'Dourado (padrão)'), ('#2ECC8A', 'Verde'), ('#E05C5C', 'Vermelho'),
+    ('#4A90D9', 'Azul'), ('#8888AA', 'Cinza'), ('#FFFFFF', 'Branco'),
+]
+
+
+def _swatch_cor_tracado(hexcor: str, titulo: str, selecionada: bool) -> html.Button:
+    return html.Button('', id={'type': 'tracado-cor-swatch', 'cor': hexcor}, n_clicks=0,
+                        title=titulo, style={
+                            'width': '28px', 'height': '28px', 'borderRadius': '6px',
+                            'background': hexcor, 'cursor': 'pointer', 'padding': '0',
+                            'border': f'2px solid {C["gold"] if selecionada else C["border"]}',
+                            'boxShadow': f'0 0 0 2px {C["panel"]}, 0 0 0 3px {C["gold"]}' if selecionada else 'none',
+                        })
+
+
+def _swatches_cor_tracado(cor_atual: str) -> list:
+    return [_swatch_cor_tracado(hexcor, titulo, hexcor == cor_atual) for hexcor, titulo in _CORES_TRACADO]
+
+
+def _modal_editar_tracado(id_tracado: str, ativo: str) -> html.Div | None:
+    """Popup de edição de um traçado — aberto por duplo clique na linha
+    (ver assets/lwchart.js::wireFerramentaDesenho). Preço/cor/espessura/
+    estilo, os 4 campos editáveis de um traçado horizontal (schema em
+    tracados.py). Mesmo padrão de overlay (backdrop escurecido + painel
+    centralizado) já usado em diario_app_classico.py::_overlay."""
+    ativo_real = ativo or 'WIN'
+    df = tracados.listar_tracados(ativo_real)
+    linha = df[df['id_tracado'] == id_tracado]
+    if linha.empty:
+        return None
+    t = linha.iloc[0]
+    cor_atual = t['cor'] if pd.notna(t['cor']) else C['gold']
+
+    def _campo(rotulo, componente):
+        return html.Div([
+            html.Label(rotulo, style={
+                'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                'textTransform': 'uppercase', 'letterSpacing': '0.05em',
+                'display': 'block', 'marginBottom': '6px',
+            }),
+            componente,
+        ], style={'marginBottom': '16px'})
+
+    estilo_campo = {
+        'width': '100%', 'background': C['bg'], 'color': C['text'],
+        'border': f'1px solid {C["border"]}', 'borderRadius': '6px',
+        'padding': '8px 10px', 'fontFamily': FONTS['mono'], 'fontSize': '14px',
+        'boxSizing': 'border-box',
+    }
+
+    conteudo = html.Div([
+        html.Div('Editar Traçado', style={
+            'fontSize': '15px', 'fontWeight': '700', 'fontFamily': FONTS['display'],
+            'color': C['text'], 'marginBottom': '16px',
+        }),
+        _campo('Preço', dcc.Input(
+            # round() — `coordinateToPrice()` no clique original devolve
+            # até 10+ casas decimais de ruído de ponto flutuante (nunca um
+            # preço "redondo"); mostrar isso cru no campo é só lixo visual
+            # e piora o risco de erro de digitação. `step='any'` evita o
+            # navegador marcar o campo como inválido (e devolver '' pro
+            # Dash) em qualquer valor decimal, independente de locale.
+            id='tracado-editar-preco', type='number', value=round(float(t['preco']), 2),
+            step='any', style=estilo_campo,
+        )),
+        dcc.Store(id='tracado-editar-cor', data=cor_atual),
+        _campo('Cor', html.Div(
+            _swatches_cor_tracado(cor_atual),
+            id='tracado-editar-cor-swatches',
+            style={'display': 'flex', 'gap': '8px'},
+        )),
+        _campo('Espessura', dcc.Dropdown(
+            id='tracado-editar-espessura', options=_OPCOES_ESPESSURA_TRACADO,
+            value=int(t['espessura']), clearable=False, searchable=False,
+            style={'fontFamily': FONTS['body'], 'fontSize': '13px'},
+        )),
+        _campo('Tipo de linha', dcc.Dropdown(
+            id='tracado-editar-estilo', options=_OPCOES_ESTILO_TRACADO,
+            value=t['estilo'], clearable=False, searchable=False,
+            style={'fontFamily': FONTS['body'], 'fontSize': '13px'},
+        )),
+        html.Div([
+            html.Button('Excluir', id='btn-tracado-editar-excluir', n_clicks=0, style={
+                'background': 'transparent', 'color': C['red'],
+                'border': f'1px solid {C["red"]}', 'borderRadius': '6px',
+                'padding': '8px 16px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
+                'fontSize': '13px', 'fontWeight': '600',
+            }),
+            html.Div(style={'flex': '1'}),
+            html.Button('Cancelar', id='btn-tracado-editar-cancelar', n_clicks=0, style={
+                'background': 'transparent', 'color': C['text2'],
+                'border': f'1px solid {C["border"]}', 'borderRadius': '6px',
+                'padding': '8px 16px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
+                'fontSize': '13px', 'marginRight': '8px',
+            }),
+            html.Button('Salvar', id='btn-tracado-editar-salvar', n_clicks=0, style={
+                'background': C['gold'], 'color': C['bg'],
+                'border': 'none', 'borderRadius': '6px',
+                'padding': '8px 20px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
+                'fontSize': '13px', 'fontWeight': '700',
+            }),
+        ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '4px'}),
+    ], style={
+        'background': C['panel'], 'border': f'1px solid {C["border"]}',
+        'borderRadius': '12px', 'padding': '24px', 'width': '320px',
+        'boxShadow': '0 8px 40px rgba(0,0,0,0.6)',
+    })
+
+    return html.Div([
+        html.Div(id='tracado-editar-backdrop', n_clicks=0, style={
+            'position': 'fixed', 'top': 0, 'left': 0, 'right': 0, 'bottom': 0,
+            'background': 'rgba(0,0,0,0.7)', 'zIndex': 9998,
+        }),
+        html.Div(conteudo, style={
+            'position': 'fixed', 'top': '50%', 'left': '50%',
+            'transform': 'translate(-50%, -50%)', 'zIndex': 9999,
+        }),
+    ])
 
 
 def _placeholder_aba(nome: str) -> html.Div:
@@ -1312,6 +2050,10 @@ app.layout = html.Div([
     # Store do ativo selecionado
     dcc.Store(id='store-ativo', data='WIN'),
     dcc.Store(id='store-metricas', data={}),
+    # Qual velocímetro do hero está com o balão explicativo aberto — setado
+    # via clique client-side (assets/hero_gauges.js), nunca por n_clicks do
+    # Dash (ver comentário em construir_hero sobre por quê).
+    dcc.Store(id='store-gauge-selecionado', data='forca'),
 
     # Candles pro gráfico Lightweight Charts do Hero — 2 stores, 2
     # cadências (mesmo padrão do SQ'98, ver dashboard_98.py): o histórico
@@ -1340,8 +2082,42 @@ app.layout = html.Div([
     dcc.Store(id='store-mme21-live', data={'ativo': None, 'ponto': None}),
     dcc.Store(id='store-mme21-visivel', data=True),
 
+    # Traçados manuais (aba "Traçados", ver tracados.py) — 2 direções, pra
+    # nunca a mão do usuário competir com um redraw do servidor no meio de
+    # um arraste (ver comentário completo em assets/lwchart.js):
+    # store-tracado-criar/store-tracado-mover (cliente -> Python, via
+    # dash_clientside.set_props) só persistem + recalculam Estudos, NUNCA
+    # redesenham o gráfico; store-tracados-servidor (Python -> cliente) é
+    # quem dispara o redesenho (carga inicial + depois de criar/apagar/editar).
+    dcc.Store(id='store-tracado-criar'),
+    dcc.Store(id='store-tracado-mover'),
+    dcc.Store(id='store-tracados-servidor', data=[]),
+
+    # Estado de expandir/colapsar a timeline de toques (Price Action E
+    # Estudos dos Traçados) — dict {chave_card: bool}, chave estável
+    # (id_tracado ou 'acima_1'/'abaixo_2' etc.) pra sobreviver ao
+    # re-render completo que cada tick já faz.
+    dcc.Store(id='store-timeline-expandida', data={}),
+
+    # Popup de edição (duplo clique numa linha, ver assets/lwchart.js) —
+    # guarda só o id_tracado sendo editado; None = popup fechado. Renderiza
+    # dentro de 'tracado-overlay-editar' (fora da árvore das abas, mesmo
+    # padrão de diario-overlay-detalhe em diario_app_classico.py).
+    dcc.Store(id='store-tracado-editar'),
+
     # Store da aba ativa do cabeçalho (QUANT LAB/BACKTESTING/DIÁRIO/CONFIGURAÇÕES)
     dcc.Store(id='store-aba-ativa', data='lab'),
+
+    # Tema claro/escuro (2026-07-17) — `storage_type='local'` persiste no
+    # localStorage do navegador, sobrevive a reload/restart do servidor.
+    # `store-tema-dummy` é o Output do clientside_callback que aplica o
+    # tema (data-theme + gauges + postMessage pro iframe do Diário) — tem
+    # que ser um Output PRÓPRIO, não `scroll-dummy` (todo uso existente de
+    # scroll-dummy é allow_duplicate=True + prevent_initial_call=True; aqui
+    # precisamos do oposto — aplicar o tema restaurado do localStorage JÁ
+    # na carga inicial, não só depois do 1º clique da sessão).
+    dcc.Store(id='store-tema', data='light', storage_type='local'),
+    dcc.Store(id='store-tema-dummy'),
 
     # Interval rápido — 1s: atualiza preço, candle atual, fluxo
     dcc.Interval(id='interval-live', interval=1_000, n_intervals=0),
@@ -1350,6 +2126,10 @@ app.layout = html.Div([
     # Sincronização de posições abertas — cadência própria (ver comentário
     # junto de `sincronizar_posicoes`).
     dcc.Interval(id='interval-posicao-sync', interval=3_000, n_intervals=0),
+    # Reconciliação MT5×diário — 5min, roda em background e silencioso
+    # (feedback diário.txt, 2026-07-11: deixou de ser aba manual). Ver
+    # `_reconciliar_background`/`resumo_reconciliacao`.
+    dcc.Interval(id='interval-reconciliacao', interval=300_000, n_intervals=0),
 
     # =========================================================================
     # CABEÇALHO — navegação em 4 abas
@@ -1371,6 +2151,7 @@ app.layout = html.Div([
                           style=_estilo_aba(key, 'lab'))
               for label, key in [
                 ('QUANT LAB', 'lab'),
+                ('TRAÇADOS', 'tracados'),
                 ('BACKTESTING', 'back'),
                 ('DIÁRIO', 'diary'),
                 ('CONFIGURAÇÕES', 'config'),
@@ -1379,6 +2160,19 @@ app.layout = html.Div([
 
         # Status de conexão fixo no cabeçalho
         html.Div([
+            # Seletor WIN / WDO — movido do hero pro cabeçalho em 2026-07-15
+            # (fica visível em qualquer aba, não só no Quant Lab). Estático,
+            # nunca recriado (só o `style` de cada botão muda, via callback
+            # dedicado `atualizar_estilo_ativo_selecionado`) — ver docstring
+            # de `construir_hero` sobre por que isso é obrigatório.
+            html.Div([
+                html.Button('WIN', id='btn-win', n_clicks=0,
+                            className='btn-ativo',
+                            style=_estilo_botao_ativo('WIN', 'WIN')),
+                html.Button('WDO', id='btn-wdo', n_clicks=0,
+                            className='btn-ativo',
+                            style=_estilo_botao_ativo('WDO', 'WIN')),
+            ], style={'display': 'flex', 'gap': '6px', 'justifyContent': 'flex-end', 'marginBottom': '6px'}),
             html.Span(id='status-conexao', children='Inicializando...',
                       style={'fontSize': '11px', 'color': C['text2'],
                              'fontFamily': FONTS['display']}),
@@ -1423,34 +2217,21 @@ app.layout = html.Div([
                         'fontSize': '14px', 'padding': '20px',
                     })
                 ]),
-                # Seletor WIN / WDO / WIN×WDO — estático, nunca recriado
-                # (só o `style` de cada botão muda, via callback dedicado
-                # `atualizar_estilo_ativo_selecionado`). Ver comentário em
-                # `construir_hero`.
-                html.Div([
-                    html.Div('ATIVO', style={
-                        'fontSize': '10px', 'color': C['text2'],
-                        'fontFamily': FONTS['display'], 'marginBottom': '8px',
-                        'letterSpacing': '0.08em',
-                    }),
-                    html.Div([
-                        html.Button('WIN', id='btn-win', n_clicks=0,
-                                    className='btn-ativo',
-                                    style=_estilo_botao_ativo('WIN', 'WIN')),
-                        html.Button('WDO', id='btn-wdo', n_clicks=0,
-                                    className='btn-ativo',
-                                    style=_estilo_botao_ativo('WDO', 'WIN')),
-                        html.Button('WIN × WDO', id='btn-correlacao', n_clicks=0,
-                                    className='btn-ativo',
-                                    style=_estilo_botao_ativo('CORRELACAO', 'WIN')),
-                    ], style={'display': 'flex', 'gap': '8px'}),
-                ], style={'flex': '1', 'padding': '0 24px'}),
             ], style={
                 'display': 'flex', 'alignItems': 'center',
                 'gap': '16px', 'flexWrap': 'wrap',
             }),
+            # Balão explicativo — estático (fora de hero-conteudo, nunca
+            # recriado pelo tick de 1s), só muda via clique num gauge
+            # (assets/hero_gauges.js + store-gauge-selecionado).
+            html.Div(_balao_explicacao_gauge('forca'), id='balao-gauge-explicacao'),
         ], style={
-            'background': f'linear-gradient(135deg, {C["panel"]} 0%, #0E0E18 100%)',
+            # #0E0E18 era hardcoded (não fazia parte do dicionário C) — nunca
+            # acompanhava o tema, ficando escuro até no modo claro
+            # (2026-07-17, achado real no screenshot de verificação).
+            # var(--bg) é semanticamente equivalente (quase-preto no escuro,
+            # cinza claro no claro) e já theme-aware de graça.
+            'background': f'linear-gradient(135deg, {C["panel"]} 0%, {C["bg"]} 100%)',
             'border': f'1px solid {C["border"]}',
             'borderRadius': '14px', 'padding': '24px',
             'marginBottom': '24px',
@@ -1468,6 +2249,7 @@ app.layout = html.Div([
         html.Div([
             html.Div([
                 html.Div(id='lw-chart-price-action', style={'width': '100%', 'height': '100%'}),
+                _botao_reset_zoom('btn-reset-zoom'),
                 _botao_toggle_sr('btn-sr-toggle'),
                 _botao_toggle_mme21('btn-mme21-toggle'),
             ], style={
@@ -1509,13 +2291,77 @@ app.layout = html.Div([
           ),
       ]),
 
+      # PAINEL TRAÇADOS — oculto por padrão, só visível quando
+      # store-aba-ativa == 'tracados'. Gráfico grande + barra de
+      # ferramentas de desenho (ver assets/lwchart.js) + seção "Estudos"
+      # (mesma informação da aba Price Action, mas pros traçados manuais —
+      # ver construir_estudos_tracados/metricas.analisar_tracados). Só a
+      # ferramenta "Nível S/R" funciona por enquanto — LTA/LTB/Canal/Figura
+      # aparecem desabilitados ("em breve"), roadmap registrado em
+      # tracados.py.
+      html.Div(id='painel-tracados', style={'display': 'none'}, children=[
+          secao('TRAÇADOS'),
+          html.Div([
+              html.Button('🖱 Cursor', id='btn-tracado-cursor',
+                          className='tracado-tool-btn tracado-tool-ativa',
+                          **{'data-tracado-tool': 'cursor'}),
+              html.Button('— Nível S/R', id='btn-tracado-horizontal',
+                          className='tracado-tool-btn',
+                          **{'data-tracado-tool': 'horizontal'}),
+              html.Button('↗ LTA/LTB', disabled=True, title='Em breve', className='tracado-tool-btn'),
+              html.Button('▱ Canal', disabled=True, title='Em breve', className='tracado-tool-btn'),
+              html.Button('△ Figura', disabled=True, title='Em breve', className='tracado-tool-btn'),
+          ], style={'display': 'flex', 'gap': '8px', 'marginBottom': '12px', 'flexWrap': 'wrap'}),
+          html.Div([
+              html.Div(id='lw-chart-tracados', style={'width': '100%', 'height': '100%'}),
+              _botao_reset_zoom('btn-reset-zoom-tracados'),
+              _botao_toggle_sr('btn-sr-toggle-tracados'),
+              _botao_toggle_mme21('btn-mme21-toggle-tracados'),
+          ], style={
+              'height': '520px', 'marginBottom': '20px', 'position': 'relative',
+              'background': C['bg'], 'border': f'1px solid {C["border"]}',
+              'borderRadius': '10px',
+          }),
+          html.Div([
+              secao('ESTUDOS'),
+              # Recomputar a leitura quantitativa (toques/força/probabilidade)
+              # depois de arrastar um traçado tem um vai-e-vem real com o
+              # servidor (trava de arquivo + reler o histórico inteiro) —
+              # sem isso, a tela fica parada nesse meio tempo e parece
+              # travada. dcc.Loading detecta sozinho quando o callback que
+              # tem 'estudos-conteudo' como Output está rodando (Input
+              # store-tracado-mover, ver atualizar_estudos) e mostra o
+              # spinner por cima até o novo conteúdo chegar.
+              dcc.Loading(
+                  id='loading-estudos', type='dot', color=C['gold'],
+                  children=html.Div(id='estudos-conteudo'),
+              ),
+          ]),
+      ]),
+
       # Placeholders — Backtesting/Configurações não têm conteúdo real ainda,
       # só evitam a aba parecer quebrada ao clicar.
       html.Div(id='painel-back', style={'display': 'none'}, children=[
           _placeholder_aba('Backtesting'),
       ]),
       html.Div(id='painel-config', style={'display': 'none'}, children=[
-          _placeholder_aba('Configurações'),
+          secao('CONFIGURAÇÕES'),
+          html.Div([
+              html.Div('Tema', style={
+                  'fontSize': '10px', 'color': C['text2'], 'textTransform': 'uppercase',
+                  'letterSpacing': '0.08em', 'fontFamily': FONTS['display'], 'marginBottom': '10px',
+              }),
+              html.Div([
+                  html.Span('Escuro', style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['display']}),
+                  html.Div(html.Div(className='tema-toggle-knob'), id='switch-tema', n_clicks=0,
+                           className='tema-toggle', title='Alternar tema claro/escuro'),
+                  html.Span('Claro', style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['display']}),
+              ], style={'display': 'flex', 'alignItems': 'center', 'gap': '10px'}),
+          ], style={
+              'background': C['panel'], 'border': f'1px solid {C["border"]}',
+              'boxShadow': 'var(--shadow-card)',
+              'borderRadius': '10px', 'padding': '16px 20px', 'maxWidth': '320px',
+          }),
       ]),
 
     ], style={
@@ -1707,6 +2553,12 @@ app.layout = html.Div([
         'marginTop': '32px',
     }),
 
+    # Popup de edição de traçado (duplo clique numa linha) — fora da árvore
+    # das abas, mesmo padrão de diario-overlay-detalhe em
+    # diario_app_classico.py: um placeholder vazio, populado por callback
+    # quando store-tracado-editar tem um id_tracado.
+    html.Div(id='tracado-overlay-editar'),
+
 ], style={
     'background': C['bg'],
     'minHeight': '100vh',
@@ -1756,22 +2608,29 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
-# Alimenta o gráfico Lightweight Charts do Hero — só repassa os dados pro
-# objeto que assets/lwchart.js expõe em window.SQ_CHART; a criação/estilo
-# do chart em si é toda lá, não aqui.
+# Alimenta os 2 gráficos Lightweight Charts (Price Action + Traçados) — só
+# repassa os dados pro objeto que assets/lwchart.js expõe em
+# window.SQ_CHART; a criação/estilo dos charts em si é toda lá, não aqui.
+# Bug 2026-07-13 (1): só `c.series` (Price Action) recebia candles aqui — o
+# gráfico da aba Traçados nunca ganhava setData(), ficava sempre vazio
+# (só as linhas de S/R/MME21 apareciam, sem nenhum candle de fundo) —
+# mesmo padrão de `assets_98/lwchart.js` (que já alimenta as 2 séries).
+# Bug 2026-07-13 (2): setData() a cada 30s resetava o zoom/pan manual do
+# usuário sozinho (comportamento da própria Lightweight Charts). `ativo`
+# vai como State pra `atualizarCandlesCompletos` (assets/lwchart.js) saber
+# se é troca de ativo (reseta o zoom de propósito) ou só o refresh
+# periódico (preserva o zoom atual).
 app.clientside_callback(
     """
-    function(candles) {
+    function(candles, ativo) {
         var c = window.SQ_CHART;
-        if (c && c.series && candles && candles.length) {
-            c.series.setData(candles);
-            if (c.refitEscala) c.refitEscala();
-        }
+        if (c && c.atualizarCandlesCompletos) c.atualizarCandlesCompletos(candles, ativo);
         return '';
     }
     """,
     Output('scroll-dummy', 'children', allow_duplicate=True),
     Input('store-candles-grafico', 'data'),
+    State('store-ativo', 'data'),
     prevent_initial_call=True,
 )
 
@@ -1796,13 +2655,15 @@ app.clientside_callback(
 # Candle "vivo" a cada 1s — `.update()` (1 candle só) em vez de `setData()`
 # (array inteiro): é o método que a própria Lightweight Charts documenta
 # pra atualização em tempo real, muito mais barato que reconstruir o
-# gráfico inteiro a cada tick.
+# gráfico inteiro a cada tick. Atualiza as 2 séries (mesmo motivo do
+# setData acima).
 app.clientside_callback(
     """
     function(candle) {
         var c = window.SQ_CHART;
-        if (c && c.series && candle) {
-            c.series.update(candle);
+        if (c && candle) {
+            if (c.series) c.series.update(candle);
+            if (c.tracadosSeries) c.tracadosSeries.update(candle);
         }
         return '';
     }
@@ -1816,12 +2677,13 @@ app.clientside_callback(
 # fazer com ele é o callback de desenho logo abaixo.
 app.clientside_callback(
     """
-    function(n, visivel) {
+    function(n, nTracados, visivel) {
         return !visivel;
     }
     """,
     Output('store-sr-visivel', 'data'),
     Input('btn-sr-toggle', 'n_clicks'),
+    Input('btn-sr-toggle-tracados', 'n_clicks'),
     State('store-sr-visivel', 'data'),
     prevent_initial_call=True,
 )
@@ -1882,12 +2744,13 @@ app.clientside_callback(
 # Ícone de olho da MME21.
 app.clientside_callback(
     """
-    function(n, visivel) {
+    function(n, nTracados, visivel) {
         return !visivel;
     }
     """,
     Output('store-mme21-visivel', 'data'),
     Input('btn-mme21-toggle', 'n_clicks'),
+    Input('btn-mme21-toggle-tracados', 'n_clicks'),
     State('store-mme21-visivel', 'data'),
     prevent_initial_call=True,
 )
@@ -1904,27 +2767,62 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 
+# Tema claro/escuro (2026-07-17) — clique no switch inverte o tema, mesmo
+# idioma do toggle MME21 acima.
+app.clientside_callback(
+    """
+    function(n, temaAtual) {
+        return (temaAtual === 'light') ? 'dark' : 'light';
+    }
+    """,
+    Output('store-tema', 'data'),
+    Input('switch-tema', 'n_clicks'),
+    State('store-tema', 'data'),
+    prevent_initial_call=True,
+)
+
+# Aplica o tema: data-theme no <html>, retema os gauges/gráfico via
+# window.SQ_CHART, repassa pro iframe do Diário via postMessage. Output
+# PRÓPRIO (store-tema-dummy, não scroll-dummy) e SEM prevent_initial_call —
+# precisa rodar já na carga inicial pra aplicar o tema restaurado do
+# localStorage antes do usuário ver a página (ver comentário no
+# dcc.Store(id='store-tema-dummy') no layout).
+app.clientside_callback(
+    """
+    function(tema) {
+        window.SQ_TEMA = window.SQ_TEMA || {};
+        window.SQ_TEMA.atual = tema || 'light';
+        var switchEl = document.getElementById('switch-tema');
+        if (switchEl) switchEl.classList.toggle('tema-toggle--claro', window.SQ_TEMA.atual === 'light');
+        if (window.SQ_TEMA.aplicarLocal) window.SQ_TEMA.aplicarLocal(window.SQ_TEMA.atual);
+        var iframe = document.querySelector('#painel-diario iframe');
+        if (iframe) iframe.contentWindow.postMessage({tipo: 'sq-tema', tema: window.SQ_TEMA.atual}, '*');
+        return '';
+    }
+    """,
+    Output('store-tema-dummy', 'data'),
+    Input('store-tema', 'data'),
+)
+
 @app.callback(
     Output('store-ativo', 'data'),
     Input('btn-win', 'n_clicks'),
     Input('btn-wdo', 'n_clicks'),
-    Input('btn-correlacao', 'n_clicks'),
     State('store-ativo', 'data'),
     prevent_initial_call=True,
 )
-def selecionar_ativo(n_win, n_wdo, n_corr, ativo_atual):
+def selecionar_ativo(n_win, n_wdo, ativo_atual):
     ctx = callback_context
     if not ctx.triggered:
         return ativo_atual
     botao = ctx.triggered[0]['prop_id'].split('.')[0]
-    mapa = {'btn-win': 'WIN', 'btn-wdo': 'WDO', 'btn-correlacao': 'CORRELACAO'}
+    mapa = {'btn-win': 'WIN', 'btn-wdo': 'WDO'}
     return mapa.get(botao, ativo_atual)
 
 
 @app.callback(
     Output('btn-win', 'style'),
     Output('btn-wdo', 'style'),
-    Output('btn-correlacao', 'style'),
     Input('store-ativo', 'data'),
 )
 def atualizar_estilo_ativo_selecionado(ativo):
@@ -1934,8 +2832,19 @@ def atualizar_estilo_ativo_selecionado(ativo):
     return (
         _estilo_botao_ativo('WIN', ativo),
         _estilo_botao_ativo('WDO', ativo),
-        _estilo_botao_ativo('CORRELACAO', ativo),
     )
+
+
+@app.callback(
+    Output('balao-gauge-explicacao', 'children'),
+    Input('store-gauge-selecionado', 'data'),
+)
+def renderizar_balao_gauge(gauge_selecionado):
+    """Dispara só quando o clique client-side (assets/hero_gauges.js) muda
+    `store-gauge-selecionado` — nunca no tick de 1s (ver comentário em
+    construir_hero/_balao_explicacao_gauge sobre por quê o balão mora fora
+    de hero-conteudo)."""
+    return _balao_explicacao_gauge(gauge_selecionado or 'forca')
 
 
 @app.callback(
@@ -1948,7 +2857,7 @@ def atualizar_candle_atual(n, ativo):
     with lock:
         bases = estado['bases']
 
-    df = bases.get(ativo if ativo != 'CORRELACAO' else 'WIN')
+    df = bases.get(ativo)
     if df is None or df.empty:
         return {}
 
@@ -1959,7 +2868,7 @@ def atualizar_candle_atual(n, ativo):
     preco_atual = float(ultimo['close'])
     try:
         if MT5_OK:
-            ticker = estado.get('contrato_win') if ativo in ('WIN', 'CORRELACAO') else estado.get('contrato_wdo')
+            ticker = estado.get('contrato_win') if ativo == 'WIN' else estado.get('contrato_wdo')
             if ticker and ticker != '—':
                 tick = mt5.symbol_info_tick(ticker)
                 if tick:
@@ -2047,6 +2956,32 @@ def sincronizar_posicoes(n):
     return ''
 
 
+def _reconciliar_background():
+    """Roda em thread separada (mesmo padrão de _sincronizar_posicoes_
+    background) — ver dashboard_98.py::_reconciliar_background pro mesmo
+    raciocínio completo."""
+    with lock:
+        estado['reconciliando'] = True
+    try:
+        diario_trade.reconciliar_com_mt5(dias_atras=30)
+    except Exception:
+        pass
+    finally:
+        with lock:
+            estado['reconciliando'] = False
+
+
+@app.callback(
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Input('interval-reconciliacao', 'n_intervals'),
+    prevent_initial_call=True,
+)
+def reconciliar_background(n):
+    if not estado['reconciliando']:
+        threading.Thread(target=_reconciliar_background, daemon=True).start()
+    return ''
+
+
 @app.callback(
     Output('store-candles-grafico', 'data'),
     Input('interval-slow', 'n_intervals'),
@@ -2061,8 +2996,241 @@ def atualizar_candles_grafico_completo(n_slow, ativo):
     de propósito nenhum)."""
     with lock:
         bases = estado['bases']
-    df_ativo = bases.get(ativo if ativo != 'CORRELACAO' else 'WIN')
+    df_ativo = bases.get(ativo)
     return candles_para_grafico(df_ativo) if df_ativo is not None else []
+
+
+# -----------------------------------------------------------------------------
+# TRAÇADOS — aba "Traçados" (ver tracados.py). `mover` só persiste + deixa
+# o recompute de Estudos reagir (Input compartilhado abaixo) — o cliente já
+# moveu a linha sozinho antes mesmo do round-trip terminar (ver
+# assets/lwchart.js), então não precisa disparar store-tracados-servidor de
+# novo. `criar` é diferente: o clique não desenha nada no cliente sozinho
+# (só existe depois que o servidor persiste), então esse Output extra é o
+# que faz a linha aparecer imediatamente em vez de só no próximo tick de
+# 30s (bug relatado 2026-07-13) — round-trip local, na prática instantâneo.
+# -----------------------------------------------------------------------------
+
+@app.callback(
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Output('store-tracados-servidor', 'data', allow_duplicate=True),
+    Input('store-tracado-criar', 'data'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def criar_tracado_callback(payload, ativo):
+    if not payload or not ativo:
+        return no_update, no_update
+    ativo_real = ativo
+    tracados.criar_tracado(ativo_real, 'horizontal', payload['preco'])
+    return '', tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Input('store-tracado-mover', 'data'),
+    prevent_initial_call=True,
+)
+def mover_tracado_callback(payload):
+    if not payload:
+        return no_update
+    tracados.atualizar_preco_tracado(payload['id_tracado'], payload['preco'])
+    return ''
+
+
+@app.callback(
+    Output('store-tracados-servidor', 'data'),
+    Input('interval-slow', 'n_intervals'),
+    Input('store-ativo', 'data'),
+)
+def carregar_tracados_servidor(n_slow, ativo):
+    """Carga autoritativa da lista de traçados — dispara na mesma cadência
+    de `atualizar_candles_grafico_completo` (30s/troca de ativo), nunca no
+    tick de 1s. Alimenta tanto o redesenho do gráfico (clientside_callback
+    abaixo) quanto o recompute de Estudos."""
+    ativo_real = ativo or 'WIN'
+    return tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('store-tracados-servidor', 'data', allow_duplicate=True),
+    Input({'type': 'del-tracado', 'index': ALL}, 'n_clicks'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def apagar_tracado_callback(n_clicks_lista, ativo):
+    """Mesmo padrão de `clicar_dia_calendario` (diario_app_classico.py) —
+    pattern-matching, guarda contra o disparo fantasma de quando os N
+    botões são recriados (n_clicks de todos em 0 nesse caso, `any()` falso)."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    componente_id = json.loads(prop_id)
+    tracados.remover_tracado(componente_id['index'])
+    ativo_real = ativo or 'WIN'
+    return tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('store-timeline-expandida', 'data'),
+    Input({'type': 'timeline-toggle', 'index': ALL}, 'n_clicks'),
+    State('store-timeline-expandida', 'data'),
+    prevent_initial_call=True,
+)
+def alternar_timeline_expandida(n_clicks_lista, expandidos):
+    """Botão "Ver histórico de toques" — Price Action E Estudos dos
+    Traçados usam o mesmo tipo de id (`timeline-toggle`), chave estável
+    por card. Mesmo padrão/guarda de `apagar_tracado_callback`."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    chave = json.loads(prop_id)['index']
+    expandidos = dict(expandidos or {})
+    expandidos[chave] = not expandidos.get(chave, False)
+    return expandidos
+
+
+@app.callback(
+    Output('estudos-conteudo', 'children'),
+    Input('interval-slow', 'n_intervals'),
+    Input('store-tracado-criar', 'data'),
+    Input('store-tracado-mover', 'data'),
+    Input('store-tracados-servidor', 'data'),
+    Input('store-timeline-expandida', 'data'),
+    State('store-ativo', 'data'),
+)
+def atualizar_estudos(n_slow, _criar, _mover, _servidor, expandidos, ativo):
+    """Recomputa a leitura quantitativa de cada traçado — nunca no tick de
+    1s (os toques podem mudar passivamente conforme novos candles se
+    formam, daí o Input em interval-slow também, não só nas ações do
+    usuário). `store-timeline-expandida` também é Input aqui (diferente do
+    tick de 1s da Price Action, que usa State) — Estudos só re-renderiza a
+    cada 30s/ação; sem isso, o clique de expandir demoraria até 30s pra
+    aparecer."""
+    ativo_real = ativo or 'WIN'
+    with lock:
+        bases = estado['bases']
+    df_ativo = bases.get(ativo_real)
+    if df_ativo is None:
+        return no_update
+    tracs = tracados.listar_tracados(ativo_real)
+    analises = analisar_tracados(df_ativo, tracs)
+    return construir_estudos_tracados(analises, expandidos or {})
+
+
+# -----------------------------------------------------------------------------
+# POPUP DE EDIÇÃO DO TRAÇADO — duplo clique na linha (ver
+# assets/lwchart.js::wireFerramentaDesenho, store-tracado-editar). Mesmo
+# padrão de store+overlay+callback de `diario-trade-detalhe-id` em
+# diario_app_classico.py.
+# -----------------------------------------------------------------------------
+
+@app.callback(
+    Output('tracado-overlay-editar', 'children'),
+    Input('store-tracado-editar', 'data'),
+    State('store-ativo', 'data'),
+)
+def renderizar_modal_editar_tracado(id_tracado, ativo):
+    if not id_tracado:
+        return None
+    return _modal_editar_tracado(id_tracado, ativo)
+
+
+@app.callback(
+    Output('store-tracado-editar', 'data', allow_duplicate=True),
+    Input('btn-tracado-editar-cancelar', 'n_clicks'),
+    Input('tracado-editar-backdrop', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def fechar_modal_editar_tracado(n1, n2):
+    return None
+
+
+@app.callback(
+    Output('tracado-editar-cor', 'data'),
+    Input({'type': 'tracado-cor-swatch', 'cor': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def selecionar_cor_tracado(n_clicks_lista):
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    componente_id = json.loads(ctx.triggered[0]['prop_id'].rsplit('.', 1)[0])
+    return componente_id['cor']
+
+
+@app.callback(
+    Output('tracado-editar-cor-swatches', 'children'),
+    Input('tracado-editar-cor', 'data'),
+)
+def destacar_cor_selecionada_tracado(cor_atual):
+    return _swatches_cor_tracado(cor_atual)
+
+
+@app.callback(
+    Output('store-tracado-editar', 'data', allow_duplicate=True),
+    Output('store-tracados-servidor', 'data', allow_duplicate=True),
+    Input('btn-tracado-editar-salvar', 'n_clicks'),
+    State('store-tracado-editar', 'data'),
+    State('tracado-editar-preco', 'value'),
+    State('tracado-editar-cor', 'data'),
+    State('tracado-editar-espessura', 'value'),
+    State('tracado-editar-estilo', 'value'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def salvar_edicao_tracado(n_clicks, id_tracado, preco, cor, espessura, estilo, ativo):
+    if not id_tracado or preco is None or preco == '':
+        return no_update, no_update
+    # str(preco).replace(',', '.') — campo numérico nativo, em máquina com
+    # configuração regional pt-BR, pode devolver o valor com vírgula
+    # decimal em vez de ponto (bug relatado 2026-07-14: 'não salva' era
+    # esse ValueError silencioso derrubando o callback inteiro, sem
+    # feedback nenhum pro usuário). try/except em vez de deixar estourar —
+    # um valor ilegível não deve travar o popup aberto pra sempre.
+    try:
+        preco_float = float(str(preco).replace(',', '.'))
+        espessura_int = int(espessura)
+    except (TypeError, ValueError):
+        return no_update, no_update
+    tracados.atualizar_tracado(id_tracado, preco_float, cor, espessura_int, estilo)
+    ativo_real = ativo or 'WIN'
+    return None, tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('store-tracado-editar', 'data', allow_duplicate=True),
+    Output('store-tracados-servidor', 'data', allow_duplicate=True),
+    Input('btn-tracado-editar-excluir', 'n_clicks'),
+    State('store-tracado-editar', 'data'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def excluir_tracado_do_modal(n_clicks, id_tracado, ativo):
+    if not id_tracado:
+        return no_update, no_update
+    tracados.remover_tracado(id_tracado)
+    ativo_real = ativo or 'WIN'
+    return None, tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+# Redesenho AUTORITATIVO dos traçados a partir do servidor (carga inicial +
+# depois de apagar) — ver desenharTracados em assets/lwchart.js e o
+# comentário nos stores acima pro porquê de criar/mover NUNCA disparar isso.
+app.clientside_callback(
+    """
+    function(lista) {
+        var c = window.SQ_CHART;
+        if (c && c.desenharTracados) c.desenharTracados(lista || []);
+        return '';
+    }
+    """,
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Input('store-tracados-servidor', 'data'),
+    prevent_initial_call=True,
+)
 
 
 @app.callback(
@@ -2078,7 +3246,7 @@ def atualizar_mme21_serie_completo(n_slow, ativo):
     comentário lá): descarta respostas atrasadas de um ativo já trocado."""
     with lock:
         bases = estado['bases']
-    df_ativo = bases.get(ativo if ativo != 'CORRELACAO' else 'WIN')
+    df_ativo = bases.get(ativo)
     serie = mme21_para_grafico(df_ativo) if df_ativo is not None else []
     return {'ativo': ativo, 'serie': serie}
 
@@ -2100,8 +3268,10 @@ def atualizar_mme21_serie_completo(n_slow, ativo):
     Input('interval-live', 'n_intervals'),
     Input('store-ativo', 'data'),
     Input('store-candle-atual', 'data'),
+    State('store-timeline-expandida', 'data'),
+    State('store-tema', 'data'),
 )
-def atualizar_dashboard(n_intervals, ativo, candle_atual):
+def atualizar_dashboard(n_intervals, ativo, candle_atual, timeline_expandida, tema_atual):
     """
     Callback principal — dispara a cada 1s via interval-live.
     A leitura das métricas é leve (só lê o DataFrame já em memória).
@@ -2115,14 +3285,18 @@ def atualizar_dashboard(n_intervals, ativo, candle_atual):
         erro        = estado['erro']
         c_win       = estado['contrato_win']
         c_wdo       = estado['contrato_wdo']
+        cotacoes_correlacionadas = estado['cotacoes_correlacionadas']
+        fechamentos_di = estado['fechamentos_di']
 
     df_win   = bases.get('WIN')
     df_wdo   = bases.get('WDO')
-    df_ativo = df_win if ativo in ('WIN', 'CORRELACAO') else df_wdo
+    df_ativo = df_win if ativo == 'WIN' else df_wdo
 
     m_win = extrair_metricas(df_win) if df_win is not None else {}
     m_wdo = extrair_metricas(df_wdo) if df_wdo is not None else {}
-    m     = m_win if ativo in ('WIN', 'CORRELACAO') else m_wdo
+    m     = m_win if ativo == 'WIN' else m_wdo
+    indice_mg = indice_medo_ganancia.calcular_indice_medo_ganancia(df_win, df_wdo)
+    correlacao = correlacao_ativos.calcular_correlacao_di(df_win, df_wdo, fechamentos_di)
 
     # Injeta preço em tempo real do store rápido (atualizado a 1s)
     if candle_atual and candle_atual.get('preco'):
@@ -2168,9 +3342,9 @@ def atualizar_dashboard(n_intervals, ativo, candle_atual):
                 status, contrato_str, upd_str, cal_str, cal_style, None,
                 {'ativo': ativo, 'niveis': []}, {'ativo': ativo, 'ponto': None}, placeholder)
 
-    hero         = construir_hero(m_win, m_wdo, ativo)
+    hero         = construir_hero(m_win, m_wdo, ativo, indice_mg, correlacao, cotacoes_correlacionadas, tema_atual or 'light')
     market_view  = construir_market_view(m)
-    price_action = construir_price_action(df_ativo, m)
+    price_action = construir_price_action(df_ativo, m, timeline_expandida or {})
     big_players  = construir_big_players(df_ativo)
     # Marcado com o `ativo` que gerou esses níveis — o clientside_callback
     # de desenho (ver assets/lwchart.js::desenharNiveisSR) descarta a
@@ -2279,7 +3453,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
                 'animation': 'pulse 1s infinite',
             }),
         ], style={
-            'background': '#1A1A28', 'borderRadius': '10px 10px 10px 2px',
+            'background': 'var(--bolha-neutra)', 'borderRadius': '10px 10px 10px 2px',
             'padding': '10px 14px', 'fontSize': '13px',
             'fontFamily': FONTS['body'], 'color': C['text'],
             'maxWidth': '90%', 'borderLeft': f'2px solid {C["gold"]}',
@@ -2291,7 +3465,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
     # Chama a IA (bloqueante — resposta real vem aqui mesmo)
     with lock:
         bases = estado['bases']
-    df = bases.get(ativo if ativo != 'CORRELACAO' else 'WIN')
+    df = bases.get(ativo)
     m = extrair_metricas(df) if df is not None else {}
 
     try:
@@ -2308,7 +3482,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
                     html.Span(f'Limite de requisições atingido{sufixo_modelo}. Aguarde {segundos_espera}s antes de enviar novamente.',
                               style={'color': C['yellow']}),
                 ], style={
-                    'background': '#1A1A14', 'borderRadius': '10px 10px 10px 2px',
+                    'background': 'var(--bolha-atencao)', 'borderRadius': '10px 10px 10px 2px',
                     'padding': '10px 14px', 'fontSize': '13px',
                     'fontFamily': FONTS['body'],
                     'maxWidth': '90%', 'borderLeft': f'2px solid {C["yellow"]}',
@@ -2324,7 +3498,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
                     html.Span(f'⚠ {resposta_bruta["erro"]}',
                               style={'color': C['red']}),
                 ], style={
-                    'background': '#1A1414', 'borderRadius': '10px 10px 10px 2px',
+                    'background': 'var(--bolha-erro)', 'borderRadius': '10px 10px 10px 2px',
                     'padding': '10px 14px', 'fontSize': '13px',
                     'fontFamily': FONTS['body'],
                     'maxWidth': '90%', 'borderLeft': f'2px solid {C["red"]}',
@@ -2344,7 +3518,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
                     html.Span('✦ ', style={'color': C['gold'], 'fontSize': '11px'}),
                     html.Span(resposta, style={'whiteSpace': 'pre-wrap', 'lineHeight': '1.6'}),
                 ], style={
-                    'background': '#1A1A28', 'borderRadius': '10px 10px 10px 2px',
+                    'background': 'var(--bolha-neutra)', 'borderRadius': '10px 10px 10px 2px',
                     'padding': '10px 14px', 'fontSize': '13px',
                     'fontFamily': FONTS['body'], 'color': C['text'],
                     'maxWidth': '90%', 'borderLeft': f'2px solid {C["gold"]}',
@@ -2377,7 +3551,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
 # botões, só trocar `style`/`display` (evita o bug histórico de reset de
 # `n_clicks` documentado no CHANGELOG.md de 2026-07-04).
 
-_ABAS_CABECALHO = ['lab', 'back', 'diary', 'config']
+_ABAS_CABECALHO = ['lab', 'tracados', 'back', 'diary', 'config']
 
 
 @app.callback(
@@ -2403,6 +3577,7 @@ def atualizar_estilo_aba_ativa(aba_ativa):
 
 @app.callback(
     Output('painel-quantlab', 'style'),
+    Output('painel-tracados', 'style'),
     Output('painel-diario', 'style'),
     Output('painel-back', 'style'),
     Output('painel-config', 'style'),
@@ -2411,7 +3586,8 @@ def atualizar_estilo_aba_ativa(aba_ativa):
 def atualizar_painel_principal(aba_ativa):
     def _estilo(chave):
         return {} if chave == aba_ativa else {'display': 'none'}
-    return _estilo('lab'), _estilo('diary'), _estilo('back'), _estilo('config')
+    return (_estilo('lab'), _estilo('tracados'), _estilo('diary'),
+            _estilo('back'), _estilo('config'))
 
 
 # =============================================================================

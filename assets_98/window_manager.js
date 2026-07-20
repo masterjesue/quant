@@ -56,6 +56,21 @@
   }
   function clamp(v, min, max) { return Math.max(min, Math.min(v, max)); }
 
+  // Arrastar (mover OU redimensionar) uma janela cujo conteúdo é um
+  // <iframe> (Diário/Posição) parava de responder no meio do arraste
+  // sempre que o cursor passava por cima do iframe — feedback 2026-07-12
+  // ("já tinha pedido isso, não sei porque não deu certo"). Causa: um
+  // <iframe> é um browsing context separado; `mousemove` sobre ele dispara
+  // no DOCUMENTO DELE, não no `window` do documento pai onde os listeners
+  // de drag/resize escutam — o evento simplesmente não chega. `.win98-
+  // interacting iframe { pointer-events: none }` (ver style.css) desliga
+  // temporariamente a captura de mouse dos iframes enquanto QUALQUER
+  // arraste estiver ativo, deixando o `mousemove` atravessar até o
+  // `window` do pai normalmente; volta ao normal no mouseup.
+  function setInteracting(ligado) {
+    document.documentElement.classList.toggle('win98-interacting', ligado);
+  }
+
   function placeInitial(win, index) {
     var saved = layout[win.dataset.window];
     var maxLeft = function () { return Math.max(0, window.innerWidth - win.offsetWidth - 4); };
@@ -197,6 +212,7 @@
       if (win.classList.contains('maximized')) return;
       if (e.target.closest('[data-action]')) return;  // não arrasta clicando em _/□/×
       dragging = true;
+      setInteracting(true);
       sx = e.clientX; sy = e.clientY;
       var rect = win.getBoundingClientRect();
       ox = rect.left; oy = rect.top;
@@ -214,7 +230,7 @@
       win.style.top = clamp(oy + (e.clientY - sy), 0, window.innerHeight - TASKBAR_HEIGHT - 30) + 'px';
     });
     window.addEventListener('mouseup', function () {
-      if (dragging) { dragging = false; rememberWindow(win); }
+      if (dragging) { dragging = false; setInteracting(false); rememberWindow(win); }
     });
 
     var actions = { close: closeWindow, minimize: minimizeWindow };
@@ -256,6 +272,7 @@
         e.stopPropagation();  // não deve também iniciar o drag da janela
         e.preventDefault();
         dragging = true;
+        setInteracting(true);
         focusWindow(win);
         sx = e.clientX; sy = e.clientY;
         var rect = win.getBoundingClientRect();
@@ -274,7 +291,7 @@
         }
       });
       window.addEventListener('mouseup', function () {
-        if (dragging) { dragging = false; rememberWindow(win); }
+        if (dragging) { dragging = false; setInteracting(false); rememberWindow(win); }
       });
     });
   }

@@ -349,7 +349,7 @@ JANELAS = [
     {'id': 'win-quantlab',     'titulo': 'Quant Lab',     'icone': '/assets/icons/my-computer.png', 'start_closed': False, 'implementada': True},
     {'id': 'win-price-action', 'titulo': 'Price Action',  'icone': '/assets/icons/find-file.png',   'start_closed': False, 'implementada': True},
     {'id': 'win-big-players',  'titulo': 'Big Players',   'icone': '/assets/icons/favorites.png',   'start_closed': False, 'implementada': True},
-    {'id': 'win-grafico',      'titulo': 'Gráfico',       'icone': '/assets/icons/grafico.png',     'start_closed': False, 'implementada': True},
+    {'id': 'win-tracados',     'titulo': 'Traçados',      'icone': '/assets/icons/grafico.png',     'start_closed': True,  'implementada': True},
     {'id': 'win-diario',       'titulo': 'Diário',        'icone': '/assets/icons/notepad.png',     'start_closed': True,  'implementada': True},
     {'id': 'win-posicao',      'titulo': 'Posição',       'icone': '/assets/icons/network.png',     'start_closed': True,  'implementada': True},
     {'id': 'win-rastreador',   'titulo': 'Rastreador de Tendência', 'icone': '/assets/icons/rastreador.png', 'start_closed': True, 'implementada': True},

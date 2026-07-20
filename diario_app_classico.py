@@ -32,9 +32,12 @@ from datetime import date
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
+import json
+
 import dash
-from dash import dcc, html, Input, Output, State, callback_context, no_update
+from dash import ALL, dcc, html, Input, Output, State, callback_context, no_update
 import flask
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
@@ -53,17 +56,35 @@ PORTA_PAI = 8050  # dashboard.py
 # front-ends nunca compartilham camada visual, só lógica de dados)
 # =============================================================================
 
+# 2026-07-17: valores viraram `var(--x)` (assets/style.css, compartilhado
+# com dashboard.py — mesmo modo claro/escuro do SQ Padrão, propagado pro
+# Diário via postMessage, ver assets/tema.js). PALETA_GAUGE abaixo é a
+# exceção pra Plotly (_grafico_evolucao_saldo/_radar_roda_vida), que não
+# entende `var(...)`.
 C = {
-    'bg':        '#0A0A0F',
-    'panel':     '#12121A',
-    'border':    '#1C1C28',
-    'gold':      '#C8A96E',
-    'green':     '#2ECC8A',
-    'red':       '#E05C5C',
-    'text':      '#E8E8F0',
-    'text2':     '#8888AA',
-    'blue':      '#4A90D9',
-    'yellow':    '#F0C040',
+    'bg':        'var(--bg)',
+    'panel':     'var(--panel)',
+    'border':    'var(--border)',
+    'gold':      'var(--gold)',
+    'green':     'var(--green)',
+    'red':       'var(--red)',
+    'text':      'var(--text)',
+    'text2':     'var(--text2)',
+    'blue':      'var(--blue)',
+    'yellow':    'var(--yellow)',
+}
+
+PALETA_GAUGE = {
+    'dark': {
+        'bg': '#0A0A0F', 'panel': '#12121A', 'border': '#1C1C28',
+        'gold': '#C8A96E', 'green': '#2ECC8A', 'red': '#E05C5C',
+        'text': '#E8E8F0', 'text2': '#8888AA', 'blue': '#4A90D9', 'yellow': '#F0C040',
+    },
+    'light': {
+        'bg': '#E4E7F0', 'panel': '#FFFFFF', 'border': '#C7CCDC',
+        'gold': '#A87C2E', 'green': '#128A55', 'red': '#B33A3A',
+        'text': '#14141C', 'text2': '#5B5B78', 'blue': '#3573B5', 'yellow': '#8A6508',
+    },
 }
 
 FONTS = {
@@ -73,19 +94,34 @@ FONTS = {
 }
 
 _ABAS_DIARIO_SUB = [
-    ('novo', 'Novo Trade'),
+    ('estatisticas', 'Estatísticas'),
     ('posicao', 'Posição'),
     ('historico', 'Histórico'),
-    ('estatisticas', 'Estatísticas'),
-    ('reconciliacao', 'Reconciliação'),
-    ('aderencia_sr', 'Aderência S/R'),
+    ('estrategias', 'Estratégias'),
+    ('novo', 'Novo Trade'),
     ('padroes', 'Padrões'),
+    ('bem_estar', 'Bem-Estar'),
 ]
+_ABA_DIARIO_INICIAL = 'estatisticas'
 
 
 def _opcoes_diario(valores: list[str]) -> list[dict]:
     """Converte vocabulário canônico (snake_case) em opções de dropdown legíveis."""
     return [{'label': v.replace('_', ' ').title(), 'value': v} for v in valores]
+
+
+def _opcoes_estrategias() -> list[dict]:
+    """Opções de estratégia lidas do cadastro editável (aba Estratégias),
+    não mais da lista fixa — refletem criação/desativação na hora."""
+    return [{'label': linha['nome'], 'value': linha['slug']} for _, linha in dt.listar_estrategias().iterrows()]
+
+
+def _opcoes_tags_setup_erro() -> list[dict]:
+    return [{'label': linha['nome'], 'value': linha['slug']} for _, linha in dt.listar_tags_setup_erro().iterrows()]
+
+
+def _opcoes_tags_emocionais() -> list[dict]:
+    return [{'label': linha['nome'], 'value': linha['slug']} for _, linha in dt.listar_tags_emocionais().iterrows()]
 
 
 def _estilo_subaba_diario(chave: str, aba_ativa: str) -> dict:
@@ -107,6 +143,214 @@ def _campo_diario(label, componente) -> html.Div:
     ], style={'marginBottom': '10px'})
 
 
+_MARCAS_SENTIMENTO_MERCADO = {0: 'Medo Extremo', 25: 'Medo', 50: 'Neutro', 75: 'Ganância', 100: 'Ganância Extrema'}
+
+
+def _num_estrela_ou_padrao(valor, padrao: int = 3) -> int:
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return padrao
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return padrao
+
+
+def _estrela_rating(id_componente, valor: int = 3) -> html.Div:
+    """Nota 1-5 clicável (5 estrelas de verdade) — ver diario_app_98.py::
+    _estrela_rating_98 pro mesmo raciocínio. Substitui o dcc.Slider com
+    marks de ★ (feedback 2026-07-11: "muito feio, coloque apenas as
+    estrelas... como tem normalmente nos apps"). Mantém a MESMA interface
+    externa da função antiga — um componente com id=id_componente expondo
+    `.value` — via um dcc.Input(type='hidden') por baixo, então nenhum
+    callback que já lê/escreve nesse id (Novo Trade, Bem-Estar, edição
+    rápida da Posição) precisa mudar. `id_componente` aceita string (campo
+    único) ou dict pattern-matched {'type','index'} (ver ea-emo-* na
+    Posição) — o clique de cada um é ligado em
+    `_registrar_clique_estrela`/`_registrar_clique_estrela_match`."""
+    valor = valor or 0
+    if isinstance(id_componente, str):
+        ids_estrelas = [f'{id_componente}-estrela-{i}' for i in range(1, 6)]
+    else:
+        ids_estrelas = [{**id_componente, 'type': f"{id_componente['type']}-estrela", 'n': i}
+                         for i in range(1, 6)]
+    estrelas = html.Div([
+        html.Span('', id=ids_estrelas[i - 1], n_clicks=0,
+                  className='diario-estrela' + (' ativa' if i <= valor else ''))
+        for i in range(1, 6)
+    ], style={'display': 'flex', 'gap': '2px'})
+    return html.Div([estrelas, dcc.Input(id=id_componente, type='hidden', value=valor)])
+
+
+def _registrar_clique_estrela(app, id_campo: str):
+    """Registra o par de clientside_callbacks de um campo de estrela
+    SINGLETON (id string única — Novo Trade/Bem-Estar). Ver
+    `_registrar_clique_estrela_match` pro equivalente pattern-matched
+    (Posição, N posições abertas dinamicamente)."""
+    app.clientside_callback(
+        """
+        function(...cliques) {
+            const ctx = dash_clientside.callback_context;
+            if (!ctx.triggered.length) { return dash_clientside.no_update; }
+            const m = ctx.triggered[0].prop_id.match(/-estrela-(\\d+)\\.n_clicks$/);
+            return m ? parseInt(m[1], 10) : dash_clientside.no_update;
+        }
+        """,
+        Output(id_campo, 'value'),
+        [Input(f'{id_campo}-estrela-{i}', 'n_clicks') for i in range(1, 6)],
+        prevent_initial_call=True,
+    )
+    app.clientside_callback(
+        """
+        function(valor) {
+            const v = valor || 0;
+            return [1, 2, 3, 4, 5].map(i => 'diario-estrela' + (i <= v ? ' ativa' : ''));
+        }
+        """,
+        [Output(f'{id_campo}-estrela-{i}', 'className') for i in range(1, 6)],
+        Input(id_campo, 'value'),
+    )
+
+
+def _registrar_clique_estrela_match(app, tipo_campo: str):
+    """Mesma lógica de `_registrar_clique_estrela`, mas via MATCH+ALL pra
+    cobrir qualquer posição aberta na aba Posição (ea-emo-confianca etc —
+    o número/id das posições muda em tempo real, não dá pra pré-registrar
+    um callback por instância)."""
+    app.clientside_callback(
+        """
+        function(cliques_lista) {
+            const triggered = dash_clientside.callback_context.triggered_id;
+            return triggered ? triggered.n : dash_clientside.no_update;
+        }
+        """,
+        Output({'type': tipo_campo, 'index': dash.MATCH}, 'value'),
+        Input({'type': f'{tipo_campo}-estrela', 'index': dash.MATCH, 'n': ALL}, 'n_clicks'),
+        prevent_initial_call=True,
+    )
+    app.clientside_callback(
+        """
+        function(valor) {
+            const v = valor || 0;
+            return [1, 2, 3, 4, 5].map(i => 'diario-estrela' + (i <= v ? ' ativa' : ''));
+        }
+        """,
+        [Output({'type': f'{tipo_campo}-estrela', 'index': dash.MATCH, 'n': i}, 'className') for i in range(1, 6)],
+        Input({'type': tipo_campo, 'index': dash.MATCH}, 'value'),
+    )
+
+
+def _campo_tag_widget(id_store: dict, opcoes: list[dict], valores_iniciais) -> html.Div:
+    """Campo de tag "de verdade" (feedback 2026-07-20 — print de
+    referência: caixa com chips grandes/arredondados, X pra remover,
+    Enter OU vírgula/ponto-e-vírgula confirmam, rodapé com contador +
+    "Remover todas"). `dcc.Dropdown` não faz Enter-pra-confirmar nem esse
+    layout nativamente — mesmo raciocínio de `_estrela_rating` (widget
+    HTML/CSS/JS de verdade, ver `assets/tag_input.js`, + um `dcc.Store`
+    escondido carregando a lista atual pros callbacks Python lerem via
+    `.data`, já que não existe prop nativo do Dash pra isso).
+
+    Só usado nos campos que já são vocabulário aberto/crescente (Print
+    Emocional e Tags Setup/Erro, dentro dos cards de Posição) — Estratégia
+    e o Novo Trade continuam com o `dcc.Dropdown` de sempre (escopo
+    2026-07-20, decisão explícita: não vale a pena reescrever CADA
+    dropdown do Diário pra este widget agora).
+
+    `id_store` é sempre um id pattern-matching (dict, {'type':...,
+    'index': id_pos}) — usado tanto no `dcc.Store` quanto como
+    `data-armar-index` (o card volta a ficar "armado" pro próximo Ctrl+V
+    ao clicar/focar dentro do widget, mesmo esses elementos não tendo um
+    id Dash próprio — ver `assets/diario_paste.js`)."""
+    rotulo_por_valor = {o['value']: o['label'] for o in opcoes}
+    selecionados = [
+        {'value': v, 'label': rotulo_por_valor.get(v, str(v))}
+        for v in (valores_iniciais or [])
+    ]
+    chips = [
+        html.Span([
+            html.Span(item['label']),
+            html.Button('×', type='button', className='tag-chip-remover', **{'aria-label': 'Remover tag'}),
+        ], className='tag-chip', **{'data-valor': item['value']})
+        for item in selecionados
+    ]
+    return html.Div([
+        html.Div('Digite e pressione Enter ou vírgula/ponto-e-vírgula após cada tag',
+                 className='tag-widget-dica'),
+        html.Div([
+            html.Div(chips, className='tag-widget-chips'),
+            dcc.Input(type='text', className='tag-widget-input', autoComplete='off',
+                      placeholder='Nova tag...'),
+        ], className='tag-widget-caixa'),
+        html.Div(className='tag-widget-sugestoes'),
+        html.Div([
+            html.Span(f"{len(selecionados)} tag(s)", className='tag-widget-contador'),
+            html.Button('Remover todas', type='button', className='tag-widget-limpar'),
+        ], className='tag-widget-rodape'),
+        dcc.Store(id=id_store, data=selecionados),
+    ], className='tag-widget', **{
+        'data-opcoes': json.dumps(opcoes, ensure_ascii=False),
+        'data-armar-index': str(id_store['index']),
+    })
+
+
+def _bloco_emocional(id_confianca, id_humor, id_energia, id_atencao, id_presenca,
+                      id_tags, id_sentimento, id_label_sentimento, valores: dict | None = None,
+                      widget_tags_customizado: bool = False) -> html.Div:
+    """Autoavaliação emocional — ver diario_app_98.py::_bloco_emocional_98
+    pro mesmo raciocínio completo (fundação do módulo emocional/
+    comportamental, feedback diário.txt 2026-07-11).
+
+    `widget_tags_customizado`: quando True (só os cards de Posição, ver
+    `_bloco_posicao_form`), o campo "Print Emocional" usa `_campo_tag_widget`
+    em vez de `dcc.Dropdown` (feedback 2026-07-20). O Novo Trade continua
+    com o dropdown de sempre (`widget_tags_customizado=False`, default)."""
+    campo = _campo_diario
+    valores = valores or {}
+    sentimento_valor = valores.get('sentimento')
+    sentimento_valor = int(sentimento_valor) if sentimento_valor is not None and not (
+        isinstance(sentimento_valor, float) and pd.isna(sentimento_valor)) else 50
+    if widget_tags_customizado:
+        campo_tags = campo('Print Emocional (tags)',
+                            _campo_tag_widget(id_tags, _opcoes_tags_emocionais(), _lista_segura(valores.get('tags'))))
+    else:
+        campo_tags = campo('Print Emocional (tags)', dcc.Dropdown(id=id_tags, multi=True,
+                                                        options=_opcoes_tags_emocionais(),
+                                                        value=_lista_segura(valores.get('tags')) or None,
+                                                        className='classico-dropdown classico-dropdown-tags'))
+    return _bloco_diario('Autoavaliação Emocional', html.Div([
+        html.Div([
+            campo('Confiança', _estrela_rating(id_confianca, _num_estrela_ou_padrao(valores.get('confianca')))),
+            campo('Humor', _estrela_rating(id_humor, _num_estrela_ou_padrao(valores.get('humor')))),
+            campo('Energia', _estrela_rating(id_energia, _num_estrela_ou_padrao(valores.get('energia')))),
+            campo('Atenção', _estrela_rating(id_atencao, _num_estrela_ou_padrao(valores.get('atencao')))),
+            campo('Presença', _estrela_rating(id_presenca, _num_estrela_ou_padrao(valores.get('presenca')))),
+        ], style={'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(160px, 1fr))', 'gap': '6px 16px'}),
+        campo_tags,
+        html.Div([
+            html.Div('Sentimento de Mercado', style={'fontSize': '11px', 'color': C['text2'], 'marginBottom': '4px'}),
+            dcc.Slider(id=id_sentimento, min=0, max=100, step=1, value=sentimento_valor, marks=_MARCAS_SENTIMENTO_MERCADO),
+            html.Div(id=id_label_sentimento, style={'fontSize': '12px', 'marginTop': '4px'}),
+        ], style={'marginTop': '10px'}),
+    ]))
+
+
+def _estrelas_texto(valor) -> str:
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return '—'
+    try:
+        n = max(0, min(5, int(valor)))
+    except (TypeError, ValueError):
+        return '—'
+    return '★' * n + '☆' * (5 - n)
+
+
+def _texto_sentimento(valor) -> str:
+    resultado = dt.classificar_sentimento_mercado(valor)
+    if resultado is None:
+        return '—'
+    nome, _ = resultado
+    return f"{nome} ({int(valor)})"
+
+
 def _bloco_diario(titulo, children) -> html.Div:
     return html.Div([
         html.Div(titulo, style={
@@ -117,6 +361,7 @@ def _bloco_diario(titulo, children) -> html.Div:
         children,
     ], style={
         'background': C['panel'], 'border': f'1px solid {C["border"]}',
+        'boxShadow': 'var(--shadow-card)',
         'borderRadius': '10px', 'padding': '14px 16px', 'marginBottom': '16px',
     })
 
@@ -126,11 +371,30 @@ def _estilo_input_diario(extra=None) -> dict:
         'background': C['bg'], 'border': f'1px solid {C["border"]}',
         'borderRadius': '6px', 'padding': '6px 10px', 'color': C['text'],
         'fontFamily': FONTS['body'], 'fontSize': '13px', 'width': '100%',
-        'boxSizing': 'border-box',
+        'boxSizing': 'border-box', 'height': '32px',
     }
     if extra:
         estilo.update(extra)
     return estilo
+
+
+def _num(valor):
+    """Converte o `value` de um <input type=text inputMode=decimal> (usado
+    no lugar de type=number pra eliminar as setinhas +/- nativas — ver
+    CHANGELOG 2026-07-11) pra float; aceita vírgula decimal; None se vazio/
+    inválido. Idempotente pra int/float (Outputs programáticos continuam
+    passando o número direto, sem passar por aqui de novo)."""
+    if valor is None:
+        return None
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    texto = str(valor).strip().replace(',', '.')
+    if not texto:
+        return None
+    try:
+        return float(texto)
+    except ValueError:
+        return None
 
 
 def _placeholder_aba(nome: str) -> html.Div:
@@ -143,59 +407,79 @@ def _placeholder_aba(nome: str) -> html.Div:
 def _construir_diario_novo_trade() -> html.Div:
     campo = _campo_diario
     estilo_input = _estilo_input_diario
-    linha = lambda *filhos: html.Div(list(filhos), style={'display': 'flex', 'gap': '16px', 'flexWrap': 'wrap'})
+    # Grid ao invés de flex+largura fixa por campo (era o motivo do espaço
+    # vazio à direita em telas largas, ver feedback diário.txt) — cada campo
+    # ocupa uma coluna de no mínimo 150px e estica pra preencher a largura
+    # disponível. `_estilo_input_diario` já usa width:100%, então os campos
+    # de texto/número acompanham a coluna do grid sem precisar de largura
+    # fixa por campo.
+    grade = lambda *filhos: html.Div(list(filhos), style={
+        'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(150px, 1fr))',
+        'gap': '14px 16px', 'alignItems': 'end',
+    })
 
     return html.Div([
         _bloco_diario('Dados da Operação', html.Div([
-            linha(
-                campo('Data', dcc.Input(id='diario-data', type='date', style=estilo_input({'width': '160px'}))),
+            grade(
+                campo('Data', dcc.Input(id='diario-data', type='date', style=estilo_input())),
                 campo('Ativo', dcc.Dropdown(id='diario-ativo', options=_opcoes_diario(cfg.ATIVOS),
-                                             clearable=False, style={'width': '120px'})),
+                                             clearable=False, className='classico-dropdown')),
                 campo('Janela', dcc.Dropdown(id='diario-janela',
                                               options=_opcoes_diario(list(cfg.JANELAS_PREGAO.keys())),
-                                              style={'width': '170px'})),
-            ),
-            linha(
+                                              className='classico-dropdown')),
                 campo('Estratégia', dcc.Dropdown(id='diario-estrategia', multi=True,
-                                                  options=_opcoes_diario(dt.ESTRATEGIA_TAGS_CANONICAS),
-                                                  style={'width': '320px'})),
+                                                  options=_opcoes_estrategias(),
+                                                  className='classico-dropdown classico-dropdown-tags')),
                 campo('Sala/Análise', dcc.Dropdown(id='diario-sala',
                                                      options=_opcoes_diario(dt.SALA_ANALISE_CANONICA),
-                                                     style={'width': '190px'})),
-            ),
-            linha(
+                                                     className='classico-dropdown')),
                 campo('Tipo', dcc.Dropdown(id='diario-tipo-operacao', options=_opcoes_diario(dt.TIPO_OPERACAO),
-                                            clearable=False, style={'width': '110px'})),
-                campo('Alvo (pts)', dcc.Input(id='diario-alvo', type='number', style=estilo_input({'width': '110px'}))),
-                campo('Stop (pts)', dcc.Input(id='diario-stop', type='number', style=estilo_input({'width': '110px'}))),
-                campo('Lote', dcc.Input(id='diario-lote', type='number', value=1, style=estilo_input({'width': '90px'}))),
-            ),
-            linha(
-                campo('Preço Entrada', dcc.Input(id='diario-preco-entrada', type='number', style=estilo_input({'width': '130px'}))),
-                campo('Preço Saída', dcc.Input(id='diario-preco-saida', type='number', style=estilo_input({'width': '130px'}))),
+                                            clearable=False, className='classico-dropdown')),
+                campo('R:R', dcc.Dropdown(id='diario-rr-preset',
+                                           options=[{'label': l['nome'], 'value': l['id']}
+                                                    for _, l in dt.listar_rr_presets().iterrows()],
+                                           placeholder='nenhuma', className='classico-dropdown')),
+                campo('Alvo (pts)', dcc.Input(id='diario-alvo', type='text', inputMode='decimal',
+                                               style=estilo_input())),
+                campo('Stop (pts)', dcc.Input(id='diario-stop', type='text', inputMode='decimal',
+                                               style=estilo_input())),
+                campo('Lote', dcc.Input(id='diario-lote', type='number', value=1, style=estilo_input())),
+                campo('Preço Entrada', dcc.Input(id='diario-preco-entrada', type='text', inputMode='decimal',
+                                                  style=estilo_input())),
+                campo('Preço Saída', dcc.Input(id='diario-preco-saida', type='text', inputMode='decimal',
+                                                style=estilo_input())),
                 campo('Tipo Saída', dcc.Dropdown(id='diario-tipo-saida', options=_opcoes_diario(dt.TIPO_SAIDA),
-                                                  style={'width': '150px'})),
-            ),
-            linha(
-                campo('Resultado (pts)', dcc.Input(id='diario-resultado', type='number', style=estilo_input({'width': '130px'}))),
-                campo('Saldo (R$)', dcc.Input(id='diario-saldo', type='number', style=estilo_input({'width': '130px'}))),
+                                                  className='classico-dropdown')),
+                campo('Resultado (pts)', dcc.Input(id='diario-resultado', type='text', inputMode='decimal',
+                                                    style=estilo_input())),
+                campo('Saldo (R$)', dcc.Input(id='diario-saldo', type='text', inputMode='decimal',
+                                               style=estilo_input())),
             ),
         ])),
 
         _bloco_diario('Nível de S/R referenciado (opcional)', html.Div([
-            linha(
-                campo('Preço', dcc.Input(id='diario-nivel-sr', type='number', style=estilo_input({'width': '130px'}))),
+            grade(
+                campo('Preço', dcc.Input(id='diario-nivel-sr', type='text', inputMode='decimal',
+                                          style=estilo_input())),
                 campo('Tipo', dcc.Input(id='diario-nivel-sr-tipo', type='text', placeholder='ex: suporte',
-                                         style=estilo_input({'width': '170px'}))),
+                                         style=estilo_input())),
             ),
         ])),
 
         _bloco_diario('Anotações', html.Div([
-            campo('Resumo Operacional', dcc.Textarea(id='diario-resumo', rows=3, style=estilo_input({'resize': 'none'}))),
-            campo('Obs (autocoaching)', dcc.Textarea(id='diario-obs', rows=2, style=estilo_input({'resize': 'none'}))),
+            campo('Resumo Operacional', dcc.Textarea(id='diario-resumo', rows=3, style=estilo_input({'resize': 'none', 'height': 'auto'}))),
+            campo('Obs (autocoaching)', dcc.Textarea(id='diario-obs', rows=2, style=estilo_input({'resize': 'none', 'height': 'auto'}))),
             campo('Tags de Setup/Erro', dcc.Dropdown(id='diario-tags-setup-erro', multi=True,
-                                                       options=_opcoes_diario(dt.TAGS_SETUP_ERRO_INICIAIS))),
+                                                       options=_opcoes_tags_setup_erro(),
+                                                       className='classico-dropdown classico-dropdown-tags')),
         ])),
+
+        _bloco_emocional(
+            id_confianca='diario-emo-confianca', id_humor='diario-emo-humor',
+            id_energia='diario-emo-energia', id_atencao='diario-emo-atencao',
+            id_presenca='diario-emo-presenca', id_tags='diario-tags-emocionais',
+            id_sentimento='diario-sentimento-mercado', id_label_sentimento='diario-sentimento-label',
+        ),
 
         _bloco_diario('Print', html.Div([
             html.Div('Cole (Ctrl+V) um print ou envie um arquivo:', style={
@@ -249,23 +533,127 @@ def _lista_segura(valor) -> list:
     return list(valor) if hasattr(valor, '__iter__') else []
 
 
+def _slugificar_tag(nome: str) -> str:
+    """Mesmo algoritmo de `diario_trade._slugificar` — duplicado aqui (não
+    é reaproveitado do módulo-privado à toa) só pra decidir o `value` de um
+    chip de tag ainda NÃO persistido, ver `criar_tag_emocional_digitada_match`.
+    O cadastro definitivo em disco sempre passa por `dt.criar_tag_emocional`,
+    que recalcula o mesmo slug de novo a partir do nome — nunca dessincroniza."""
+    import re
+    import unicodedata
+    sem_acento = unicodedata.normalize('NFKD', nome.strip().lower())
+    sem_acento = ''.join(c for c in sem_acento if not unicodedata.combining(c))
+    s = re.sub(r'[\s\-]+', '_', sem_acento)
+    s = re.sub(r'[^a-z0-9_]', '', s)
+    return s or 'sem_nome'
+
+
+def _parse_index_par(index):
+    """Se `index` (de um `dash.MATCH`/`id_componente['index']`) for um par
+    de hedge — string `"ticket_a-ticket_b"`, ver
+    `dt.montar_posicao_sintetica_par` — devolve `(ticket_a, ticket_b)`;
+    senão `None` (é um ticket avulso normal, int ou string numérica)."""
+    texto = str(index)
+    partes = texto.split('-')
+    if len(partes) != 2:
+        return None
+    try:
+        return int(partes[0]), int(partes[1])
+    except ValueError:
+        return None
+
+
+def _ticket_alvo(index):
+    """Ticket MT5 que deve receber ações de rascunho (nota/imagem) pra este
+    `index` — pra um par de hedge, escreve sempre na perna de ENTRADA
+    (`ticket_a`), mesma decisão de `finalizar_par_hedge`/
+    `montar_posicao_sintetica_par`; pra um ticket avulso, é o próprio."""
+    par = _parse_index_par(index)
+    return par[0] if par else index
+
+
+def _estilo_thumb_imagem_principal(selecionada: bool) -> dict:
+    return {
+        'width': '120px', 'height': '80px', 'objectFit': 'cover', 'borderRadius': '6px',
+        'cursor': 'pointer', 'display': 'block',
+        'border': f"3px solid {C['gold'] if selecionada else C['border']}",
+        'opacity': '1' if selecionada else '0.7',
+    }
+
+
+def _campo_imagem_principal(id_pos, imagens: list) -> html.Div | None:
+    """Escolhe qual imagem da galeria vira a capa oficial do trade
+    (`imagem_arquivo`) — feedback 2026-07-20: "deve trazer a última como
+    padrão e deve mostrar a miniatura pra selecionar (um pouco maior do
+    que o normal, já que é difícil ver uma tela de gráfico em miniatura)".
+    Substitui o dropdown de texto (só nome de arquivo, sem preview nenhum)
+    por miniaturas clicáveis MAIORES que a galeria comum (`_bloco_posicao_
+    live`, 70×46px) — mesmo padrão de clique pattern-matched já usado em
+    `ampliar_imagem`/`_registrar_clique_estrela_match`, sem precisar de JS
+    novo. Default = última imagem anexada (mais recente), sempre — ver
+    `escolher_imagem_principal`/`destacar_imagem_principal`."""
+    if not imagens:
+        return None
+    selecionada = imagens[-1]
+    thumbs = [
+        html.Img(
+            src=f'/diario-imagens/{nome}',
+            id={'type': 'ea-imagem-thumb-escolher', 'index': id_pos, 'nome': nome},
+            n_clicks=0,
+            style=_estilo_thumb_imagem_principal(nome == selecionada),
+        )
+        for nome in imagens
+    ]
+    return html.Div([
+        html.Div('Imagem principal (clique pra escolher a capa do trade)', style={
+            'fontSize': '11px', 'color': C['text2'], 'marginBottom': '4px', 'fontFamily': FONTS['display']}),
+        html.Div(thumbs, style={'display': 'flex', 'gap': '8px', 'flexWrap': 'wrap'}),
+        dcc.Store(id={'type': 'ea-imagem-principal', 'index': id_pos}, data=selecionada),
+    ])
+
+
 def _bloco_finalizar_em_andamento(pos: dict, imagens: list) -> html.Div:
     campo = _campo_diario
     id_pos = pos['id_posicao']
-    opcoes_imagem = [{'label': nome, 'value': nome} for nome in imagens]
+    saida_estimada = bool(pos.get('saida_estimada'))
+    # Tipo de saída não é mais escolhido à mão (feedback diário.txt,
+    # 2026-07-11) — só um preview do que `dt.derivar_tipo_saida` vai gravar.
+    tipo_saida_previsto = dt.derivar_tipo_saida(
+        pos.get('tipo_operacao'), pos.get('preco_entrada'), pos.get('preco_saida'),
+        pos.get('sl'), pos.get('tp'),
+    )
+    # Campos de correção de saída SEMPRE renderizados (ver
+    # diario_app_98.py::_bloco_finalizar_em_andamento_98 pro mesmo
+    # raciocínio de não depender de um componente condicional que quebraria
+    # o agrupamento de dash.MATCH). O aviso só aparece quando a corretora
+    # não confirmou o fechamento real (bug confirmado em 2026-07-12).
+    aviso_saida = html.Div(
+        '⚠ Saída NÃO confirmada pela corretora — o valor abaixo é uma estimativa. '
+        'Confira/corrija antes de finalizar.',
+        style={'fontSize': '11px', 'color': C['yellow'], 'fontWeight': '700', 'marginBottom': '8px'},
+    ) if saida_estimada else None
+    campos_correcao_saida = html.Div([
+        campo('Preço de Saída (confira/corrija)', dcc.Input(
+            id={'type': 'ea-preco-saida-correcao', 'index': id_pos}, type='text', inputMode='decimal',
+            value=pos.get('preco_saida'), style=_estilo_input_diario({'width': '120px'}))),
+        campo('Data/Hora de Saída (confira/corrija, AAAA-MM-DD HH:MM)', dcc.Input(
+            id={'type': 'ea-datahora-saida-correcao', 'index': id_pos}, type='text',
+            value=str(pos.get('datetime_saida'))[:16] if pos.get('datetime_saida') else '',
+            style=_estilo_input_diario({'width': '180px'}))),
+    ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap', 'marginBottom': '8px'})
+    aviso_e_correcao = ([aviso_saida] if aviso_saida is not None else []) + [campos_correcao_saida]
     return html.Div([
         html.Div('Finalizar operação', style={
             'fontSize': '11px', 'color': C['gold'], 'fontFamily': FONTS['display'],
             'fontWeight': '700', 'marginTop': '14px', 'marginBottom': '6px',
         }),
-        html.Div([
-            campo('Tipo de Saída', dcc.Dropdown(id={'type': 'ea-tipo-saida', 'index': id_pos},
-                  options=_opcoes_diario(dt.TIPO_SAIDA), style={'width': '160px'})),
-            campo('Tags Setup/Erro', dcc.Dropdown(id={'type': 'ea-tags-erro', 'index': id_pos}, multi=True,
-                  options=_opcoes_diario(dt.TAGS_SETUP_ERRO_INICIAIS), style={'width': '260px'})),
-        ] + ([campo('Imagem principal', dcc.Dropdown(id={'type': 'ea-imagem-principal', 'index': id_pos},
-                    options=opcoes_imagem, style={'width': '220px'}))] if opcoes_imagem else []),
-            style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+        html.Div(f'Tipo de saída (calculado a partir do MT5): {tipo_saida_previsto}',
+                 style={'fontSize': '11px', 'color': C['text2'], 'marginBottom': '8px'}),
+    ] + aviso_e_correcao + [
+        campo('Tags Setup/Erro', dcc.Dropdown(id={'type': 'ea-tags-erro', 'index': id_pos}, multi=True,
+              options=_opcoes_tags_setup_erro(),
+              className='classico-dropdown classico-dropdown-tags', style={'width': '260px'})),
+    ] + ([_campo_imagem_principal(id_pos, imagens)] if imagens else []) + [
         html.Button('Finalizar e gravar no Diário', id={'type': 'ea-btn-finalizar', 'index': id_pos}, n_clicks=0, style={
             'background': C['gold'], 'color': C['bg'], 'border': 'none', 'borderRadius': '6px',
             'padding': '7px 18px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
@@ -274,9 +662,17 @@ def _bloco_finalizar_em_andamento(pos: dict, imagens: list) -> html.Div:
     ])
 
 
-def _bloco_posicao_em_andamento(pos: dict) -> html.Div:
-    campo = _campo_diario
-    estilo_input = _estilo_input_diario
+def _bloco_posicao_live(pos: dict) -> html.Div:
+    """Parte SÓ-LEITURA do card de posição (preço/P&L/notas já salvas) —
+    reconstruída a cada 6s pelo `interval-em-andamento` (ver
+    `atualizar_em_andamento`). Deliberadamente SEM nenhum campo editável:
+    ver `_bloco_posicao_form` pro raciocínio de por que a classificação
+    (estratégia/estrelas/sentimento/resumo/nota) foi separada num Output
+    PRÓPRIO, nunca tocado pelo interval — um `dcc.Input`/`dcc.Slider`
+    reconstruído com `value=` fresco do disco a cada 6s sobrescreve
+    qualquer edição não salva do usuário, isso é o que causava o
+    "Neutro piscando" (o valor persistido reaparecendo por cima do que o
+    usuário acabou de arrastar/clicar) reportado em 2026-07-11."""
     id_pos = pos['id_posicao']
     cor_direcao = C['green'] if pos.get('tipo_operacao') == 'long' else C['red']
     pendente = pos.get('status') == dt.STATUS_POSICAO_FECHADA_PENDENTE
@@ -299,49 +695,36 @@ def _bloco_posicao_em_andamento(pos: dict) -> html.Div:
         }) for nome in imagens
     ], style={'display': 'flex', 'flexWrap': 'wrap'}) if imagens else None
 
+    par_hedge = bool(pos.get('par_hedge'))
     preco_ref = pos.get('preco_saida') if pendente else pos.get('preco_atual')
-    label_ref = 'Saída' if pendente else 'Atual'
+    if pendente:
+        label_ref = 'Saída (⚠ estimada)' if pos.get('saida_estimada') else 'Saída'
+    else:
+        label_ref = 'Atual'
     pnl_pts = pos.get('pnl_pontos_final') if pendente else pos.get('pnl_pontos')
     pnl_reais = pos.get('pnl_reais_final') if pendente else pos.get('pnl_reais')
+    # Achado real 2026-07-15: "AGUARDANDO CONFIRMAÇÃO" faz sentido pro caso
+    # antigo (saída estimada, ver comentário em sincronizar_posicoes_abertas),
+    # mas é confuso/errado pra um par de hedge — ali a saída É confirmada
+    # (preço real da posição oposta que fechou o par), só não veio de uma
+    # perna OUT no mesmo ticket. Ver montar_posicao_sintetica_par.
+    if pendente and par_hedge:
+        status_txt, status_cor = ' ✓ FECHADA (par hedge — pronta pra finalizar)', C['green']
+    elif pendente:
+        status_txt, status_cor = ' ⚠ FECHADA — AGUARDANDO CONFIRMAÇÃO', C['yellow']
+    else:
+        status_txt, status_cor = ' ● ABERTA', C['green']
     detalhe = html.Div([
         html.Span((pos.get('tipo_operacao') or '—').upper(), style={
             'color': cor_direcao, 'fontSize': '11px', 'fontWeight': '700'}),
-        html.Span(' ⚠ FECHADA — AGUARDANDO CONFIRMAÇÃO' if pendente else ' ● ABERTA', style={
-            'marginLeft': '8px', 'fontSize': '10px', 'fontWeight': '700',
-            'color': C['yellow'] if pendente else C['green']}),
+        html.Span(status_txt, style={
+            'marginLeft': '8px', 'fontSize': '10px', 'fontWeight': '700', 'color': status_cor}),
         html.Div(
             f"Entrada {_fmt_num(pos.get('preco_entrada'))} · {label_ref} {_fmt_num(preco_ref)} · "
             f"Pts {_fmt_num(pnl_pts, sinal=True)} · R$ {_fmt_num(pnl_reais, sinal=True, casas=2)}",
             style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['mono'], 'marginTop': '2px'}
         ),
     ])
-
-    campos_classificacao = html.Div([
-        campo('Estratégia', dcc.Dropdown(
-            id={'type': 'ea-estrategia', 'index': id_pos}, multi=True,
-            options=_opcoes_diario(dt.ESTRATEGIA_TAGS_CANONICAS),
-            value=_lista_segura(pos.get('estrategia_tags_preliminar')) or None, style={'width': '260px'})),
-        campo('Sala/Análise', dcc.Dropdown(
-            id={'type': 'ea-sala', 'index': id_pos}, options=_opcoes_diario(dt.SALA_ANALISE_CANONICA),
-            value=pos.get('sala_analise_preliminar'), style={'width': '170px'})),
-        campo('Alvo (pts)', dcc.Input(id={'type': 'ea-alvo', 'index': id_pos}, type='number',
-              value=pos.get('alvo_pontos_preliminar'), style=estilo_input({'width': '100px'}))),
-        campo('Stop (pts)', dcc.Input(id={'type': 'ea-stop', 'index': id_pos}, type='number',
-              value=pos.get('stop_pontos_preliminar'), style=estilo_input({'width': '100px'}))),
-    ], style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginTop': '10px'})
-
-    nota_input = html.Div([
-        dcc.Textarea(id={'type': 'ea-nota', 'index': id_pos}, rows=2,
-                     placeholder='Escreva uma nova anotação (análise durante ou depois da operação)...',
-                     style=estilo_input({'resize': 'none'})),
-        html.Button('Salvar', id={'type': 'ea-btn-salvar', 'index': id_pos}, n_clicks=0, style={
-            'background': C['green'], 'color': C['bg'], 'border': 'none', 'borderRadius': '6px',
-            'padding': '6px 16px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
-            'fontWeight': '700', 'fontSize': '11px', 'marginTop': '6px',
-        }),
-        html.Div(id={'type': 'ea-status', 'index': id_pos}, style={
-            'fontSize': '11px', 'color': C['text2'], 'marginTop': '4px'}),
-    ], style={'marginTop': '10px'})
 
     filhos = [
         detalhe,
@@ -350,12 +733,121 @@ def _bloco_posicao_em_andamento(pos: dict) -> html.Div:
     ]
     if galeria:
         filhos.append(galeria)
-    filhos.append(campos_classificacao)
-    filhos.append(nota_input)
+    return _bloco_diario(f"{pos.get('ativo', '—')} · {pos.get('contrato', '—')}", html.Div(filhos))
+
+
+def _bloco_posicao_form(pos: dict, imagens: list) -> html.Div:
+    """Parte EDITÁVEL do card de posição (classificação/estrelas/
+    sentimento/resumo/nota nova) — ver `_bloco_posicao_live` pro raciocínio
+    completo de por que isso vive num Output separado, atualizado só ao
+    entrar na aba Posição (ou pelo botão "Atualizar formulários"), nunca
+    pelo `interval-em-andamento` de 6s."""
+    campo = _campo_diario
+    estilo_input = _estilo_input_diario
+    id_pos = pos['id_posicao']
+    pendente = pos.get('status') == dt.STATUS_POSICAO_FECHADA_PENDENTE
+
+    campos_classificacao = html.Div([
+        campo('Estratégia', dcc.Dropdown(
+            id={'type': 'ea-estrategia', 'index': id_pos}, multi=True,
+            options=_opcoes_estrategias(),
+            value=_lista_segura(pos.get('estrategia_tags_preliminar')) or None,
+            className='classico-dropdown classico-dropdown-tags', style={'width': '260px'})),
+        campo('Sala/Análise', dcc.Dropdown(
+            id={'type': 'ea-sala', 'index': id_pos}, options=_opcoes_diario(dt.SALA_ANALISE_CANONICA),
+            value=pos.get('sala_analise_preliminar'), className='classico-dropdown', style={'width': '170px'})),
+        campo('R:R', dcc.Dropdown(
+            id={'type': 'ea-rr-preset', 'index': id_pos},
+            options=[{'label': l['nome'], 'value': l['id']} for _, l in dt.listar_rr_presets().iterrows()],
+            placeholder='nenhuma', className='classico-dropdown', style={'width': '140px'})),
+        campo('Alvo (pts)', dcc.Input(id={'type': 'ea-alvo', 'index': id_pos}, type='text', inputMode='decimal',
+              debounce=True, value=pos.get('alvo_pontos_preliminar'), style=estilo_input({'width': '130px'}))),
+        campo('Stop (pts)', dcc.Input(id={'type': 'ea-stop', 'index': id_pos}, type='text', inputMode='decimal',
+              debounce=True, value=pos.get('stop_pontos_preliminar'), style=estilo_input({'width': '130px'}))),
+        # R:R calculado automaticamente a partir de Alvo/Stop (feedback
+        # 2026-07-20) — só leitura, não confundir com o preset acima (que
+        # PREENCHE Alvo/Stop a partir de um valor salvo; este aqui é o
+        # inverso, deriva o número a partir do que já está nos campos).
+        campo('R:R calculado', html.Div(
+            id={'type': 'ea-rr-calculado', 'index': id_pos},
+            style={'fontSize': '13px', 'fontFamily': FONTS['mono'], 'color': C['text2'], 'paddingTop': '7px'})),
+        campo('Nível S/R referenciado', dcc.Input(id={'type': 'ea-nivel-sr', 'index': id_pos}, type='text', inputMode='decimal',
+              debounce=True, value=pos.get('nivel_sr_referencia_preliminar'), style=estilo_input({'width': '140px'}))),
+    ], style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginTop': '10px'})
+
+    resumo_input = campo('Resumo Operacional', dcc.Textarea(
+        id={'type': 'ea-resumo', 'index': id_pos}, rows=4,
+        value=pos.get('resumo_operacional_preliminar'), style=estilo_input({'resize': 'none', 'height': 'auto'})))
+
+    bloco_emocional = _bloco_emocional(
+        id_confianca={'type': 'ea-emo-confianca', 'index': id_pos},
+        id_humor={'type': 'ea-emo-humor', 'index': id_pos},
+        id_energia={'type': 'ea-emo-energia', 'index': id_pos},
+        id_atencao={'type': 'ea-emo-atencao', 'index': id_pos},
+        id_presenca={'type': 'ea-emo-presenca', 'index': id_pos},
+        id_tags={'type': 'ea-tags-emocionais', 'index': id_pos},
+        id_sentimento={'type': 'ea-sentimento-mercado', 'index': id_pos},
+        id_label_sentimento={'type': 'ea-sentimento-label', 'index': id_pos},
+        valores={
+            'confianca': pos.get('emo_confianca_preliminar'), 'humor': pos.get('emo_humor_preliminar'),
+            'energia': pos.get('emo_energia_preliminar'), 'atencao': pos.get('emo_atencao_preliminar'),
+            'presenca': pos.get('emo_presenca_preliminar'), 'tags': pos.get('tags_emocionais_preliminar'),
+            'sentimento': pos.get('sentimento_mercado_preliminar'),
+        },
+        widget_tags_customizado=True,
+    )
+
+    # Feedback 2026-07-20 ("o sistema de salvamento é muito primitivo...
+    # qualquer sistema consegue salvar tudo imediatamente"): NENHUM campo
+    # deste formulário depende mais de um botão "Salvar" — a nota grava
+    # sozinha ao perder foco (`n_blur`, ver `salvar_nota_em_andamento`) e
+    # os demais campos (estratégia/sala/alvo/stop/nível S/R/resumo/
+    # estrelas/tags/sentimento) auto-salvam a cada mudança (ver
+    # `auto_salvar_campos_em_andamento`) — achado real: um trade fechado
+    # (par hedge) apareceu "Pronta pra Finalizar" com tudo em branco porque
+    # o usuário preencheu a classificação enquanto a posição ainda estava
+    # `aberta` e nunca clicou em "Salvar" antes dela fechar — sem botão,
+    # não tem como esquecer.
+    nota_input = html.Div([
+        dcc.Textarea(id={'type': 'ea-nota', 'index': id_pos}, rows=2,
+                     placeholder='Escreva uma nova anotação (análise durante ou depois da operação)... '
+                                  '(salva sozinha ao sair do campo)',
+                     style=estilo_input({'resize': 'none', 'height': 'auto'})),
+        html.Div(id={'type': 'ea-status', 'index': id_pos}, style={
+            'fontSize': '11px', 'color': C['text2'], 'marginTop': '4px'}),
+    ], style={'marginTop': '10px'})
+
+    # Campo de print embutido NESTE card (não mais um seletor+upload
+    # compartilhado no rodapé da aba — feedback de 2026-07-12: "eu quero
+    # que apareça o campo trade a trade, e não no final com seletor").
+    # Feedback 2026-07-20: "não faz sentido eu adicionar a imagem, e depois
+    # clicar no botão" (auto-anexa, ver `preview_e_anexar_imagem_em_
+    # andamento`) E "eu não quero ter que apertar em um botão para depois
+    # dar Ctrl+V, o sistema tem que capturar automaticamente" — o botão
+    # "clique aqui e cole" que "armava" este card pro próximo Ctrl+V foi
+    # removido; agora `assets/diario_paste.js` arma sozinho o card mais
+    # próximo de QUALQUER clique/foco (em qualquer campo do card — Resumo,
+    # Nota, Alvo, etc.), então colar já funciona assim que o usuário estiver
+    # interagindo com o card, sem esse passo extra.
+    imagem_bloco = html.Div([
+        html.Div('Anexar print desta posição (cole com Ctrl+V ou envie um arquivo):', style={
+            'fontSize': '11px', 'color': C['text2'], 'marginTop': '10px', 'marginBottom': '4px'}),
+        dcc.Upload(
+            id={'type': 'ea-upload-imagem', 'index': id_pos},
+            children=html.Div('Arraste ou clique pra selecionar um arquivo', style={'fontSize': '12px'}),
+            style={
+                'background': C['bg'], 'border': f'1px dashed {C["border"]}', 'borderRadius': '8px',
+                'padding': '10px', 'textAlign': 'center', 'cursor': 'pointer', 'color': C['text2'],
+            },
+        ),
+        html.Div(id={'type': 'ea-preview-imagem', 'index': id_pos}, style={'marginTop': '8px'}),
+    ], style={'marginTop': '10px'})
+
+    filhos = [campos_classificacao, resumo_input, bloco_emocional, nota_input, imagem_bloco]
     if pendente:
         filhos.append(_bloco_finalizar_em_andamento(pos, imagens))
 
-    return _bloco_diario(f"{pos.get('ativo', '—')} · {pos.get('contrato', '—')}", html.Div(filhos))
+    return _bloco_diario(f"{pos.get('ativo', '—')} · {pos.get('contrato', '—')} — Classificação", html.Div(filhos))
 
 
 def _fmt_num(valor, sinal=False, casas=0) -> str:
@@ -406,59 +898,184 @@ def _secao_ordens_pendentes(ordens: pd.DataFrame) -> html.Div | None:
     return _bloco_diario('Ordens Pendentes (ainda não executadas)', html.Div(linhas))
 
 
-def _renderizar_em_andamento(posicoes: pd.DataFrame, ordens: pd.DataFrame | None = None) -> html.Div:
-    secao_ordens = _secao_ordens_pendentes(ordens) if ordens is not None else None
+def _preparar_registros_posicao(posicoes: pd.DataFrame) -> tuple[list, dict, dict]:
+    """
+    Mescla pares de hedge (ver `dt.detectar_pares_hedge`) com posições
+    avulsas (não pareadas) e agrupa por `ativo` — fonte única de verdade
+    pras funções de render abaixo, pra nunca divergir entre a parte
+    ao-vivo, a parte editável e a seção de pendentes no Histórico. Achado
+    real 2026-07-15: cada ORDEM/ticket virava seu próprio card+formulário
+    (Jesué opera com OCO, então SL/TP disparando cria posições opostas
+    novas no MT5 em vez de fechar a original) — o usuário quer 1 card por
+    TRADE, não por ticket.
 
+    Feedback 2026-07-16 ("a visualização deve ser dinâmica, apenas as
+    posições abertas... trade fechado vai pro histórico"): separa o
+    resultado em DOIS grupos por ativo em vez de um só —
+    `por_ativo_abertas` (só avulsas genuinamente `status='aberta'`, sem
+    par — o que continua aparecendo na aba Posição) e `por_ativo_prontas`
+    (pares de hedge mesclados — SEMPRE prontos, ver
+    `montar_posicao_sintetica_par` — + avulsas já `fechada_pendente` —
+    migraram pra uma seção "Pendente de Classificação" dentro do
+    Histórico; mesmo formulário de sempre, só mudou onde mora).
+
+    Retorna `(pares_crus, por_ativo_abertas, por_ativo_prontas)` — os
+    dicts dentro de cada lista já estão no formato de
+    `montar_posicao_sintetica_par` (pares) ou da linha original do
+    parquet (avulsas), prontos pra `_bloco_posicao_live`/`_bloco_posicao_form`
+    sem distinção nenhuma.
+    """
     if posicoes is None or posicoes.empty:
-        vazio = html.Div('Nenhuma posição aberta ou aguardando confirmação no momento.', style={
-            'padding': '20px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '13px',
-        })
-        return html.Div([vazio, secao_ordens] if secao_ordens else vazio)
+        return [], {}, {}
+    pares = dt.detectar_pares_hedge(posicoes)
+    tickets_pareados = {p['ticket_a'] for p in pares} | {p['ticket_b'] for p in pares}
+    sinteticas = [dt.montar_posicao_sintetica_par(par, posicoes) for par in pares]
+    avulsas = [p for p in posicoes.to_dict('records') if p['id_posicao'] not in tickets_pareados]
+    avulsas_abertas = [p for p in avulsas if p.get('status') == dt.STATUS_POSICAO_ABERTA]
+    avulsas_prontas = [p for p in avulsas if p.get('status') != dt.STATUS_POSICAO_ABERTA]
 
-    registros = posicoes.to_dict('records')
-    blocos = [_bloco_posicao_em_andamento(p) for p in registros]
+    por_ativo_abertas: dict[str, list] = {}
+    for r in avulsas_abertas:
+        por_ativo_abertas.setdefault(r.get('ativo') or '—', []).append(r)
 
-    opcoes_posicao = [
-        {'label': f"{p.get('ativo')} · entrada {_fmt_num(p.get('preco_entrada'))} · "
-                  f"{'aguardando confirmação' if p.get('status') == dt.STATUS_POSICAO_FECHADA_PENDENTE else 'aberta'}",
-         'value': p['id_posicao']}
-        for p in registros
+    por_ativo_prontas: dict[str, list] = {}
+    for r in sinteticas + avulsas_prontas:
+        por_ativo_prontas.setdefault(r.get('ativo') or '—', []).append(r)
+
+    return pares, por_ativo_abertas, por_ativo_prontas
+
+
+def _secao_status_posicoes(posicoes: pd.DataFrame, pares: list) -> html.Div:
+    """Resumo rápido da aba — quantas posições existem agora (por ativo),
+    quantos pares de hedge já foram mesclados num trade só, e se sobra
+    exposição líquida real por contrato (ver `dt.calcular_exposicao_residual`
+    — Requisito 4 da especificação de pareamento hedge, 2026-07-16), pra
+    deixar explícito o que a seção "Status" está mostrando antes de descer
+    pros cards de cada ativo."""
+    total = 0 if posicoes is None or posicoes.empty else len(posicoes)
+    n_win = 0 if not total else int((posicoes['ativo'] == 'WIN').sum())
+    n_wdo = 0 if not total else int((posicoes['ativo'] == 'WDO').sum())
+    linhas = [
+        (f"{total} posição(ões)/ordem(ns) rastreada(s) no MT5 agora — {n_win} WIN, {n_wdo} WDO.", C['text2']),
+        (f"{len(pares)} par(es) de hedge detectado(s) (SL/TP oposto virou posição nova) — "
+         f"mesclado(s) automaticamente em 1 trade líquido cada." if pares
+         else "Nenhum par de hedge detectado agora.", C['text2']),
     ]
-    anexar = _bloco_diario('Anexar print (cole com Ctrl+V ou envie um arquivo)', html.Div([
-        _campo_diario('Posição', dcc.Dropdown(id='em-andamento-select-posicao', options=opcoes_posicao,
-                                                style={'width': '320px'})),
-        dcc.Upload(
-            id='em-andamento-upload-imagem',
-            children=html.Div('Arraste ou clique pra selecionar um arquivo', style={'fontSize': '12px'}),
-            style={
-                'background': C['bg'], 'border': f'1px dashed {C["border"]}', 'borderRadius': '8px',
-                'padding': '12px', 'textAlign': 'center', 'cursor': 'pointer', 'color': C['text2'],
-                'marginTop': '8px',
-            },
-        ),
-        html.Div(id='em-andamento-preview-imagem', style={'marginTop': '8px'}),
-        html.Button('Anexar à posição selecionada', id='btn-em-andamento-anexar', n_clicks=0, style={
-            'background': C['green'], 'color': C['bg'], 'border': 'none', 'borderRadius': '6px',
-            'padding': '7px 18px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
-            'fontWeight': '700', 'fontSize': '12px', 'marginTop': '8px',
-        }),
-        html.Div(id='em-andamento-anexar-status', style={'marginTop': '6px', 'fontSize': '11px', 'color': C['text2']}),
+    residual = dt.calcular_exposicao_residual(posicoes)
+    sobras = {contrato: liquido for contrato, liquido in residual.items() if liquido != 0}
+    if sobras:
+        texto_sobras = ', '.join(f"{contrato}: {liquido:+.0f}" for contrato, liquido in sobras.items())
+        linhas.append((f"⚠ Exposição líquida real (sem par no momento) — {texto_sobras}.", C['yellow']))
+    else:
+        linhas.append(("Exposição líquida zerada em todos os contratos — nenhum risco de mercado residual.", C['text2']))
+    return _bloco_diario('Status das Posições', html.Div([
+        html.Div(t, style={'fontSize': '12px', 'color': cor, 'marginBottom': '4px'}) for t, cor in linhas
     ]))
 
-    filhos = blocos + [anexar]
+
+def _registros_por_ativo(mapa: dict, ativo_selecionado: str) -> list:
+    """Junta os registros do ativo selecionado com qualquer "outro" ativo
+    fora de WIN/WDO (não deveria existir na prática, mas não pode
+    desaparecer silenciosamente se existir) — mesmo filtro usado tanto
+    pelas posições abertas quanto pelas prontas pra finalizar."""
+    registros = list(mapa.get(ativo_selecionado, []))
+    for ativo_nome, lista in mapa.items():
+        if ativo_nome not in ('WIN', 'WDO'):
+            registros.extend(lista)
+    return registros
+
+
+def _bloco_posicao_completo(p: dict, imagens: list) -> html.Div:
+    """Info ao vivo (só-leitura) + formulário editável EMPILHADOS num único
+    bloco — feedback 2026-07-20: "quando um trade está aberto aparecem as
+    informações do trade desconectados do formulário... o formulário deve
+    ficar logo abaixo do bloco do trade aberto". Reaproveita
+    `_bloco_posicao_live`/`_bloco_posicao_form` sem alteração nenhuma, só
+    muda ONDE ficam (adjacentes, um container Dash só — antes viviam em
+    dois Outputs separados, `em-andamento-conteudo`/`em-andamento-
+    formularios`, um bem abaixo do outro na página)."""
+    return html.Div([_bloco_posicao_live(p), _bloco_posicao_form(p, imagens)],
+                     style={'marginBottom': '16px'})
+
+
+def _ids_rastreados(registros_prontas: list, registros_abertas: list) -> list:
+    """"Assinatura" do conjunto atual de posições (prontas + abertas) pro
+    ativo selecionado — usada só pra decidir SE alguma coisa realmente
+    mudou (posição nova, fechou, virou par) entre um tick do interval e o
+    anterior, ver `atualizar_em_andamento`."""
+    return sorted(str(r['id_posicao']) for r in registros_prontas + registros_abertas)
+
+
+def _renderizar_posicao_completa(posicoes: pd.DataFrame, ordens: pd.DataFrame | None = None,
+                                  ativo_selecionado: str = 'WIN') -> html.Div:
+    """Substitui `_renderizar_em_andamento` + `_renderizar_formularios_em_
+    andamento` (unificados em 2026-07-20 — ver `_bloco_posicao_completo`
+    pro raciocínio do porquê). Mostra só o ativo selecionado na sub-aba
+    WIN/WDO da Posição (feedback 2026-07-16).
+
+    Feedback 2026-07-17: "se eu já preenchi as informações do trade e
+    salvei em Posições, não faz sentido aparecer pendência/confirmação no
+    histórico" — os "prontos pra finalizar" (pares hedge, fechada_pendente)
+    aparecem numa seção própria acima das posições genuinamente abertas
+    (ver `_bloco_posicao_live` pro badge que diferencia "● ABERTA" de
+    "✓ FECHADA — pronta pra finalizar")."""
+    pares, por_ativo_abertas, por_ativo_prontas = _preparar_registros_posicao(posicoes)
+    status = _secao_status_posicoes(posicoes, pares)
+
+    registros_prontas = _registros_por_ativo(por_ativo_prontas, ativo_selecionado)
+    registros_abertas = _registros_por_ativo(por_ativo_abertas, ativo_selecionado)
+
+    ordens_ativo = ordens
+    if ordens is not None and not ordens.empty:
+        ordens_ativo = ordens[ordens['ativo'] == ativo_selecionado]
+    secao_ordens = _secao_ordens_pendentes(ordens_ativo) if ordens_ativo is not None else None
+
+    filhos = [status]
     if secao_ordens:
         filhos.append(secao_ordens)
+    if registros_prontas:
+        blocos_prontas = [_bloco_posicao_completo(p, _lista_segura(p.get('imagens_em_andamento')))
+                           for p in registros_prontas]
+        filhos.append(_bloco_diario(f'Pronta pra Finalizar — {ativo_selecionado} ({len(registros_prontas)})',
+                                     html.Div(blocos_prontas)))
+    if not registros_abertas:
+        vazio = html.Div(f'Nenhuma posição {ativo_selecionado} aberta no momento.', style={
+            'padding': '20px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '13px',
+        })
+        filhos.append(vazio)
+    else:
+        blocos = [_bloco_posicao_completo(p, _lista_segura(p.get('imagens_em_andamento')))
+                  for p in registros_abertas]
+        filhos.append(_bloco_diario(f'Posições {ativo_selecionado}', html.Div(blocos)))
     return html.Div(filhos)
 
 
 def _construir_diario_em_andamento() -> html.Div:
     return html.Div([
+        # Sub-abas WIN/WDO (feedback 2026-07-16: "eu quero WDO e WIN
+        # separados em sub-abas da aba Posições") — mesmo padrão de
+        # Store+botões+callback de estilo já usado pras abas principais do
+        # Diário (`store-diario-sub-aba`), só que aninhado aqui dentro.
+        dcc.Store(id='store-posicao-ativo-subaba', data='WIN'),
+        html.Div([
+            html.Button(nome, id=f'btn-posicao-ativo-{nome}', n_clicks=0,
+                        style=_estilo_subaba_diario(nome, 'WIN'))
+            for nome in ('WIN', 'WDO')
+        ], style={'display': 'flex', 'gap': '8px', 'marginBottom': '12px'}),
         dcc.Interval(id='interval-em-andamento', interval=6_000, n_intervals=0),
+        # Guarda a "assinatura" (ids) do último render pra decidir se um
+        # tick do interval precisa reconstruir alguma coisa de verdade —
+        # ver `atualizar_em_andamento`.
+        dcc.Store(id='store-em-andamento-ids-conhecidos', data=[]),
         html.Div(id='em-andamento-conteudo'),
         # Reaproveita o MESMO id/JS global de colagem (assets/diario_paste.js)
         # do Novo Trade — seguro porque as sub-abas nunca ficam montadas ao
         # mesmo tempo (`montar_sub_aba_diario` troca o conteúdo inteiro).
         dcc.Store(id='store-diario-imagem-colada'),
+        # Qual card está "armado" pra receber o próximo Ctrl+V — ver
+        # `assets/diario_paste.js` (clicar/focar em qualquer campo do card
+        # já arma sozinho, sem botão).
+        dcc.Store(id='store-diario-posicao-ativa-print'),
     ])
 
 
@@ -470,43 +1087,305 @@ def _td_diario(conteudo, extra=None) -> html.Td:
     return html.Td(conteudo, style=estilo)
 
 
-def _linha_historico(trade: pd.Series) -> html.Tr:
-    tags = trade['estrategia_tags']
-    tags_str = ', '.join(tags) if hasattr(tags, '__iter__') else ''
+# Aderência S/R deixou de ser aba própria (feedback diário.txt, 2026-07-11)
+# — vira coluna extra aqui (join por id_trade), ver diario_app_98.py pro
+# mesmo raciocínio.
+_COR_STATUS_ADERENCIA_SR = {
+    'visto_preciso': 'green', 'visto_proximo': 'yellow', 'nao_visto': 'red',
+}
+
+
+def _formatar_janela(chave: str | None) -> str:
+    """"Abertura (9:00-9:30)" — ver diario_app_98.py::_formatar_janela_98
+    pro mesmo raciocínio."""
+    if not chave or chave not in cfg.JANELAS_PREGAO:
+        return chave or '—'
+    inicio, fim = cfg.JANELAS_PREGAO[chave]
+    return f"{chave.replace('_', ' ').title()} ({inicio}-{fim})"
+
+
+def _opcoes_janelas() -> list[dict]:
+    return [{'label': _formatar_janela(k), 'value': k} for k in cfg.JANELAS_PREGAO.keys()]
+
+
+def _mapa_nomes_estrategias() -> dict:
+    return {l['slug']: l['nome'] for _, l in dt.listar_estrategias(somente_ativas=False).iterrows()}
+
+
+def _formatar_tags_estrategia(tags, mapa_nomes: dict) -> str:
+    lista = list(tags) if hasattr(tags, '__iter__') and not isinstance(tags, str) else []
+    return ', '.join(mapa_nomes.get(t, t.replace('_', ' ').title()) for t in lista) or '—'
+
+
+def _linha_historico(trade: pd.Series, aderencia_por_trade: dict, mapa_nomes_estrategias: dict) -> list[html.Tr]:
+    """Retorna 2 `Tr` (resumo + detalhe) em vez de 1 — feedback 2026-07-16:
+    "ao invés de colocar os detalhes do trade no final da página, coloque
+    na linha do histórico de forma que quando clicamos em Detalhes a linha
+    se expande... quando clicamos novamente esses detalhes ocultam,
+    voltando a se recolher". Substitui o popup/modal (`_overlay`) por uma
+    2ª linha de detalhe, inicialmente vazia (recolhida), alternada por
+    `alternar_detalhe_historico` (usa o próprio texto da seta como estado:
+    "▶" fechado, "▼" aberto — sem precisar de um `dcc.Store` por linha)."""
+    id_trade = int(trade['id_trade']) if pd.notna(trade.get('id_trade')) else None
+    tags_str = _formatar_tags_estrategia(trade['estrategia_tags'], mapa_nomes_estrategias)
     saldo = trade['saldo_operacao_reais']
     saldo_num = float(saldo) if pd.notna(saldo) else 0.0
     cor_saldo = C['green'] if saldo_num > 0 else (C['red'] if saldo_num < 0 else C['text2'])
     thumb = (
-        html.Img(src=f"/diario-imagens/{trade['imagem_arquivo']}", style={
-            'width': '56px', 'height': '36px', 'objectFit': 'cover', 'borderRadius': '4px',
-            'border': f'1px solid {C["border"]}',
-        }) if trade.get('imagem_arquivo') else html.Span('—', style={'color': C['text2']})
+        html.Img(src=f"/diario-imagens/{trade['imagem_arquivo']}",
+                 id={'type': 'diario-img-thumb', 'index': id_trade}, n_clicks=0,
+                 style={
+                     'width': '56px', 'height': '36px', 'objectFit': 'cover', 'borderRadius': '4px',
+                     'border': f'1px solid {C["border"]}', 'cursor': 'pointer',
+                 }) if trade.get('imagem_arquivo') and id_trade is not None else html.Span('—', style={'color': C['text2']})
     )
-    return html.Tr([
+    classificacao = aderencia_por_trade.get(id_trade) if id_trade is not None else None
+    celula_aderencia = (
+        _td_diario(classificacao.replace('_', ' '),
+                   extra={'color': C[_COR_STATUS_ADERENCIA_SR.get(classificacao, 'text2')], 'fontSize': '10px'})
+        if classificacao else _td_diario('—')
+    )
+    botao_expandir = (
+        html.Button('▶', id={'type': 'diario-btn-expandir', 'index': id_trade}, n_clicks=0, style={
+            'background': 'transparent', 'color': C['text2'], 'border': f'1px solid {C["border"]}',
+            'borderRadius': '4px', 'padding': '2px 10px', 'cursor': 'pointer', 'fontSize': '11px',
+        }) if id_trade is not None else ''
+    )
+    linha_resumo = html.Tr([
         _td_diario(str(trade['data_op'])),
         _td_diario(trade['ativo']),
-        _td_diario(trade.get('janela_pregao') or '—'),
-        _td_diario(tags_str or '—'),
+        _td_diario(_formatar_janela(trade.get('janela_pregao'))),
+        _td_diario(tags_str),
         _td_diario(trade.get('tipo_operacao') or '—'),
         _td_diario(f"{trade['resultado_pontos']:+.0f}" if pd.notna(trade['resultado_pontos']) else '—'),
         _td_diario(f"R$ {saldo_num:+.2f}" if pd.notna(saldo) else '—',
                    extra={'color': cor_saldo, 'fontWeight': '700'}),
         _td_diario(thumb),
+        celula_aderencia,
+        _td_diario(botao_expandir),
     ])
+    linha_detalhe = html.Tr(
+        html.Td(html.Div(id={'type': 'diario-detalhe-linha', 'index': id_trade}),
+                colSpan=10, style={'padding': '0', 'border': 'none'}),
+        id={'type': 'diario-tr-detalhe', 'index': id_trade},
+    ) if id_trade is not None else None
+    return [linha_resumo, linha_detalhe] if linha_detalhe is not None else [linha_resumo]
 
 
 def _construir_diario_historico() -> html.Div:
+    # Feedback 2026-07-17: a seção "Pendente de Classificação" que morava
+    # aqui (desde 2026-07-16) voltou pra aba Posição — trade fechado ainda
+    # precisa de 1 clique consciente em "Finalizar" antes de virar registro
+    # permanente, mas isso agora acontece sem trocar de aba (ver
+    # `_renderizar_posicao_completa`).
     return html.Div([
+        # Feedback 2026-07-20: "ao clicar na imagem anexada ela deve abrir
+        # em um pop-up e não no final da lista" — antes este overlay vivia
+        # no nível mais alto do layout, DEPOIS de toda a árvore de abas —
+        # com a tabela de Histórico podendo ter uma lista longa de trades,
+        # "rolar até o overlay" (`_registrar_scroll_ate_overlay`, ainda
+        # necessário por causa do iframe, ver `_overlay`) na prática rolava
+        # pra debaixo da tabela inteira, parecendo "abrir no final da
+        # lista". Morando aqui, no TOPO do próprio conteúdo do Histórico, o
+        # scroll cai sempre perto de onde a tabela começa, não no fim dela.
+        html.Div(id='diario-overlay-imagem'),
         html.Div([
             dcc.Dropdown(id='diario-hist-ativo', options=_opcoes_diario(cfg.ATIVOS),
-                         placeholder='Ativo', style={'width': '140px'}),
-            dcc.Dropdown(id='diario-hist-janela', options=_opcoes_diario(list(cfg.JANELAS_PREGAO.keys())),
-                         placeholder='Janela', style={'width': '170px'}),
-            dcc.Dropdown(id='diario-hist-estrategia', options=_opcoes_diario(dt.ESTRATEGIA_TAGS_CANONICAS),
-                         placeholder='Estratégia', style={'width': '200px'}),
-        ], style={'display': 'flex', 'gap': '10px', 'marginBottom': '14px', 'flexWrap': 'wrap'}),
+                         placeholder='Ativo', className='classico-dropdown', style={'width': '140px'}),
+            dcc.Dropdown(id='diario-hist-janela', options=_opcoes_janelas(),
+                         placeholder='Janela', className='classico-dropdown', style={'width': '190px'}),
+            dcc.Dropdown(id='diario-hist-estrategia', options=_opcoes_estrategias(),
+                         placeholder='Estratégia', className='classico-dropdown', style={'width': '200px'}),
+            dcc.Input(id='diario-hist-data-ini', type='date', style=_estilo_input_diario({'width': '150px'})),
+            html.Span('até', style={'fontSize': '12px', 'color': C['text2'], 'alignSelf': 'center'}),
+            dcc.Input(id='diario-hist-data-fim', type='date', style=_estilo_input_diario({'width': '150px'})),
+        ], style={'display': 'flex', 'gap': '10px', 'marginBottom': '8px', 'flexWrap': 'wrap', 'alignItems': 'center'}),
+        html.Div(id='diario-hist-banner-filtro-cal', style={'marginBottom': '10px'}),
         html.Div(id='diario-historico-tabela'),
     ])
+
+
+def _overlay(conteudo, id_backdrop: str) -> html.Div:
+    """Painel de detalhe — ver diario_app_98.py::_overlay_98 pro mesmo
+    raciocínio. NÃO usa mais `position:fixed` (bug real confirmado em
+    2026-07-16, comparando screenshot standalone :8053 vs embutido no
+    dashboard.py): o Diário roda num `<iframe>` que CRESCE pra caber TODO
+    o conteúdo, sem scroll próprio (`assets/diario_iframe_resize.js`) — um
+    elemento `fixed` ali é fixado à altura TOTAL do iframe (facilmente
+    2000px+), não ao viewport real da janela, então "centralizado" cai bem
+    abaixo da dobra e o usuário nunca via o popup abrir (o clique
+    "funcionava" — só o resultado ficava invisível). Fix: renderiza em
+    fluxo normal (sem `position:fixed`) + rola até ele automaticamente
+    (`_registrar_scroll_ate_overlay`) — não depende de altura de viewport
+    nenhuma, funciona igual embutido ou standalone.
+
+    Único uso hoje é o popup de imagem (feedback 2026-07-20: "preencher o
+    bloco inteiro") — por isso o wrapper de conteúdo é um flex column de
+    altura fixa (88vh) em vez do antigo maxWidth:900px + overflowY:auto
+    (pensado pra texto de altura variável); o filho (`renderizar_overlay_
+    imagem`) usa flex:1 no container de zoom pra ocupar o espaço todo."""
+    return html.Div([
+        html.Div(id=id_backdrop, n_clicks=0, style={
+            'position': 'absolute', 'top': 0, 'left': 0, 'right': 0, 'bottom': 0,
+            'background': 'rgba(0,0,0,0.55)', 'borderRadius': '10px',
+        }),
+        html.Div(conteudo, style={
+            'position': 'relative', 'maxWidth': '95vw', 'margin': '0 auto',
+            'height': '88vh', 'display': 'flex', 'flexDirection': 'column',
+        }),
+    ], id=f'{id_backdrop}-wrap', style={'position': 'relative', 'padding': '24px 16px'})
+
+
+def _registrar_scroll_ate_overlay(app, id_store: str, id_container_estavel: str, id_wrap: str):
+    """Rola a página até o painel de detalhe quando ele abre (`id_store`
+    vira não-None) — ver `_overlay` pro motivo de não dar mais pra confiar
+    em `position:fixed` pra centralizar.
+
+    `Output` mira `id_container_estavel` — o `html.Div` placeholder
+    declarado 1x no `app.layout` (`diario-overlay-detalhe`/`-imagem`,
+    SEMPRE presente, nunca removido), não o painel dinâmico `id_wrap`
+    (que só passa a existir depois que a OUTRA callback reagindo ao MESMO
+    Input já rodou) — evita depender de ordem entre as duas callbacks. O
+    `setTimeout` dá tempo do React montar o painel antes do
+    `getElementById` ir procurar por ele."""
+    app.clientside_callback(
+        f"""
+        function(valor) {{
+            if (valor) {{
+                setTimeout(function() {{
+                    var el = document.getElementById('{id_wrap}');
+                    if (el) {{ el.scrollIntoView({{behavior: 'smooth', block: 'start'}}); }}
+                }}, 60);
+            }}
+            return window.dash_clientside.no_update;
+        }}
+        """,
+        Output(id_container_estavel, 'title'),
+        Input(id_store, 'data'),
+        prevent_initial_call=True,
+    )
+
+
+def _campo_detalhe(label: str, valor) -> html.Div:
+    # Ver diario_app_98.py::_campo_detalhe_98 pro mesmo raciocínio
+    # (comparar com pd.isna, não com a string 'nan').
+    vazio = valor is None or valor == '' or (isinstance(valor, float) and pd.isna(valor))
+    return html.Div([
+        html.Span(f"{label}: ", style={'color': C['text2'], 'fontSize': '11px'}),
+        html.Span('—' if vazio else str(valor), style={'fontSize': '12px'}),
+    ], style={'marginBottom': '5px'})
+
+
+def _conteudo_detalhe_trade(id_trade: int) -> html.Div | None:
+    """Conteúdo do detalhe de uma operação — antes um popup/modal
+    (`position:fixed`, ver `_overlay`), agora renderizado DENTRO da própria
+    linha do Histórico (feedback 2026-07-16: "quando clicarmos em Detalhes
+    a linha se expande... clicarmos novamente esses detalhes ocultam") —
+    ver `_linha_historico`/`alternar_detalhe_historico`. Sem botão de
+    fechar próprio: a seta da linha já alterna aberto/fechado."""
+    df = dt.listar_trades()
+    linha_df = df[df['id_trade'] == id_trade]
+    if linha_df.empty:
+        return None
+    trade = linha_df.iloc[0]
+
+    mapa_nomes = _mapa_nomes_estrategias()
+    tags_str = _formatar_tags_estrategia(trade['estrategia_tags'], mapa_nomes)
+    tags_erro = trade.get('tags_setup_erro')
+    tags_erro_str = ', '.join(list(tags_erro)) if hasattr(tags_erro, '__iter__') and not isinstance(tags_erro, str) else '—'
+
+    tags_emocionais = trade.get('tags_emocionais')
+    tags_emocionais_str = (', '.join(list(tags_emocionais))
+                            if hasattr(tags_emocionais, '__iter__') and not isinstance(tags_emocionais, str) else '—')
+    tem_dado_emocional = any(pd.notna(trade.get(c)) for c in
+                             ('emo_confianca', 'emo_humor', 'emo_energia', 'emo_atencao', 'emo_presenca', 'sentimento_mercado'))
+
+    aderencia_df = dt.avaliar_aderencia_sr()
+    linha_aderencia = aderencia_df[aderencia_df['id_trade'] == id_trade] if not aderencia_df.empty else aderencia_df
+    bloco_aderencia = None
+    if not linha_aderencia.empty:
+        classificacao = linha_aderencia.iloc[0]['classificacao']
+        bloco_aderencia = html.Div(
+            f"Aderência S/R: {classificacao.replace('_', ' ')}",
+            style={'color': C[_COR_STATUS_ADERENCIA_SR.get(classificacao, 'text2')],
+                   'fontWeight': '700', 'fontSize': '12px', 'marginBottom': '6px'})
+
+    padroes_df = persistencia.carregar_padroes_comportamentais()
+    flags_padroes = []
+    if padroes_df is not None and not padroes_df.empty:
+        relacionados = padroes_df[(padroes_df['id_trade'] == id_trade) | (padroes_df['id_trade_anterior'] == id_trade)]
+        for _, p in relacionados.iterrows():
+            flags_padroes.append(html.Div(
+                f"⚠ {p['tipo'].replace('_', ' ').title()}: {p['detalhe']}",
+                style={'color': C[_COR_TIPO_PADRAO.get(p['tipo'], 'text2')], 'fontSize': '12px', 'marginBottom': '4px'}))
+
+    snapshot_resumo = None
+    snap_json = trade.get('snapshot_mercado_json')
+    if snap_json is not None and pd.notna(snap_json):
+        try:
+            s = json.loads(snap_json)
+            snapshot_resumo = (f"Preço {s.get('preco')} · ATR {s.get('atr')} · "
+                                f"Tendência {s.get('tendencia')} · Fase {s.get('fase')} · Saúde {s.get('saude')}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            snapshot_resumo = None
+
+    imagem = None
+    if trade.get('imagem_arquivo'):
+        imagem = html.Img(src=f"/diario-imagens/{trade['imagem_arquivo']}",
+                           id={'type': 'diario-img-thumb-detalhe', 'index': id_trade}, n_clicks=0, style={
+            'maxWidth': '360px', 'maxHeight': '260px', 'objectFit': 'contain', 'borderRadius': '6px',
+            'border': f"1px solid {C['border']}", 'marginTop': '8px', 'display': 'block', 'cursor': 'pointer',
+        })
+
+    saldo = trade['saldo_operacao_reais']
+    saldo_num = float(saldo) if pd.notna(saldo) else 0.0
+
+    return _bloco_diario(f"Detalhe da Operação #{id_trade}", html.Div([
+        html.Div([
+            _campo_detalhe('Data', trade['data_op']),
+            _campo_detalhe('Ativo', trade['ativo']),
+            _campo_detalhe('Janela', _formatar_janela(trade.get('janela_pregao'))),
+            _campo_detalhe('Tipo', trade.get('tipo_operacao')),
+            _campo_detalhe('Estratégia', tags_str),
+            _campo_detalhe('Sala/Análise', trade.get('sala_analise')),
+            _campo_detalhe('Alvo (pts)', trade.get('alvo_pontos')),
+            _campo_detalhe('Stop (pts)', trade.get('stop_pontos')),
+            _campo_detalhe('Lote', trade.get('lote')),
+            _campo_detalhe('Preço Entrada', trade.get('preco_entrada')),
+            _campo_detalhe('Preço Saída', trade.get('preco_saida')),
+            _campo_detalhe('Tipo Saída', trade.get('tipo_saida')),
+            _campo_detalhe('Resultado (pts)', trade.get('resultado_pontos')),
+            _campo_detalhe('Saldo (R$)', f"R$ {saldo_num:+.2f}"),
+            _campo_detalhe('Nível S/R referenciado', trade.get('nivel_sr_referencia')),
+            _campo_detalhe('Tags Setup/Erro', tags_erro_str),
+        ], style={'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(190px, 1fr))', 'gap': '2px 14px'}),
+        html.Div([
+            html.Div('Estado Emocional', style={
+                'fontSize': '11px', 'color': C['gold'], 'fontFamily': FONTS['display'],
+                'fontWeight': '700', 'marginTop': '10px', 'marginBottom': '4px',
+            }),
+            html.Div([
+                _campo_detalhe('Confiança', _estrelas_texto(trade.get('emo_confianca'))),
+                _campo_detalhe('Humor', _estrelas_texto(trade.get('emo_humor'))),
+                _campo_detalhe('Energia', _estrelas_texto(trade.get('emo_energia'))),
+                _campo_detalhe('Atenção', _estrelas_texto(trade.get('emo_atencao'))),
+                _campo_detalhe('Presença', _estrelas_texto(trade.get('emo_presenca'))),
+                _campo_detalhe('Sentimento de Mercado', _texto_sentimento(trade.get('sentimento_mercado'))),
+                _campo_detalhe('Print Emocional', tags_emocionais_str),
+            ], style={'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(190px, 1fr))', 'gap': '2px 14px'}),
+        ]) if tem_dado_emocional else None,
+        html.Div([
+            html.Div('Resumo Operacional:', style={'fontSize': '11px', 'color': C['text2'], 'marginTop': '8px'}),
+            html.Div(trade.get('resumo_operacional') or '—', style={'fontSize': '12px', 'whiteSpace': 'pre-wrap'}),
+            html.Div('Obs (autocoaching):', style={'fontSize': '11px', 'color': C['text2'], 'marginTop': '8px'}),
+            html.Div(trade.get('obs') or '—', style={'fontSize': '12px', 'whiteSpace': 'pre-wrap'}),
+        ]),
+        bloco_aderencia,
+        html.Div(flags_padroes) if flags_padroes else None,
+        html.Div(f"Snapshot do motor no save: {snapshot_resumo}" if snapshot_resumo else 'Snapshot do motor: não capturado (trade antigo).',
+                 style={'fontSize': '11px', 'color': C['text2'], 'marginTop': '8px'}),
+        imagem,
+    ]))
 
 
 def _card_estatistica(titulo: str, valor: str, cor=None) -> html.Div:
@@ -535,20 +1414,30 @@ def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
     return _bloco_diario(titulo, html.Div(linhas))
 
 
-def _grafico_evolucao_saldo(stats: dict) -> go.Figure:
+def _hex_para_rgba(hex_cor: str, alpha: float) -> str:
+    """Converte '#RRGGBB' pra 'rgba(r,g,b,a)' — Plotly só aceita opacidade
+    via rgba(), não hex separado. Usado pelo fill translúcido dos gráficos
+    abaixo, que precisam de PALETA_GAUGE (hex literal) por tema."""
+    h = hex_cor.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f'rgba({r},{g},{b},{alpha})'
+
+
+def _grafico_evolucao_saldo(stats: dict, tema: str = 'light') -> go.Figure:
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
     fig = go.Figure()
     if stats['evolucao_data']:
         fig.add_trace(go.Scatter(
             x=stats['evolucao_data'], y=stats['evolucao_saldo_acumulado'],
-            mode='lines', line=dict(color=C['gold'], width=2),
-            fill='tozeroy', fillcolor='rgba(200,169,110,0.08)',
+            mode='lines', line=dict(color=p['gold'], width=2),
+            fill='tozeroy', fillcolor=_hex_para_rgba(p['gold'], 0.08),
         ))
     fig.update_layout(
-        paper_bgcolor=C['panel'], plot_bgcolor=C['bg'],
-        font=dict(family=FONTS['mono'], color=C['text2'], size=10),
+        paper_bgcolor=p['panel'], plot_bgcolor=p['bg'],
+        font=dict(family=FONTS['mono'], color=p['text2'], size=10),
         margin=dict(l=45, r=10, t=10, b=30), height=200,
-        xaxis=dict(showgrid=False, gridcolor=C['border']),
-        yaxis=dict(gridcolor=C['border'], gridwidth=0.5, title='R$ acumulado'),
+        xaxis=dict(showgrid=False, gridcolor=p['border']),
+        yaxis=dict(gridcolor=p['border'], gridwidth=0.5, title='R$ acumulado'),
     )
     return fig
 
@@ -579,7 +1468,44 @@ def _grade_calendario(por_dia: dict, ano: int, mes: int) -> html.Div:
             if dia == 0:
                 celulas.append(html.Div(style={'flex': '1', 'minHeight': '40px', 'margin': '2px'}))
                 continue
-            info = por_dia.get(f"{ano:04d}-{mes:02d}-{dia:02d}")
+            data_iso = f"{ano:04d}-{mes:02d}-{dia:02d}"
+            info = por_dia.get(data_iso)
+            if info is None:
+                bg, cor_texto = C['bg'], C['text2']
+            elif info['saldo'] > 0:
+                bg, cor_texto = C['green'], C['bg']
+            elif info['saldo'] < 0:
+                bg, cor_texto = C['red'], C['bg']
+            else:
+                bg, cor_texto = C['border'], C['text2']
+            estilo_celula = {'background': bg, 'border': f'1px solid {C["border"]}', 'borderRadius': '4px',
+                              'flex': '1', 'minHeight': '40px', 'margin': '2px', 'padding': '4px',
+                              'color': cor_texto, 'textAlign': 'center'}
+            conteudo = [
+                html.Div(str(dia), style={'fontSize': '11px'}),
+                html.Div(f"R$ {info['saldo']:+.0f}" if info else '',
+                          style={'fontSize': '10px', 'fontFamily': FONTS['mono']}),
+            ]
+            if info is not None:
+                # Clicável só quando há operação no dia — navega pro
+                # Histórico já filtrado (ver `clicar_dia_calendario`).
+                celulas.append(html.Div(conteudo, id={'type': 'diario-cal-dia', 'index': data_iso},
+                                         n_clicks=0, style={**estilo_celula, 'cursor': 'pointer'}))
+            else:
+                celulas.append(html.Div(conteudo, style=estilo_celula))
+        linhas.append(html.Div(celulas, style={'display': 'flex'}))
+    return html.Div(linhas)
+
+
+def _grade_calendario_anual(por_mes: dict, ano: int) -> html.Div:
+    """Grade 4x3 (um trimestre por linha) com o saldo agregado de cada mês
+    do ano — usada quando o toggle "Ano Corrente" está ligado."""
+    linhas = []
+    for trimestre in range(4):
+        celulas = []
+        for i in range(3):
+            mes_num = trimestre * 3 + i + 1
+            info = por_mes.get(f"{ano:04d}-{mes_num:02d}")
             if info is None:
                 bg, cor_texto = C['bg'], C['text2']
             elif info['saldo'] > 0:
@@ -589,11 +1515,12 @@ def _grade_calendario(por_dia: dict, ano: int, mes: int) -> html.Div:
             else:
                 bg, cor_texto = C['border'], C['text2']
             celulas.append(html.Div([
-                html.Div(str(dia), style={'fontSize': '11px'}),
-                html.Div(f"R$ {info['saldo']:+.0f}" if info else '',
+                html.Div(_NOMES_MES[mes_num][:3], style={'fontSize': '11px', 'fontWeight': '700'}),
+                html.Div(f"R$ {info['saldo']:+.0f}" if info else '—',
                           style={'fontSize': '10px', 'fontFamily': FONTS['mono']}),
+                html.Div(f"{info['n']} op." if info else '', style={'fontSize': '9px'}),
             ], style={'background': bg, 'border': f'1px solid {C["border"]}', 'borderRadius': '4px',
-                       'flex': '1', 'minHeight': '40px', 'margin': '2px', 'padding': '4px',
+                       'flex': '1', 'minHeight': '52px', 'margin': '2px', 'padding': '6px',
                        'color': cor_texto, 'textAlign': 'center'}))
         linhas.append(html.Div(celulas, style={'display': 'flex'}))
     return html.Div(linhas)
@@ -640,52 +1567,77 @@ def _tabela_score_confiabilidade(scores: dict) -> html.Div:
                        style={'width': '100%', 'borderCollapse': 'collapse'})
 
 
-def _construir_diario_estatisticas(stats: dict, scores: dict) -> html.Div:
-    if stats['num_operacoes'] == 0:
-        return _placeholder_aba('Estatísticas (nenhum trade real lançado ainda)')
-
+def _cards_estatisticas(stats: dict) -> html.Div:
     payoff_str = f"{stats['payoff']:.2f}" if stats['payoff'] is not None else '—'
-    hoje = date.today()
-    mes_inicial = f"{hoje.year:04d}-{hoje.month:02d}"
     return html.Div([
-        dcc.Store(id='diario-por-dia-store', data=stats['por_dia']),
-        dcc.Store(id='diario-calendario-mes', data=mes_inicial),
+        _card_estatistica('Operações', str(stats['num_operacoes'])),
+        _card_estatistica('Saldo Total', f"R$ {stats['saldo_total']:+.2f}",
+                           cor=C['green'] if stats['saldo_total'] > 0 else C['red']),
+        _card_estatistica('Wins', str(stats['n_win']), cor=C['green']),
+        _card_estatistica('Losses', str(stats['n_loss']), cor=C['red']),
+        _card_estatistica('Breakeven', str(stats['n_breakeven'])),
+        _card_estatistica('Taxa de Acerto', f"{stats['taxa_acerto'] * 100:.1f}%"),
+        _card_estatistica('Payoff', payoff_str),
+        _card_estatistica('Expectativa', f"R$ {stats['expectativa']:+.2f}"),
+        _card_estatistica('Max Gain', f"R$ {stats['max_gain']:+.2f}", cor=C['green']),
+        _card_estatistica('Max Loss', f"R$ {stats['max_loss']:+.2f}", cor=C['red']),
+        _card_estatistica('Drawdown Máx.', f"R$ {stats['drawdown_maximo_reais']:+.2f}",
+                           cor=C['red'] if stats['drawdown_maximo_reais'] < 0 else None),
+        _card_estatistica('Seq. Wins', str(stats['maior_sequencia_win'])),
+        _card_estatistica('Seq. Losses', str(stats['maior_sequencia_loss'])),
+    ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '16px'})
 
-        html.Div([
-            _card_estatistica('Operações', str(stats['num_operacoes'])),
-            _card_estatistica('Saldo Total', f"R$ {stats['saldo_total']:+.2f}",
-                               cor=C['green'] if stats['saldo_total'] > 0 else C['red']),
-            _card_estatistica('Taxa de Acerto', f"{stats['taxa_acerto'] * 100:.1f}%"),
-            _card_estatistica('Payoff', payoff_str),
-            _card_estatistica('Expectativa', f"R$ {stats['expectativa']:+.2f}"),
-            _card_estatistica('Max Gain', f"R$ {stats['max_gain']:+.2f}", cor=C['green']),
-            _card_estatistica('Max Loss', f"R$ {stats['max_loss']:+.2f}", cor=C['red']),
-            _card_estatistica('Drawdown Máx.', f"R$ {stats['drawdown_maximo_reais']:+.2f}",
-                               cor=C['red'] if stats['drawdown_maximo_reais'] < 0 else None),
-            _card_estatistica('Seq. Wins', str(stats['maior_sequencia_win'])),
-            _card_estatistica('Seq. Losses', str(stats['maior_sequencia_loss'])),
-        ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '16px'}),
 
+_TOGGLE_LARGURA = 42
+_TOGGLE_ALTURA = 22
+_TOGGLE_BOLINHA = 18
+_TOGGLE_MARGEM = 2
+
+
+def _estilo_toggle_trilho(ativo: bool) -> dict:
+    """Trilho do toggle switch 'Ano Inteiro' (feedback 2026-07-12: pediu o
+    visual padrão de toggle switch de app — trilho arredondado + bolinha
+    deslizante — no lugar do botão retangular antigo. Só no clássico: no
+    SQ'98 esse visual destoaria do bisel Win98, mantido como botão."""
+    return {
+        'position': 'relative', 'width': f'{_TOGGLE_LARGURA}px', 'height': f'{_TOGGLE_ALTURA}px',
+        'borderRadius': f'{_TOGGLE_ALTURA // 2}px', 'border': 'none', 'padding': '0',
+        'cursor': 'pointer', 'flexShrink': '0',
+        # C['border'] (#1C1C28) é quase invisível contra o fundo escuro pra
+        # servir de trilho "desligado" — tom intermediário só pra esse uso.
+        'background': C['green'] if ativo else '#3A3A48',
+        'transition': 'background-color 0.2s ease',
+    }
+
+
+def _estilo_toggle_bolinha(ativo: bool) -> dict:
+    deslocamento = _TOGGLE_LARGURA - _TOGGLE_BOLINHA - _TOGGLE_MARGEM if ativo else _TOGGLE_MARGEM
+    return {
+        'position': 'absolute', 'top': f'{_TOGGLE_MARGEM}px', 'left': f'{deslocamento}px',
+        'width': f'{_TOGGLE_BOLINHA}px', 'height': f'{_TOGGLE_BOLINHA}px', 'borderRadius': '50%',
+        'background': '#FFFFFF', 'boxShadow': '0 1px 3px rgba(0,0,0,0.4)',
+        'transition': 'left 0.2s ease',
+    }
+
+
+def _cards_ou_vazio_estatisticas(stats: dict) -> html.Div:
+    if stats['num_operacoes']:
+        return _cards_estatisticas(stats)
+    return html.Div('Nenhum trade real neste período.', style={
+        'padding': '16px', 'textAlign': 'center', 'color': C['text2'], 'fontSize': '12px',
+    })
+
+
+def _resto_periodo_estatisticas(stats: dict, tema: str = 'light') -> html.Div:
+    """Evolução de saldo + breakdowns do período — a parte do painel de
+    Estatísticas que pode ser livremente recriada a cada troca de mês/ano
+    (nenhum desses componentes guarda estado de clique). O calendário em si
+    (grade + botões) NÃO mora aqui — ver o comentário em
+    `_construir_diario_estatisticas` pro porquê."""
+    return html.Div([
         _bloco_diario('Evolução de Saldo', dcc.Graph(
-            figure=_grafico_evolucao_saldo(stats), config={'displayModeBar': False},
+            figure=_grafico_evolucao_saldo(stats, tema), config={'displayModeBar': False},
         )),
-
-        _bloco_diario('Calendário', html.Div([
-            html.Div([
-                html.Button('◀', id='btn-diario-cal-prev', n_clicks=0, style={
-                    'background': C['panel'], 'color': C['text'], 'border': f'1px solid {C["border"]}',
-                    'borderRadius': '4px', 'padding': '2px 10px', 'cursor': 'pointer',
-                }),
-                html.Span(id='diario-calendario-label', style={
-                    'margin': '0 10px', 'fontSize': '12px', 'fontFamily': FONTS['display'],
-                }),
-                html.Button('▶', id='btn-diario-cal-next', n_clicks=0, style={
-                    'background': C['panel'], 'color': C['text'], 'border': f'1px solid {C["border"]}',
-                    'borderRadius': '4px', 'padding': '2px 10px', 'cursor': 'pointer',
-                }),
-            ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '8px'}),
-            html.Div(id='diario-calendario-grid'),
-        ])),
 
         html.Div([
             _bloco_breakdown_diario('Por Ativo', stats['por_ativo']),
@@ -698,115 +1650,120 @@ def _construir_diario_estatisticas(stats: dict, scores: dict) -> html.Div:
         html.Div([
             _bloco_breakdown_diario('Por Tags Setup/Erro', stats['por_tags_setup_erro']),
         ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+    ])
+
+
+def _bloco_status_badges() -> html.Div:
+    """Reconciliação MT5 (agora em background) e resumo de Aderência S/R
+    (agora enriquece o Histórico) — ver diario_app_98.py::
+    _bloco_status_badges_98 pro mesmo raciocínio."""
+    resumo_rec = dt.resumo_reconciliacao()
+    if resumo_rec is None:
+        badge_rec = html.Span('Reconciliação: aguardando o 1º ciclo em background (a cada 5min).',
+                               style={'color': C['text2']})
+    else:
+        problemas = (resumo_rec['divergente'] + resumo_rec['sem_correspondencia_mt5']
+                     + resumo_rec['sem_correspondencia_diario'])
+        if problemas == 0:
+            badge_rec = html.Span(f"Reconciliação MT5: ✔ {resumo_rec['ok']} trade(s) OK (últimos 30 dias).",
+                                   style={'color': C['green']})
+        else:
+            badge_rec = html.Span(
+                f"Reconciliação MT5: ⚠ {problemas} pendência(s) nos últimos 30 dias "
+                f"({resumo_rec['divergente']} divergente(s), {resumo_rec['sem_correspondencia_mt5']} sem execução MT5, "
+                f"{resumo_rec['sem_correspondencia_diario']} sem registro no diário).",
+                style={'color': C['gold']})
+
+    resumo_ader = dt.avaliar_aderencia_sr()
+    if resumo_ader.empty:
+        badge_ader = html.Span(
+            'Aderência S/R: sem trades avaliáveis ainda (precisa de nível S/R referenciado + snapshot de mercado).',
+            style={'color': C['text2']})
+    else:
+        total = len(resumo_ader)
+        precisos = int((resumo_ader['classificacao'] == 'visto_preciso').sum())
+        badge_ader = html.Span(f"Aderência S/R: {precisos}/{total} trade(s) vistos com precisão pelo motor "
+                                f"(ver coluna no Histórico).", style={'color': C['text']})
+
+    return _bloco_diario('Status', html.Div([
+        html.Div(badge_rec, style={'fontSize': '12px', 'marginBottom': '4px'}),
+        html.Div(badge_ader, style={'fontSize': '12px'}),
+    ]))
+
+
+def _construir_diario_estatisticas(stats_geral: dict, scores: dict) -> html.Div:
+    """Shell montado 1x por ativação da aba — ver
+    `diario_app_98.py::_construir_diario98_estatisticas` pro raciocínio
+    completo (mesma estrutura, só a casca visual muda).
+
+    Os botões de navegação do calendário (◀/▶/"Ver Ano Inteiro") moram AQUI,
+    criados uma única vez, e NÃO dentro de `diario-periodo-conteudo`/
+    `diario-resto-periodo-conteudo` (que `atualizar_periodo_estatisticas`
+    reconstrói a cada troca de mês/ano/toggle). Causa raiz do bug relatado
+    em 2026-07-12 (calendário pulando pra mês/ano aparentemente aleatório e
+    o toggle "Ano Corrente" às vezes não fazendo nada): um `html.Button`
+    recriado do zero nasce com `n_clicks=0`, e como esse prop é Input do
+    callback de navegação, o Dash detectava essa queda pra 0 como "mais um
+    clique" e disparava a navegação sozinha — cada clique real gerava 0-2
+    cliques fantasmas extras, em direção imprevisível pro usuário. Com os
+    botões fixos aqui e só `children`/`style` atualizados por callback
+    (nunca o componente inteiro), `n_clicks` nunca mais reseta."""
+    if stats_geral['num_operacoes'] == 0:
+        return _placeholder_aba('Estatísticas (nenhum trade real lançado ainda)')
+
+    hoje = date.today()
+    mes_inicial = f"{hoje.year:04d}-{hoje.month:02d}"
+    estilo_botao_nav = {
+        'background': C['panel'], 'color': C['text'], 'border': f'1px solid {C["border"]}',
+        'borderRadius': '4px', 'padding': '2px 10px', 'cursor': 'pointer', 'fontSize': '11px',
+    }
+    return html.Div([
+        dcc.Store(id='diario-calendario-mes', data=mes_inicial),
+        dcc.Store(id='diario-modo-ano', data=False),
+
+        html.Div(id='diario-cards-conteudo'),
+
+        _bloco_diario('Calendário', html.Div([
+            html.Div([
+                html.Div([
+                    html.Button('◀', id='btn-diario-cal-mes-prev', n_clicks=0, style=estilo_botao_nav),
+                    html.Span(_NOMES_MES[hoje.month], id='diario-calendario-label-mes', style={
+                        'margin': '0 8px', 'fontSize': '12px', 'fontFamily': FONTS['display'], 'fontWeight': '700',
+                    }),
+                    html.Button('▶', id='btn-diario-cal-mes-next', n_clicks=0, style=estilo_botao_nav),
+                ], style={'display': 'flex', 'alignItems': 'center', 'marginRight': '16px'}),
+                html.Div([
+                    html.Button('◀', id='btn-diario-cal-ano-prev', n_clicks=0, style=estilo_botao_nav),
+                    html.Span(str(hoje.year), id='diario-calendario-label-ano', style={
+                        'margin': '0 8px', 'fontSize': '12px', 'fontFamily': FONTS['display'], 'fontWeight': '700',
+                    }),
+                    html.Button('▶', id='btn-diario-cal-ano-next', n_clicks=0, style=estilo_botao_nav),
+                ], style={'display': 'flex', 'alignItems': 'center'}),
+                html.Span('Ano Inteiro', style={
+                    'marginLeft': 'auto', 'marginRight': '8px', 'fontSize': '11px', 'color': C['text2'],
+                    'fontFamily': FONTS['display'],
+                }),
+                html.Button(html.Div(id='diario-modo-ano-bolinha', style=_estilo_toggle_bolinha(False)),
+                            id='btn-diario-modo-ano', n_clicks=0, style=_estilo_toggle_trilho(False)),
+            ], style={
+                # `flexWrap`: 4 mês + ano viraram grupos separados (feedback
+                # 2026-07-12) — a fileira ficou mais larga que o botão único
+                # de antes e, sem wrap, estourava a largura do iframe do
+                # Diário (dashboard.py embute em 100% de largura), forçando
+                # scroll horizontal que por sua vez empurrava a página
+                # inteira a precisar de scroll vertical também. Com wrap,
+                # em telas estreitas o toggle só desce pra 2ª linha.
+                'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'center',
+                'rowGap': '8px', 'marginBottom': '8px',
+            }),
+            html.Div(id='diario-calendario-grid'),
+        ])),
+
+        html.Div(id='diario-resto-periodo-conteudo'),
 
         _bloco_diario('Score de Confiabilidade', _tabela_score_confiabilidade(scores)),
-    ])
 
-
-_COR_STATUS_RECONCILIACAO = {
-    'ok': 'green', 'divergente': 'red',
-    'sem_correspondencia_mt5': 'yellow', 'sem_correspondencia_diario': 'text2',
-}
-
-
-def _tabela_reconciliacao(df: pd.DataFrame | None) -> html.Div:
-    if df is None or df.empty:
-        return html.Div('Nenhum resultado ainda — clique em "Reconciliar agora".', style={
-            'padding': '20px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '13px',
-        })
-    cabecalho = html.Tr([
-        html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
-        for t in ['ID Trade', 'Position MT5', 'Divergência', 'Confiança', 'Status']
-    ])
-    linhas = []
-    for _, linha in df.iterrows():
-        chave_cor = _COR_STATUS_RECONCILIACAO.get(linha['mt5_match_status'], 'text2')
-        cor = C.get(chave_cor, C['text2'])
-        divergencia = linha['mt5_divergencia_reais']
-        linhas.append(html.Tr([
-            _td_diario(str(int(linha['id_trade'])) if pd.notna(linha['id_trade']) else '—'),
-            _td_diario(str(int(linha['mt5_position_id'])) if pd.notna(linha['mt5_position_id']) else '—'),
-            _td_diario(f"R$ {divergencia:+.2f}" if pd.notna(divergencia) else '—'),
-            _td_diario(linha['confianca'] or '—'),
-            _td_diario((linha['mt5_match_status'] or '').replace('_', ' '),
-                       extra={'color': cor, 'fontWeight': '700'}),
-        ]))
-    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
-                       style={'width': '100%', 'borderCollapse': 'collapse'})
-
-
-def _construir_diario_reconciliacao() -> html.Div:
-    return html.Div([
-        html.Div([
-            html.Button('Reconciliar agora', id='btn-diario-reconciliar', n_clicks=0, style={
-                'background': C['green'], 'color': C['bg'], 'border': 'none', 'borderRadius': '6px',
-                'padding': '8px 20px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
-                'fontWeight': '700', 'fontSize': '12px',
-            }),
-            html.Span(id='diario-reconciliar-status', style={
-                'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2'],
-            }),
-        ], style={'marginBottom': '14px'}),
-        html.Div(_tabela_reconciliacao(persistencia.carregar_reconciliacao()),
-                 id='diario-reconciliacao-tabela'),
-    ])
-
-
-# --- Aderência S/R -------------------------------------------------------------
-# Responde "o motor via o nível que Jesué marcou à mão?" cruzando
-# `nivel_sr_referencia` contra o `snapshot_mercado_json` capturado no save
-# (ver `diario_trade.avaliar_aderencia_sr`). Relatório de revisão manual —
-# Jesué julga, o sistema não ajusta nada sozinho.
-
-_COR_STATUS_ADERENCIA_SR = {
-    'visto_preciso': 'green', 'visto_proximo': 'yellow', 'nao_visto': 'red',
-}
-
-
-def _tabela_aderencia_sr(df: pd.DataFrame | None) -> html.Div:
-    if df is None or df.empty:
-        return html.Div('Nenhum resultado ainda — clique em "Avaliar aderência S/R".', style={
-            'padding': '20px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '13px',
-        })
-    cabecalho = html.Tr([
-        html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
-        for t in ['ID Trade', 'Data', 'Ativo', 'Nível Ref.', 'Nível Motor', 'Dif. ATR', 'Forte', 'Classificação']
-    ])
-    linhas = []
-    for _, linha in df.iterrows():
-        chave_cor = _COR_STATUS_ADERENCIA_SR.get(linha['classificacao'], 'text2')
-        cor = C.get(chave_cor, C['text2'])
-        dif_atr = linha['diferenca_atr']
-        nivel_motor = linha['nivel_motor_preco']
-        linhas.append(html.Tr([
-            _td_diario(str(int(linha['id_trade'])) if pd.notna(linha['id_trade']) else '—'),
-            _td_diario(str(linha['data_op'])),
-            _td_diario(linha['ativo'] or '—'),
-            _td_diario(f"{linha['nivel_sr_referencia']:.0f}" if pd.notna(linha['nivel_sr_referencia']) else '—'),
-            _td_diario(f"{nivel_motor:.0f}" if pd.notna(nivel_motor) else '—'),
-            _td_diario(f"{dif_atr:.2f}" if pd.notna(dif_atr) else '—'),
-            _td_diario('sim' if linha['forte'] else ('não' if pd.notna(linha['forte']) else '—')),
-            _td_diario((linha['classificacao'] or '').replace('_', ' '),
-                       extra={'color': cor, 'fontWeight': '700'}),
-        ]))
-    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
-                       style={'width': '100%', 'borderCollapse': 'collapse'})
-
-
-def _construir_diario_aderencia_sr() -> html.Div:
-    return html.Div([
-        html.Div([
-            html.Button('Avaliar aderência S/R', id='btn-diario-aderencia-sr', n_clicks=0, style={
-                'background': C['green'], 'color': C['bg'], 'border': 'none', 'borderRadius': '6px',
-                'padding': '8px 20px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
-                'fontWeight': '700', 'fontSize': '12px',
-            }),
-            html.Span(id='diario-aderencia-sr-status', style={
-                'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2'],
-            }),
-        ], style={'marginBottom': '14px'}),
-        html.Div(_tabela_aderencia_sr(persistencia.carregar_aderencia_sr()),
-                 id='diario-aderencia-sr-tabela'),
+        _bloco_status_badges(),
     ])
 
 
@@ -863,11 +1820,417 @@ def _construir_diario_padroes() -> html.Div:
     ])
 
 
+# --- Estratégias (CRUD) ---------------------------------------------------------
+# Ver diario_app_98.py pro mesmo raciocínio completo (mesma estrutura, só a
+# casca visual muda) — substitui as listas fixas por cadastro editável.
+
+def _estilo_btn_primario() -> dict:
+    return {
+        'background': C['green'], 'color': C['bg'], 'border': 'none', 'borderRadius': '6px',
+        'padding': '7px 18px', 'cursor': 'pointer', 'fontFamily': FONTS['display'],
+        'fontWeight': '700', 'fontSize': '12px',
+    }
+
+
+def _estilo_btn_pequeno() -> dict:
+    return {
+        'background': 'transparent', 'color': C['text2'], 'border': f'1px solid {C["border"]}',
+        'borderRadius': '4px', 'padding': '2px 10px', 'cursor': 'pointer', 'fontSize': '10px',
+    }
+
+
+def _botao_desativar(tipo_pattern: str, id_item: int) -> html.Button:
+    return html.Button('Desativar', id={'type': tipo_pattern, 'index': int(id_item)}, n_clicks=0,
+                        style=_estilo_btn_pequeno())
+
+
+def _botao_editar(tipo_pattern: str, id_item: int) -> html.Button:
+    return html.Button('Editar', id={'type': tipo_pattern, 'index': int(id_item)}, n_clicks=0,
+                        style={**_estilo_btn_pequeno(), 'marginRight': '6px', 'color': C['gold'], 'borderColor': C['gold']})
+
+
+def _tabela_estrategias(df: pd.DataFrame) -> html.Div:
+    if df.empty:
+        return html.Div('Nenhuma estratégia cadastrada.', style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
+    cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
+                          for t in ['Nome', 'Descrição', 'Checklist', '']])
+    linhas = [html.Tr([
+        _td_diario(linha['nome']),
+        _td_diario(linha['descricao'] or '—'),
+        _td_diario(f"{len(_lista_segura(linha['checklist']))} item(ns)"),
+        _td_diario(html.Div([
+            _botao_editar('diario-estrategia-editar', linha['id']),
+            _botao_desativar('diario-estrategia-desativar', linha['id']),
+        ], style={'display': 'flex'})),
+    ]) for _, linha in df.iterrows()]
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+def _tabela_rr_presets(df: pd.DataFrame) -> html.Div:
+    if df.empty:
+        return html.Div('Nenhum preset R:R cadastrado.', style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
+    cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
+                          for t in ['Nome', 'Alvo (pts)', 'Stop (pts)', 'Breakeven (pts)', '']])
+    linhas = [html.Tr([
+        _td_diario(linha['nome']),
+        _td_diario(f"{linha['alvo_pontos']:.0f}"),
+        _td_diario(f"{linha['stop_pontos']:.0f}"),
+        _td_diario(f"{linha['breakeven_pontos']:.0f}" if pd.notna(linha['breakeven_pontos']) else '—'),
+        _td_diario(_botao_desativar('diario-rr-desativar', linha['id'])),
+    ]) for _, linha in df.iterrows()]
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+def _tabela_tags(df: pd.DataFrame) -> html.Div:
+    if df.empty:
+        return html.Div('Nenhuma tag cadastrada.', style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
+    cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
+                          for t in ['Nome', 'Tipo', '']])
+    linhas = [html.Tr([
+        _td_diario(linha['nome']),
+        _td_diario(linha['tipo']),
+        _td_diario(_botao_desativar('diario-tag-desativar', linha['id'])),
+    ]) for _, linha in df.iterrows()]
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+def _tabela_tags_emocionais(df: pd.DataFrame) -> html.Div:
+    if df.empty:
+        return html.Div('Nenhuma tag emocional cadastrada.', style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
+    cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
+                          for t in ['Nome', '']])
+    linhas = [html.Tr([
+        _td_diario(linha['nome']),
+        _td_diario(_botao_desativar('diario-tag-emocional-desativar', linha['id'])),
+    ]) for _, linha in df.iterrows()]
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+def _construir_diario_estrategias() -> html.Div:
+    campo = _campo_diario
+    estilo_input = _estilo_input_diario
+    return html.Div([
+        _bloco_diario('Nova Estratégia', html.Div([
+            html.Div(id='diario-estrategia-editando-aviso'),
+            campo('Nome', dcc.Input(id='diario-nova-estrategia-nome', type='text', style=estilo_input())),
+            campo('Descrição', dcc.Textarea(id='diario-nova-estrategia-desc', rows=2, style=estilo_input({'resize': 'none', 'height': 'auto'}))),
+            campo('Checklist operacional (1 item por linha, opcional)',
+                  dcc.Textarea(id='diario-nova-estrategia-checklist', rows=3, style=estilo_input({'resize': 'none', 'height': 'auto'}))),
+            html.Button('Adicionar Estratégia', id='btn-diario-add-estrategia', n_clicks=0, style=_estilo_btn_primario()),
+            html.Button('Cancelar Edição', id='btn-diario-cancelar-edicao-estrategia', n_clicks=0,
+                        style={**_estilo_btn_pequeno(), 'marginLeft': '8px', 'display': 'none'}),
+            html.Span(id='diario-estrategia-status', style={'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2']}),
+            dcc.Store(id='store-diario-estrategia-editando', data=None),
+        ])),
+        _bloco_diario('Estratégias Cadastradas', html.Div(_tabela_estrategias(dt.listar_estrategias()),
+                                                             id='diario-tabela-estrategias')),
+
+        _bloco_diario('Novo Preset R:R', html.Div([
+            html.Div([
+                campo('Nome', dcc.Input(id='diario-novo-rr-nome', type='text', style=estilo_input({'width': '180px'}))),
+                campo('Alvo (pts)', dcc.Input(id='diario-novo-rr-alvo', type='text', inputMode='decimal',
+                                               style=estilo_input({'width': '110px'}))),
+                campo('Stop (pts)', dcc.Input(id='diario-novo-rr-stop', type='text', inputMode='decimal',
+                                               style=estilo_input({'width': '110px'}))),
+                campo('Breakeven (pts, opcional)', dcc.Input(id='diario-novo-rr-be', type='text', inputMode='decimal',
+                                                              style=estilo_input({'width': '150px'}))),
+            ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
+            html.Button('Adicionar Preset', id='btn-diario-add-rr', n_clicks=0,
+                        style={**_estilo_btn_primario(), 'marginTop': '8px'}),
+            html.Span(id='diario-rr-status', style={'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2']}),
+        ])),
+        _bloco_diario('Presets R:R Cadastrados', html.Div(_tabela_rr_presets(dt.listar_rr_presets()),
+                                                             id='diario-tabela-rr')),
+
+        _bloco_diario('Nova Tag Setup/Erro', html.Div([
+            html.Div([
+                campo('Nome', dcc.Input(id='diario-nova-tag-nome', type='text', style=estilo_input({'width': '220px'}))),
+                campo('Tipo', dcc.Dropdown(id='diario-nova-tag-tipo',
+                                            options=[{'label': v.title(), 'value': v} for v in ('setup', 'erro', 'ambos')],
+                                            value='ambos', clearable=False, className='classico-dropdown', style={'width': '140px'})),
+            ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
+            html.Button('Adicionar Tag', id='btn-diario-add-tag', n_clicks=0,
+                        style={**_estilo_btn_primario(), 'marginTop': '8px'}),
+            html.Span(id='diario-tag-status', style={'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2']}),
+        ])),
+        _bloco_diario('Tags Cadastradas', html.Div(_tabela_tags(dt.listar_tags_setup_erro()),
+                                                      id='diario-tabela-tags')),
+
+        _bloco_diario('Nova Tag Emocional (Print Emocional)', html.Div([
+            campo('Nome', dcc.Input(id='diario-nova-tag-emocional-nome', type='text', style=estilo_input({'width': '220px'}))),
+            html.Button('Adicionar Tag', id='btn-diario-add-tag-emocional', n_clicks=0,
+                        style={**_estilo_btn_primario(), 'marginTop': '8px'}),
+            html.Span(id='diario-tag-emocional-status', style={'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2']}),
+        ])),
+        _bloco_diario('Tags Emocionais Cadastradas', html.Div(_tabela_tags_emocionais(dt.listar_tags_emocionais()),
+                                                                 id='diario-tabela-tags-emocionais')),
+    ])
+
+
+# =============================================================================
+# BEM-ESTAR: check-in pré-operacional, Escala Hawkins, Roda da Vida (aba
+# nova, feedback diário.txt 2026-07-11, Fase E) — ver diario_app_98.py pro
+# mesmo raciocínio completo (primeira tela do Diário organizada por DATA em
+# vez de por trade/cadastro editável).
+# =============================================================================
+
+# Funil vertical (2026-07-15, pedido do Jesué — substitui o velocímetro/
+# gauge circular anterior por um formato mais fiel ao pôster original da
+# Escala Hawkins: funil estreitando da consciência expandida, no topo, à
+# contraída, na base, com os 17 níveis listados ao lado). CSS puro (sem
+# Plotly) — `clip-path` recorta um div em forma de funil, o preenchimento é
+# um `linear-gradient` cujos stops usam a MESMA escala logarítmica de
+# `dt.posicao_normalizada_hawkins` que posiciona o marcador do nível atual,
+# então cor de fundo e rótulos ficam sempre alinhados entre si.
+_ALTURA_FUNIL_HAWKINS = 440
+_LARGURA_FUNIL_HAWKINS = 170
+
+
+def _funil_hawkins(valor: float, normalizado: float, nivel_nome: str, cor_nivel: str) -> html.Div:
+    """Ver diario_app_98.py::_funil_hawkins_98 pro mesmo raciocínio
+    (duplicado aqui porque este processo isolado nunca importa de
+    dashboard.py). `normalizado` já vem 0-1 de `dt.calcular_nivel_hawkins`
+    (mesma escala usada pra plotar `dt.NIVEIS_HAWKINS` ao lado)."""
+    stops = ', '.join(
+        f'{cor} {dt.posicao_normalizada_hawkins(v) * 100:.1f}%'
+        for v, _, cor in dt.NIVEIS_HAWKINS
+    )
+    pos_marcador = min(max((1 - normalizado) * 100, 2), 98)  # 0%=topo/expandido, 100%=base/contraído, com folga nas bordas
+
+    # Espaçamento UNIFORME (17 linhas iguais), não proporcional à escala log
+    # real do gradiente: valores altos como 500/540/600/700 ficam a poucos
+    # % de distância na escala log de verdade — texto legível não cabe nesse
+    # espaço. Mesmo o pôster original da Escala Hawkins espaça a legenda de
+    # forma uniforme; só o degradê de cor do funil segue a escala log real
+    # (via `dt.posicao_normalizada_hawkins` nos `stops`, acima).
+    rotulos = []
+    for v, nome, cor in reversed(dt.NIVEIS_HAWKINS):
+        eh_coragem = (v == dt.LIMIAR_HAWKINS_CORAGEM)
+        rotulos.append(html.Div([
+            html.Span(nome, style={
+                'fontFamily': FONTS['display'], 'color': C['gold'] if eh_coragem else C['text2'],
+                'fontWeight': '700' if eh_coragem else '400',
+            }),
+            html.Span(style={'display': 'inline-block', 'width': '10px', 'height': '0',
+                              'borderBottom': f'1px dotted {C["border"]}', 'margin': '0 5px', 'verticalAlign': 'middle'}),
+            html.Span(str(v), style={'fontFamily': FONTS['mono'], 'color': cor}),
+        ], style={
+            'flex': '1', 'display': 'flex', 'alignItems': 'center', 'justifyContent': 'flex-end',
+            'whiteSpace': 'nowrap', 'fontSize': '10px', 'lineHeight': '1',
+        }))
+
+    marcador = html.Div([
+        html.Div(style={
+            'position': 'absolute', 'left': f'-{_LARGURA_FUNIL_HAWKINS + 40}px', 'right': '0',
+            'top': '0', 'height': '2px', 'background': cor_nivel,
+            'boxShadow': f'0 0 8px {cor_nivel}',
+        }),
+        html.Span('◀ você está aqui', style={
+            'position': 'absolute', 'left': '100%', 'top': '-8px', 'marginLeft': '8px',
+            'fontSize': '10px', 'fontFamily': FONTS['display'], 'color': cor_nivel, 'whiteSpace': 'nowrap',
+        }),
+    ], style={'position': 'absolute', 'top': f'{pos_marcador:.2f}%', 'left': '0', 'right': '0', 'zIndex': '2'})
+
+    funil = html.Div(style={
+        'position': 'absolute', 'left': '0', 'top': '0',
+        'width': f'{_LARGURA_FUNIL_HAWKINS}px', 'height': f'{_ALTURA_FUNIL_HAWKINS}px',
+        'background': f'linear-gradient(to top, {stops})',
+        'clipPath': 'polygon(0% 4%, 6% 0%, 94% 0%, 100% 4%, 100% 72%, 60% 100%, 40% 100%, 0% 72%)',
+        'opacity': '0.92',
+    })
+
+    cabecalho = html.Div([
+        html.Span(f'{nivel_nome}', style={'fontFamily': FONTS['mono'], 'fontSize': '15px',
+                                           'fontWeight': '700', 'color': cor_nivel}),
+        html.Span(f' · {valor:.0f}', style={'fontFamily': FONTS['mono'], 'fontSize': '12px', 'color': C['text2']}),
+    ], style={'marginBottom': '10px'})
+
+    return html.Div([
+        cabecalho,
+        html.Div([
+            html.Div([funil, marcador], style={
+                'position': 'relative', 'width': f'{_LARGURA_FUNIL_HAWKINS}px', 'height': f'{_ALTURA_FUNIL_HAWKINS}px',
+                'marginLeft': f'{_LARGURA_FUNIL_HAWKINS + 40}px',
+            }),
+            html.Div(rotulos, style={
+                'position': 'absolute', 'left': '0', 'top': '0',
+                'width': f'{_LARGURA_FUNIL_HAWKINS + 20}px', 'height': f'{_ALTURA_FUNIL_HAWKINS}px',
+                'display': 'flex', 'flexDirection': 'column',
+            }),
+        ], style={'position': 'relative', 'height': f'{_ALTURA_FUNIL_HAWKINS}px'}),
+        html.Div('Escala Hawkins (proxy, não calibrado) — abaixo de Coragem (200) a teoria original considera que a pessoa "perde poder"',
+                  style={'fontSize': '10px', 'color': C['text2'], 'marginTop': '10px', 'maxWidth': '420px'}),
+    ])
+
+
+def _bloco_gauge_hawkins(data_checkin: date):
+    """Nunca inventa valor: sem check-in do dia (ou sem nenhuma nota
+    preenchida), mostra um aviso em vez do funil."""
+    checkin = dt.obter_checkin_dia(data_checkin)
+    if not checkin:
+        return html.Div('Sem check-in salvo pra esse dia ainda — preencha e salve pra ver o nível.',
+                         style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
+    medias = dt.calcular_medias_emocionais_dia(data_checkin)
+    resultado = dt.calcular_nivel_hawkins(checkin, medias)
+    if not resultado:
+        return html.Div('Check-in salvo, mas sem nenhuma nota preenchida ainda.',
+                         style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
+    return _funil_hawkins(resultado['valor'], resultado['normalizado'], resultado['nivel_nome'], resultado['cor'])
+
+
+def _radar_roda_vida(registro: dict | None, tema: str = 'light') -> go.Figure:
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    categorias = [dt.NOMES_AREAS_RODA_VIDA[a] for a in dt.AREAS_RODA_VIDA]
+    valores = [float(registro.get(a) or 0) for a in dt.AREAS_RODA_VIDA] if registro else [0] * len(dt.AREAS_RODA_VIDA)
+    fig = go.Figure(go.Scatterpolar(r=valores + [valores[0]], theta=categorias + [categorias[0]],
+                                     fill='toself', line=dict(color=p['gold']), fillcolor=p['gold'], opacity=0.5))
+    fig.update_layout(
+        # `range` sozinho não é suficiente: com todas as áreas em 0 (antes do
+        # 1º registro salvo), o auto-cálculo de ticks do Plotly quebra (variância
+        # zero nos dados) e desenha uma escala minúscula tipo "0.7378" em vez de
+        # 0-10 — `autorange=False` + `tickvals` explícitos travam a escala real.
+        polar=dict(bgcolor='rgba(0,0,0,0)',
+                   radialaxis=dict(visible=True, range=[0, 10], autorange=False, tickvals=[0, 2, 4, 6, 8, 10],
+                                    tickfont=dict(size=8, color=p['text2']), gridcolor=p['border']),
+                   angularaxis=dict(tickfont=dict(size=9, color=p['text']), gridcolor=p['border'])),
+        paper_bgcolor='rgba(0,0,0,0)', showlegend=False, margin=dict(l=30, r=30, t=20, b=20),
+        height=320, autosize=True,
+    )
+    return fig
+
+
+def _tabela_checkins(df: pd.DataFrame) -> html.Div:
+    if df.empty:
+        return html.Div('Nenhum check-in registrado ainda.', style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
+    cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
+                          for t in ['Data', 'Sono', 'Café', 'Duração Sono', 'Nível Hawkins']])
+    linhas = []
+    for _, linha in df.head(14).iterrows():
+        checkin = linha.to_dict()
+        resultado = dt.calcular_nivel_hawkins(checkin, dt.calcular_medias_emocionais_dia(checkin['data']))
+        duracao = checkin.get('sono_duracao_horas')
+        linhas.append(html.Tr([
+            _td_diario(str(checkin['data'])),
+            _td_diario(_estrelas_texto(checkin.get('sono_qualidade'))),
+            _td_diario(_estrelas_texto(checkin.get('cafe_qualidade'))),
+            _td_diario(f"{duracao:.1f}h" if duracao is not None and not (isinstance(duracao, float) and pd.isna(duracao)) else '—'),
+            _td_diario(resultado['nivel_nome'] if resultado else '—'),
+        ]))
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+def _tabela_roda_vida(df: pd.DataFrame) -> html.Div:
+    if df.empty:
+        return html.Div('Nenhum registro de Roda da Vida ainda.', style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
+    cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
+                          for t in ['Data', 'Média Geral']])
+    linhas = []
+    for _, linha in df.head(10).iterrows():
+        valores = [linha[a] for a in dt.AREAS_RODA_VIDA if pd.notna(linha[a])]
+        media = sum(valores) / len(valores) if valores else None
+        linhas.append(html.Tr([
+            _td_diario(str(linha['data'])),
+            _td_diario(f"{media:.1f}" if media is not None else '—'),
+        ]))
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+def _construir_diario_bem_estar() -> html.Div:
+    campo = _campo_diario
+    estilo_input = _estilo_input_diario
+    hoje = date.today().isoformat()
+    checkin_hoje = dt.obter_checkin_dia(hoje) or {}
+    ultimo_roda = dt.obter_ultimo_registro_roda_vida()
+    # Ver diario_app_98.py::_construir_diario98_bem_estar pro mesmo
+    # raciocínio (radar inicial sincronizado com o valor-padrão dos
+    # sliders, não em zero).
+    valores_iniciais_roda = ultimo_roda or {area: 5 for area in dt.AREAS_RODA_VIDA}
+
+    def _valor(chave, padrao=None):
+        v = checkin_hoje.get(chave)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return padrao
+        return v
+
+    return html.Div([
+        _bloco_diario('Check-in do Dia', html.Div([
+            campo('Data', dcc.Input(id='diario-checkin-data', type='date', value=hoje, style=estilo_input())),
+            html.Div([
+                campo('Qualidade do Sono', _estrela_rating('diario-checkin-sono', _num_estrela_ou_padrao(_valor('sono_qualidade')))),
+                campo('Qualidade do Café', _estrela_rating('diario-checkin-cafe', _num_estrela_ou_padrao(_valor('cafe_qualidade')))),
+            ], style={'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(160px, 1fr))', 'gap': '6px 16px'}),
+            html.Div([
+                campo('Dormiu (HH:MM)', dcc.Input(id='diario-checkin-hora-dormir', type='text', placeholder='23:00',
+                                                    value=_valor('sono_hora_dormir', ''), style=estilo_input({'width': '100px'}))),
+                campo('Acordou (HH:MM)', dcc.Input(id='diario-checkin-hora-acordar', type='text', placeholder='07:00',
+                                                     value=_valor('sono_hora_acordar', ''), style=estilo_input({'width': '100px'}))),
+                campo('Autocuidado (min)', dcc.Input(id='diario-checkin-autocuidado', type='number', className='no-spinner',
+                                                       value=_valor('autocuidado_minutos'), style=estilo_input({'width': '100px'}))),
+                campo('Meditação (min)', dcc.Input(id='diario-checkin-meditacao', type='number', className='no-spinner',
+                                                     value=_valor('meditacao_minutos'), style=estilo_input({'width': '100px'}))),
+            ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
+            campo('5 Motivos Para Agradecer + Obs.:',
+                  dcc.Textarea(id='diario-checkin-obs', value=_valor('observacoes', ''), rows=6,
+                               style=estilo_input({'resize': 'none', 'height': 'auto'}))),
+            html.Button('Salvar Check-in do Dia', id='btn-diario-salvar-checkin', n_clicks=0,
+                        style={**_estilo_btn_primario(), 'marginTop': '8px'}),
+            html.Span(id='diario-checkin-status', style={'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2']}),
+        ])),
+
+        _bloco_diario('Escala Hawkins (proxy, não calibrado)',
+                       html.Div(_bloco_gauge_hawkins(date.fromisoformat(hoje)), id='diario-gauge-hawkins')),
+
+        _bloco_diario('Roda da Vida', html.Div([
+            html.Div([
+                campo(dt.NOMES_AREAS_RODA_VIDA[area],
+                      dcc.Slider(id={'type': 'diario-roda-area', 'index': area}, min=0, max=10, step=1,
+                                 value=int(valores_iniciais_roda.get(area) or 5),
+                                 marks={0: '0', 5: '5', 10: '10'}))
+                for area in dt.AREAS_RODA_VIDA
+            ], style={'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(210px, 1fr))', 'gap': '10px 20px'}),
+            html.Button('Salvar Novo Registro', id='btn-diario-salvar-roda', n_clicks=0,
+                        style={**_estilo_btn_primario(), 'marginTop': '10px'}),
+            html.Span(id='diario-roda-status', style={'marginLeft': '10px', 'fontSize': '12px', 'color': C['text2']}),
+            # `staticPlot=True`: só leitura, ver diario_app_98.py pro mesmo
+            # raciocínio (tirar a interatividade evita repetir o bug do
+            # eixo distorcido por clique/arraste direto no gráfico).
+            dcc.Graph(id='diario-radar-roda', figure=_radar_roda_vida(valores_iniciais_roda), responsive=True,
+                      config={'displayModeBar': False, 'staticPlot': True, 'responsive': True},
+                      style={'marginTop': '10px', 'width': '100%'}),
+        ])),
+
+        _bloco_diario('Histórico', html.Div([
+            html.Div('Check-ins recentes', style={'fontSize': '12px', 'fontWeight': '700', 'marginBottom': '4px'}),
+            html.Div(_tabela_checkins(dt.listar_checkins()), id='diario-tabela-checkins'),
+            html.Div('Roda da Vida — registros', style={'fontSize': '12px', 'fontWeight': '700', 'margin': '10px 0 4px'}),
+            html.Div(_tabela_roda_vida(dt.listar_registros_roda_vida()), id='diario-tabela-roda-vida'),
+        ])),
+    ])
+
+
 # =============================================================================
 # APP
 # =============================================================================
 
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
+
+# Registro dos cliques da avaliação em estrelas (ver _estrela_rating) — um
+# campo singleton por chamada (Novo Trade + Bem-Estar), um TIPO
+# pattern-matched por chamada (Posição, cobre qualquer nº de posições
+# abertas).
+for _campo_estrela in (
+    'diario-emo-confianca', 'diario-emo-humor', 'diario-emo-energia',
+    'diario-emo-atencao', 'diario-emo-presenca',
+    'diario-checkin-sono', 'diario-checkin-cafe',
+):
+    _registrar_clique_estrela(app, _campo_estrela)
+for _tipo_estrela in (
+    'ea-emo-confianca', 'ea-emo-humor', 'ea-emo-energia', 'ea-emo-atencao', 'ea-emo-presenca',
+):
+    _registrar_clique_estrela_match(app, _tipo_estrela)
+
+_registrar_scroll_ate_overlay(app, 'diario-imagem-ampliada', 'diario-overlay-imagem',
+                               'diario-overlay-imagem-backdrop-wrap')
 
 _PADRAO_NOME_IMAGEM_DIARIO = re.compile(r'^(\d{4}_[A-Z]+_\d{8}|rascunho_\d+_\d{2})\.png$')
 
@@ -883,18 +2246,49 @@ app.layout = html.Div([
     html.Link(rel='stylesheet',
               href='https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;500&display=swap'),
 
-    dcc.Store(id='store-diario-sub-aba', data='novo'),
+    dcc.Store(id='store-diario-sub-aba', data=_ABA_DIARIO_INICIAL),
+
+    # Tema claro/escuro (2026-07-17) — este processo é o FILHO (embutido
+    # via iframe em dashboard.py); recebe o tema do pai por postMessage
+    # (assets/tema.js) e grava aqui, ou usa o último valor persistido no
+    # próprio localStorage se acessado direto em :8053. Ver dashboard.py
+    # pro raciocínio completo (mesmos stores lá, só que o pai também tem
+    # o switch e repassa por postMessage pro iframe).
+    dcc.Store(id='store-tema', data='light', storage_type='local'),
+    dcc.Store(id='store-tema-dummy'),
+
+    dcc.Store(id='diario-hist-filtro-data-calendario', data=None),
+    dcc.Store(id='diario-imagem-ampliada', data=None),
     html.Div([
         html.Button(nome, id=f'btn-diario-sub-{chave}', n_clicks=0,
-                    style=_estilo_subaba_diario(chave, 'novo'))
+                    style=_estilo_subaba_diario(chave, _ABA_DIARIO_INICIAL))
         for chave, nome in _ABAS_DIARIO_SUB
-    ], style={'display': 'flex', 'gap': '8px', 'marginBottom': '16px'}),
+    ], style={'display': 'flex', 'gap': '8px', 'marginBottom': '16px', 'flexWrap': 'wrap'}),
 
     html.Div(id='diario-sub-aba-conteudo'),
 ], style={
-    'padding': '8px', 'fontFamily': FONTS['body'], 'background': C['bg'],
+    'padding': '8px', 'fontFamily': FONTS['body'], 'background': C['bg'], 'color': C['text'],
     'minHeight': '100vh', 'boxSizing': 'border-box',
 })
+
+
+# Tema claro/escuro (2026-07-17) — aplica o tema recebido do pai (ou o
+# persistido no próprio localStorage, se acessado direto em :8053). Sem
+# repasse por postMessage aqui: este processo é o FILHO, não tem mais
+# ninguém embaixo pra avisar (ver dashboard.py pro lado que manda/escuta os
+# dois papéis, e assets/tema.js pro branch client-side).
+app.clientside_callback(
+    """
+    function(tema) {
+        window.SQ_TEMA = window.SQ_TEMA || {};
+        window.SQ_TEMA.atual = tema || 'light';
+        if (window.SQ_TEMA.aplicarLocal) window.SQ_TEMA.aplicarLocal(window.SQ_TEMA.atual);
+        return '';
+    }
+    """,
+    Output('store-tema-dummy', 'data'),
+    Input('store-tema', 'data'),
+)
 
 
 @app.callback(
@@ -923,9 +2317,9 @@ _DIARIO_SUBABA_CONSTRUTORES = {
     'posicao': _construir_diario_em_andamento,
     'historico': _construir_diario_historico,
     'estatisticas': lambda: html.Div(id='diario-estatisticas-conteudo'),
-    'reconciliacao': _construir_diario_reconciliacao,
-    'aderencia_sr': _construir_diario_aderencia_sr,
+    'estrategias': lambda: html.Div(id='diario-estrategias-conteudo'),
     'padroes': _construir_diario_padroes,
+    'bem_estar': lambda: html.Div(id='diario-bemestar-conteudo'),
 }
 
 
@@ -938,6 +2332,227 @@ def montar_sub_aba_diario(sub_aba_ativa):
     `diario_app_98.py::montar_aba_diario98`."""
     construtor = _DIARIO_SUBABA_CONSTRUTORES.get(sub_aba_ativa, _construir_diario_novo_trade)
     return construtor()
+
+
+@app.callback(
+    Output('diario-estrategias-conteudo', 'children'),
+    Input('store-diario-sub-aba', 'data'),
+)
+def atualizar_estrategias(sub_aba_ativa):
+    if sub_aba_ativa != 'estrategias':
+        return no_update
+    return _construir_diario_estrategias()
+
+
+@app.callback(
+    Output('diario-tabela-estrategias', 'children'),
+    Output('diario-estrategia-status', 'children'),
+    Output('diario-nova-estrategia-nome', 'value'),
+    Output('diario-nova-estrategia-desc', 'value'),
+    Output('diario-nova-estrategia-checklist', 'value'),
+    Output('store-diario-estrategia-editando', 'data'),
+    Output('btn-diario-add-estrategia', 'children'),
+    Output('btn-diario-cancelar-edicao-estrategia', 'style'),
+    Output('diario-estrategia-editando-aviso', 'children'),
+    Input('btn-diario-add-estrategia', 'n_clicks'),
+    Input({'type': 'diario-estrategia-desativar', 'index': ALL}, 'n_clicks'),
+    Input({'type': 'diario-estrategia-editar', 'index': ALL}, 'n_clicks'),
+    Input('btn-diario-cancelar-edicao-estrategia', 'n_clicks'),
+    State('diario-nova-estrategia-nome', 'value'),
+    State('diario-nova-estrategia-desc', 'value'),
+    State('diario-nova-estrategia-checklist', 'value'),
+    State('store-diario-estrategia-editando', 'data'),
+    prevent_initial_call=True,
+)
+def gerenciar_estrategias(n_add, n_desativar, n_editar, n_cancelar, nome, descricao, checklist_texto, editando_id):
+    """Um único form ("Nova Estratégia") serve os 2 modos — criar e editar
+    (feedback 2026-07-20: "preciso de um botão pra editar a estratégia").
+    `store-diario-estrategia-editando` guarda o id em edição (None = modo
+    criar); clicar "Editar" popula o form + muda o botão pra "Salvar
+    Alterações"; "Cancelar Edição" e o próprio submit (quando `editando_id`
+    está setado) voltam ao modo criar."""
+    ctx = callback_context
+    if not ctx.triggered:
+        return (no_update,) * 9
+    origem = ctx.triggered[0]['prop_id']
+    prop_curto = origem.rsplit('.', 1)[0]
+    estilo_cancelar_oculto = {**_estilo_btn_pequeno(), 'marginLeft': '8px', 'display': 'none'}
+    estilo_cancelar_visivel = {**_estilo_btn_pequeno(), 'marginLeft': '8px', 'display': 'inline-block',
+                                'color': C['gold'], 'borderColor': C['gold']}
+
+    if prop_curto == 'btn-diario-cancelar-edicao-estrategia':
+        if not n_cancelar:
+            return (no_update,) * 9
+        return (no_update, 'Edição cancelada.', '', '', '', None,
+                'Adicionar Estratégia', estilo_cancelar_oculto, None)
+
+    if prop_curto == 'btn-diario-add-estrategia':
+        if not nome or not nome.strip():
+            return (no_update, '⚠ Informe um nome.') + (no_update,) * 7
+        checklist = [linha.strip() for linha in (checklist_texto or '').split('\n') if linha.strip()]
+        if editando_id:
+            dt.editar_estrategia(editando_id, nome=nome.strip(), descricao=descricao or '', checklist=checklist)
+            return (_tabela_estrategias(dt.listar_estrategias()), f'✔ "{nome.strip()}" atualizada.',
+                    '', '', '', None, 'Adicionar Estratégia', estilo_cancelar_oculto, None)
+        dt.criar_estrategia(nome, descricao or '', checklist)
+        return (_tabela_estrategias(dt.listar_estrategias()), f'✔ "{nome.strip()}" cadastrada.',
+                '', '', '', no_update, no_update, no_update, no_update)
+
+    if prop_curto.startswith('{'):
+        id_componente = json.loads(prop_curto)
+        if id_componente['type'] == 'diario-estrategia-editar':
+            if not any(n_editar or []):
+                return (no_update,) * 9
+            df = dt.listar_estrategias(somente_ativas=False)
+            linha = df[df['id'] == id_componente['index']]
+            if linha.empty:
+                return (no_update,) * 9
+            linha0 = linha.iloc[0]
+            checklist_texto_novo = '\n'.join(_lista_segura(linha0['checklist']))
+            aviso = html.Div(f'✏ Editando "{linha0["nome"]}" (ID {linha0["id"]}).',
+                              style={'fontSize': '11px', 'color': C['gold'], 'marginBottom': '8px'})
+            return (no_update, '', linha0['nome'], linha0['descricao'] or '', checklist_texto_novo,
+                    int(linha0['id']), 'Salvar Alterações', estilo_cancelar_visivel, aviso)
+        if id_componente['type'] == 'diario-estrategia-desativar':
+            if not any(n_desativar or []):
+                return (no_update,) * 9
+            dt.desativar_estrategia(id_componente['index'])
+            return (_tabela_estrategias(dt.listar_estrategias()), '✔ Estratégia desativada.',
+                    no_update, no_update, no_update, no_update, no_update, no_update, no_update)
+    return (no_update,) * 9
+
+
+@app.callback(
+    Output('diario-tabela-rr', 'children'),
+    Output('diario-rr-status', 'children'),
+    Output('diario-novo-rr-nome', 'value'),
+    Output('diario-novo-rr-alvo', 'value'),
+    Output('diario-novo-rr-stop', 'value'),
+    Output('diario-novo-rr-be', 'value'),
+    Input('btn-diario-add-rr', 'n_clicks'),
+    Input({'type': 'diario-rr-desativar', 'index': ALL}, 'n_clicks'),
+    State('diario-novo-rr-nome', 'value'),
+    State('diario-novo-rr-alvo', 'value'),
+    State('diario-novo-rr-stop', 'value'),
+    State('diario-novo-rr-be', 'value'),
+    prevent_initial_call=True,
+)
+def gerenciar_rr_presets(n_add, n_desativar, nome, alvo, stop, be):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update, no_update, no_update, no_update, no_update, no_update
+    origem = ctx.triggered[0]['prop_id']
+    if origem.startswith('btn-diario-add-rr'):
+        alvo, stop, be = _num(alvo), _num(stop), _num(be)
+        if not nome or not nome.strip() or alvo is None or stop is None:
+            return no_update, '⚠ Informe nome, alvo e stop.', no_update, no_update, no_update, no_update
+        dt.criar_rr_preset(nome, alvo, stop, be)
+        return _tabela_rr_presets(dt.listar_rr_presets()), f'✔ "{nome.strip()}" cadastrado.', '', None, None, None
+    if not any(n_desativar or []):
+        return no_update, no_update, no_update, no_update, no_update, no_update
+    id_componente = json.loads(origem.rsplit('.', 1)[0])
+    dt.desativar_rr_preset(id_componente['index'])
+    return _tabela_rr_presets(dt.listar_rr_presets()), '✔ Preset desativado.', no_update, no_update, no_update, no_update
+
+
+@app.callback(
+    Output('diario-tabela-tags', 'children'),
+    Output('diario-tag-status', 'children'),
+    Output('diario-nova-tag-nome', 'value'),
+    Input('btn-diario-add-tag', 'n_clicks'),
+    Input({'type': 'diario-tag-desativar', 'index': ALL}, 'n_clicks'),
+    State('diario-nova-tag-nome', 'value'),
+    State('diario-nova-tag-tipo', 'value'),
+    prevent_initial_call=True,
+)
+def gerenciar_tags(n_add, n_desativar, nome, tipo):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update, no_update, no_update
+    origem = ctx.triggered[0]['prop_id']
+    if origem.startswith('btn-diario-add-tag.'):
+        if not nome or not nome.strip():
+            return no_update, '⚠ Informe um nome.', no_update
+        dt.criar_tag_setup_erro(nome, tipo or 'ambos')
+        return _tabela_tags(dt.listar_tags_setup_erro()), f'✔ "{nome.strip()}" cadastrada.', ''
+    if not any(n_desativar or []):
+        return no_update, no_update, no_update
+    id_componente = json.loads(origem.rsplit('.', 1)[0])
+    dt.desativar_tag_setup_erro(id_componente['index'])
+    return _tabela_tags(dt.listar_tags_setup_erro()), '✔ Tag desativada.', no_update
+
+
+@app.callback(
+    Output('diario-tabela-tags-emocionais', 'children'),
+    Output('diario-tag-emocional-status', 'children'),
+    Output('diario-nova-tag-emocional-nome', 'value'),
+    Input('btn-diario-add-tag-emocional', 'n_clicks'),
+    Input({'type': 'diario-tag-emocional-desativar', 'index': ALL}, 'n_clicks'),
+    State('diario-nova-tag-emocional-nome', 'value'),
+    prevent_initial_call=True,
+)
+def gerenciar_tags_emocionais(n_add, n_desativar, nome):
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update, no_update, no_update
+    origem = ctx.triggered[0]['prop_id']
+    if origem.startswith('btn-diario-add-tag-emocional'):
+        if not nome or not nome.strip():
+            return no_update, '⚠ Informe um nome.', no_update
+        dt.criar_tag_emocional(nome)
+        return _tabela_tags_emocionais(dt.listar_tags_emocionais()), f'✔ "{nome.strip()}" cadastrada.', ''
+    if not any(n_desativar or []):
+        return no_update, no_update, no_update
+    id_componente = json.loads(origem.rsplit('.', 1)[0])
+    dt.desativar_tag_emocional(id_componente['index'])
+    return _tabela_tags_emocionais(dt.listar_tags_emocionais()), '✔ Tag desativada.', no_update
+
+
+@app.callback(
+    Output('diario-alvo', 'value'),
+    Output('diario-stop', 'value'),
+    Input('diario-rr-preset', 'value'),
+    prevent_initial_call=True,
+)
+def aplicar_rr_preset(rr_valor):
+    preset = dt.obter_rr_preset(rr_valor)
+    if preset is None:
+        return no_update, no_update
+    return preset['alvo_pontos'], preset['stop_pontos']
+
+
+@app.callback(
+    Output('diario-rr-preset', 'value', allow_duplicate=True),
+    Input('diario-alvo', 'value'),
+    Input('diario-stop', 'value'),
+    State('diario-rr-preset', 'value'),
+    prevent_initial_call=True,
+)
+def resetar_rr_se_editado(alvo, stop, rr_atual):
+    """Ver diario_app_98.py::resetar_rr_se_editado_98 pro raciocínio
+    completo (compara contra o preset em vez de usar triggered_id, pra
+    evitar loop de re-disparo)."""
+    if not rr_atual:
+        return no_update
+    preset = dt.obter_rr_preset(rr_atual)
+    if preset is None:
+        return no_update
+    if _num(alvo) == preset['alvo_pontos'] and _num(stop) == preset['stop_pontos']:
+        return no_update
+    return None
+
+
+@app.callback(
+    Output('diario-sentimento-label', 'children'),
+    Output('diario-sentimento-label', 'style'),
+    Input('diario-sentimento-mercado', 'value'),
+)
+def atualizar_label_sentimento(valor):
+    resultado = dt.classificar_sentimento_mercado(valor)
+    if resultado is None:
+        return '—', {'fontSize': '12px', 'color': C['text2']}
+    nome, cor_chave = resultado
+    return nome, {'fontSize': '12px', 'fontWeight': '700', 'color': C.get(cor_chave, C['text'])}
 
 
 @app.callback(
@@ -980,16 +2595,29 @@ def preview_imagem_diario(upload_contents, imagem_colada):
     State('diario-nivel-sr', 'value'),
     State('diario-nivel-sr-tipo', 'value'),
     State('diario-tags-setup-erro', 'value'),
+    State('diario-emo-confianca', 'value'),
+    State('diario-emo-humor', 'value'),
+    State('diario-emo-energia', 'value'),
+    State('diario-emo-atencao', 'value'),
+    State('diario-emo-presenca', 'value'),
+    State('diario-tags-emocionais', 'value'),
+    State('diario-sentimento-mercado', 'value'),
     State('diario-upload-imagem', 'contents'),
     State('store-diario-imagem-colada', 'data'),
     prevent_initial_call=True,
 )
 def salvar_novo_trade(n_clicks, data_op, ativo, janela, estrategia_tags, sala, tipo_op, alvo, stop, lote,
                        preco_entrada, preco_saida, tipo_saida, resultado, saldo, resumo, obs,
-                       nivel_sr, nivel_sr_tipo, tags_setup_erro, upload_contents, imagem_colada):
+                       nivel_sr, nivel_sr_tipo, tags_setup_erro,
+                       emo_confianca, emo_humor, emo_energia, emo_atencao, emo_presenca,
+                       tags_emocionais, sentimento_mercado, upload_contents, imagem_colada):
     if not data_op or not ativo:
         return '⚠ Preencha ao menos Data e Ativo.'
 
+    alvo, stop, preco_entrada, preco_saida, resultado, saldo, nivel_sr = (
+        _num(alvo), _num(stop), _num(preco_entrada), _num(preco_saida),
+        _num(resultado), _num(saldo), _num(nivel_sr),
+    )
     campos = dict(
         data_op=data_op, ativo=ativo, janela_pregao=janela,
         estrategia_tags=estrategia_tags or [], sala_analise=sala,
@@ -999,6 +2627,9 @@ def salvar_novo_trade(n_clicks, data_op, ativo, janela, estrategia_tags, sala, t
         resumo_operacional=resumo, obs=obs,
         nivel_sr_referencia=nivel_sr, nivel_sr_tipo=nivel_sr_tipo,
         tags_setup_erro=tags_setup_erro or [],
+        emo_confianca=emo_confianca, emo_humor=emo_humor, emo_energia=emo_energia,
+        emo_atencao=emo_atencao, emo_presenca=emo_presenca,
+        tags_emocionais=tags_emocionais or [], sentimento_mercado=sentimento_mercado,
         conta='real',
     )
 
@@ -1045,6 +2676,13 @@ def salvar_novo_trade(n_clicks, data_op, ativo, janela, estrategia_tags, sala, t
     Output('diario-nivel-sr', 'value'),
     Output('diario-nivel-sr-tipo', 'value'),
     Output('diario-tags-setup-erro', 'value'),
+    Output('diario-emo-confianca', 'value'),
+    Output('diario-emo-humor', 'value'),
+    Output('diario-emo-energia', 'value'),
+    Output('diario-emo-atencao', 'value'),
+    Output('diario-emo-presenca', 'value'),
+    Output('diario-tags-emocionais', 'value'),
+    Output('diario-sentimento-mercado', 'value'),
     Output('diario-preview-imagem', 'children', allow_duplicate=True),
     Output('store-diario-imagem-colada', 'data', allow_duplicate=True),
     Input('btn-diario-limpar', 'n_clicks'),
@@ -1053,29 +2691,227 @@ def salvar_novo_trade(n_clicks, data_op, ativo, janela, estrategia_tags, sala, t
 def limpar_form_diario(n_clicks):
     return (None, None, None, None, None, None, None, None, 1,
             None, None, None, None, None, None, None, None, None, None,
+            3, 3, 3, 3, 3, None, 50,
             None, None)
 
 
 @app.callback(
     Output('diario-historico-tabela', 'children'),
+    Output('diario-hist-banner-filtro-cal', 'children'),
     Input('diario-hist-ativo', 'value'),
     Input('diario-hist-janela', 'value'),
     Input('diario-hist-estrategia', 'value'),
+    Input('diario-hist-data-ini', 'value'),
+    Input('diario-hist-data-fim', 'value'),
+    Input('diario-hist-filtro-data-calendario', 'data'),
 )
-def atualizar_historico(ativo, janela, estrategia):
-    df = dt.listar_trades(ativo=ativo, janela=janela, estrategia_tag=estrategia, is_simulated=False)
-    df = df.sort_values('data_op', ascending=False).head(50)
+def atualizar_historico(ativo, janela, estrategia, data_ini, data_fim, filtro_cal):
+    # O clique num dia do calendário (Estatísticas) força um filtro de dia
+    # único aqui, sobrepondo o filtro manual de intervalo.
+    data_ini_efetivo = filtro_cal or data_ini
+    data_fim_efetivo = filtro_cal or data_fim
+    df = dt.listar_trades(ativo=ativo, janela=janela, estrategia_tag=estrategia,
+                           data_ini=data_ini_efetivo, data_fim=data_fim_efetivo, is_simulated=False)
+    df = df.sort_values('data_op', ascending=False).head(200 if filtro_cal else 50)
+
+    banner = html.Div([
+        html.Span(f'Filtrando pelo dia {filtro_cal} (clique no calendário). ',
+                  style={'fontSize': '12px', 'color': C['text2']}),
+        html.Button('Limpar', id='btn-diario-hist-limpar-filtro-cal', n_clicks=0, style={
+            'background': 'transparent', 'color': C['text2'], 'border': f'1px solid {C["border"]}',
+            'borderRadius': '4px', 'padding': '2px 10px', 'cursor': 'pointer', 'fontSize': '11px',
+        }),
+    ], style={'display': 'flex', 'alignItems': 'center', 'gap': '8px'}) if filtro_cal else ''
+
     if df.empty:
         return html.Div('Nenhuma operação encontrada.', style={
             'padding': '20px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '13px',
-        })
+        }), banner
+    aderencia_df = dt.avaliar_aderencia_sr()
+    aderencia_por_trade = (
+        dict(zip(aderencia_df['id_trade'].astype(int), aderencia_df['classificacao']))
+        if not aderencia_df.empty else {}
+    )
+    mapa_nomes_estrategias = _mapa_nomes_estrategias()
     cabecalho = html.Tr([
         html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
-        for t in ['Data', 'Ativo', 'Janela', 'Estratégia', 'Tipo', 'Pts', 'Saldo', 'Print']
+        for t in ['Data', 'Ativo', 'Janela', 'Estratégia', 'Tipo', 'Pts', 'Saldo', 'Print', 'Aderência S/R', '']
     ])
-    linhas = [_linha_historico(row) for _, row in df.iterrows()]
+    linhas = []
+    for _, row in df.iterrows():
+        linhas.extend(_linha_historico(row, aderencia_por_trade, mapa_nomes_estrategias))
     return html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
-                       style={'width': '100%', 'borderCollapse': 'collapse'})
+                       style={'width': '100%', 'borderCollapse': 'collapse'}), banner
+
+
+@app.callback(
+    Output('diario-hist-filtro-data-calendario', 'data', allow_duplicate=True),
+    Input('btn-diario-hist-limpar-filtro-cal', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def limpar_filtro_calendario(n_clicks):
+    return None
+
+
+@app.callback(
+    Output({'type': 'diario-detalhe-linha', 'index': dash.MATCH}, 'children'),
+    Output({'type': 'diario-btn-expandir', 'index': dash.MATCH}, 'children'),
+    Input({'type': 'diario-btn-expandir', 'index': dash.MATCH}, 'n_clicks'),
+    State({'type': 'diario-btn-expandir', 'index': dash.MATCH}, 'children'),
+    State({'type': 'diario-btn-expandir', 'index': dash.MATCH}, 'id'),
+    prevent_initial_call=True,
+)
+def alternar_detalhe_historico(n_clicks, seta_atual, id_componente):
+    """Expande/recolhe a linha de detalhe do Histórico — substitui o
+    antigo popup (`_overlay`/`diario-trade-detalhe-id`), removido de vez
+    (feedback 2026-07-16). Usa o próprio texto da seta como estado (▶
+    fechado/▼ aberto) em vez de um `dcc.Store` por linha — mais simples,
+    já que a seta É a única fonte de verdade de "está aberta ou não"."""
+    if seta_atual == '▶':
+        conteudo = _conteudo_detalhe_trade(id_componente['index'])
+        return conteudo, '▼'
+    return None, '▶'
+
+
+@app.callback(
+    Output({'type': 'ea-imagem-principal', 'index': dash.MATCH}, 'data'),
+    Input({'type': 'ea-imagem-thumb-escolher', 'index': dash.MATCH, 'nome': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def escolher_imagem_principal(n_clicks_lista):
+    """Clique na miniatura vira a escolha de capa na hora — ver
+    `_campo_imagem_principal`. Mesma técnica de `ampliar_imagem` (achar QUAL
+    id disparou via `ctx.triggered`, sem precisar de JS novo)."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    id_componente = json.loads(ctx.triggered[0]['prop_id'].rsplit('.', 1)[0])
+    return id_componente['nome']
+
+
+@app.callback(
+    Output({'type': 'ea-imagem-thumb-escolher', 'index': dash.MATCH, 'nome': ALL}, 'style'),
+    Input({'type': 'ea-imagem-principal', 'index': dash.MATCH}, 'data'),
+    State({'type': 'ea-imagem-thumb-escolher', 'index': dash.MATCH, 'nome': ALL}, 'id'),
+)
+def destacar_imagem_principal(selecionada, ids_lista):
+    return [_estilo_thumb_imagem_principal(item_id['nome'] == selecionada) for item_id in ids_lista]
+
+
+@app.callback(
+    Output('diario-imagem-ampliada', 'data'),
+    Input({'type': 'diario-img-thumb', 'index': ALL}, 'n_clicks'),
+    Input({'type': 'diario-img-thumb-detalhe', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def ampliar_imagem(n_clicks_lista, n_clicks_lista_detalhe):
+    """Amplia tanto a miniatura da linha do Histórico (`diario-img-thumb`)
+    quanto a imagem maior dentro do detalhe expandido (`diario-img-thumb-
+    detalhe`, feedback 2026-07-16) — 2 `Input`s pattern-matched em vez de 1
+    porque as duas podem coexistir na página ao mesmo tempo (linha
+    recolhida + detalhe expandido), então não podem compartilhar o mesmo
+    `type` de id (duplicaria o id na mesma renderização).
+
+    Feedback 2026-07-20: "deve ter botões de navegação entre outros prints
+    do mesmo trade quando tiver" — a imagem principal (`imagem_arquivo`)
+    sempre entra primeiro, seguida das adicionais (`imagens_adicionais`,
+    coluna existente desde a Fase C, nunca exposta na UI até agora).
+    `indice` sempre começa em 0 (a principal), navegação em
+    `navegar_imagem_ampliada`."""
+    ctx = callback_context
+    if not ctx.triggered or not any((n_clicks_lista or []) + (n_clicks_lista_detalhe or [])):
+        return no_update
+    id_componente = json.loads(ctx.triggered[0]['prop_id'].rsplit('.', 1)[0])
+    df = dt.listar_trades()
+    linha = df[df['id_trade'] == id_componente['index']]
+    if linha.empty or not linha.iloc[0].get('imagem_arquivo'):
+        return no_update
+    linha0 = linha.iloc[0]
+    principal = linha0['imagem_arquivo']
+    adicionais = [nome for nome in _lista_segura(linha0.get('imagens_adicionais')) if nome != principal]
+    imagens = [principal] + adicionais
+    return {'imagens': [f"/diario-imagens/{nome}" for nome in imagens], 'indice': 0}
+
+
+@app.callback(
+    Output('diario-imagem-ampliada', 'data', allow_duplicate=True),
+    Input('btn-diario-fechar-imagem', 'n_clicks'),
+    Input('diario-overlay-imagem-backdrop', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def fechar_imagem_ampliada(n1, n2):
+    return None
+
+
+@app.callback(
+    Output('diario-imagem-ampliada', 'data', allow_duplicate=True),
+    Input('btn-diario-imagem-anterior', 'n_clicks'),
+    Input('btn-diario-imagem-proxima', 'n_clicks'),
+    State('diario-imagem-ampliada', 'data'),
+    prevent_initial_call=True,
+)
+def navegar_imagem_ampliada(_n_anterior, _n_proxima, atual):
+    if not atual or not atual.get('imagens'):
+        return no_update
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update
+    origem = ctx.triggered[0]['prop_id'].split('.')[0]
+    total = len(atual['imagens'])
+    indice = atual.get('indice', 0)
+    if origem == 'btn-diario-imagem-anterior':
+        indice = (indice - 1) % total
+    elif origem == 'btn-diario-imagem-proxima':
+        indice = (indice + 1) % total
+    else:
+        return no_update
+    return {**atual, 'indice': indice}
+
+
+@app.callback(
+    Output('diario-overlay-imagem', 'children'),
+    Input('diario-imagem-ampliada', 'data'),
+)
+def renderizar_overlay_imagem(dados):
+    if not dados or not dados.get('imagens'):
+        return None
+    imagens = dados['imagens']
+    indice = dados.get('indice', 0)
+    topo = [
+        html.Button('✕ Fechar', id='btn-diario-fechar-imagem', n_clicks=0, style={
+            'background': 'transparent', 'color': C['text'], 'border': f'1px solid {C["border"]}',
+            'borderRadius': '6px', 'padding': '4px 12px', 'cursor': 'pointer',
+        }),
+    ]
+    if len(imagens) > 1:
+        topo.append(html.Div([
+            html.Button('◀ Anterior', id='btn-diario-imagem-anterior', n_clicks=0, style={
+                'background': 'transparent', 'color': C['text'], 'border': f'1px solid {C["border"]}',
+                'borderRadius': '6px', 'padding': '4px 12px', 'cursor': 'pointer',
+            }),
+            html.Span(f'{indice + 1} / {len(imagens)}', style={'fontSize': '12px', 'color': C['text2']}),
+            html.Button('Próxima ▶', id='btn-diario-imagem-proxima', n_clicks=0, style={
+                'background': 'transparent', 'color': C['text'], 'border': f'1px solid {C["border"]}',
+                'borderRadius': '6px', 'padding': '4px 12px', 'cursor': 'pointer',
+            }),
+        ], style={'display': 'flex', 'gap': '10px', 'alignItems': 'center'}))
+    # Feedback 2026-07-20: "preencher o bloco inteiro com zoom pela rolagem
+    # do scroll, e clicar e arrastar" — comportamento em assets/diario_zoom.js
+    # (delegação de evento em document, wheel = zoom centrado no cursor,
+    # pointer capture = arrastar). `key=imagens[indice]` força o React a
+    # remontar um <img>/container NOVO por imagem (não só trocar o src de um
+    # nó reciclado) — sem isso o zoom/pan da imagem anterior (guardado direto
+    # no elemento DOM pelo JS) vazaria pra próxima ao navegar.
+    filhos = [
+        html.Div(topo, style={'display': 'flex', 'flexDirection': 'column', 'gap': '8px', 'flexShrink': '0'}),
+        html.Div(
+            html.Img(src=imagens[indice], className='diario-zoom-img', draggable='false', key=imagens[indice]),
+            className='diario-zoom-container', key=imagens[indice],
+            style={'flex': '1', 'minHeight': '0', 'marginTop': '8px', 'border': f"2px solid {C['border']}"},
+        ),
+    ]
+    return _overlay(html.Div(filhos, style={'display': 'flex', 'flexDirection': 'column', 'height': '100%'}),
+                     'diario-overlay-imagem-backdrop')
 
 
 @app.callback(
@@ -1089,75 +2925,197 @@ def atualizar_estatisticas(sub_aba_ativa):
 
 
 @app.callback(
+    Output('diario-bemestar-conteudo', 'children'),
+    Input('store-diario-sub-aba', 'data'),
+)
+def atualizar_bem_estar(sub_aba_ativa):
+    if sub_aba_ativa != 'bem_estar':
+        return no_update
+    return _construir_diario_bem_estar()
+
+
+@app.callback(
+    Output('diario-checkin-status', 'children'),
+    Output('diario-gauge-hawkins', 'children'),
+    Output('diario-tabela-checkins', 'children'),
+    Input('btn-diario-salvar-checkin', 'n_clicks'),
+    State('diario-checkin-data', 'value'),
+    State('diario-checkin-sono', 'value'),
+    State('diario-checkin-cafe', 'value'),
+    State('diario-checkin-hora-dormir', 'value'),
+    State('diario-checkin-hora-acordar', 'value'),
+    State('diario-checkin-autocuidado', 'value'),
+    State('diario-checkin-meditacao', 'value'),
+    State('diario-checkin-obs', 'value'),
+    prevent_initial_call=True,
+)
+def salvar_checkin(n_clicks, data_str, sono, cafe, hora_dormir, hora_acordar,
+                    autocuidado, meditacao, obs):
+    if not n_clicks or not data_str:
+        return no_update, no_update, no_update
+    campos = {
+        'sono_qualidade': sono, 'cafe_qualidade': cafe,
+        'sono_hora_dormir': hora_dormir, 'sono_hora_acordar': hora_acordar,
+        'autocuidado_minutos': autocuidado, 'meditacao_minutos': meditacao,
+        'observacoes': obs,
+    }
+    ok = dt.salvar_checkin_dia(data_str, campos)
+    if not ok:
+        return '⚠ Não foi possível salvar (tente novamente).', no_update, no_update
+    return ('✔ Check-in salvo.', _bloco_gauge_hawkins(date.fromisoformat(data_str)),
+            _tabela_checkins(dt.listar_checkins()))
+
+
+@app.callback(
+    Output('diario-radar-roda', 'figure'),
+    Output('diario-roda-status', 'children'),
+    Output('diario-tabela-roda-vida', 'children'),
+    Input('btn-diario-salvar-roda', 'n_clicks'),
+    State({'type': 'diario-roda-area', 'index': ALL}, 'value'),
+    State({'type': 'diario-roda-area', 'index': ALL}, 'id'),
+    State('store-tema', 'data'),
+    prevent_initial_call=True,
+)
+def salvar_roda_vida(n_clicks, valores, ids, tema_atual):
+    if not n_clicks:
+        return no_update, no_update, no_update
+    campos = {id_['index']: valor for id_, valor in zip(ids, valores)}
+    dt.criar_registro_roda_vida(date.today(), campos)
+    ultimo = dt.obter_ultimo_registro_roda_vida()
+    return (_radar_roda_vida(ultimo, tema_atual or 'light'), '✔ Registro salvo.',
+            _tabela_roda_vida(dt.listar_registros_roda_vida()))
+
+
+@app.callback(
+    Output('diario-radar-roda', 'figure', allow_duplicate=True),
+    Input({'type': 'diario-roda-area', 'index': ALL}, 'value'),
+    State({'type': 'diario-roda-area', 'index': ALL}, 'id'),
+    State('store-tema', 'data'),
+    prevent_initial_call=True,
+)
+def atualizar_radar_ao_vivo(valores, ids, tema_atual):
+    """Ver diario_app_98.py::atualizar_radar_ao_vivo_98 pro mesmo raciocínio
+    (preview ao vivo do radar a cada slider movido, sem gravar nada)."""
+    campos = {id_['index']: valor for id_, valor in zip(ids, valores)}
+    return _radar_roda_vida(campos, tema_atual or 'light')
+
+
+@app.callback(
     Output('diario-calendario-mes', 'data'),
-    Input('btn-diario-cal-prev', 'n_clicks'),
-    Input('btn-diario-cal-next', 'n_clicks'),
+    Input('btn-diario-cal-mes-prev', 'n_clicks'),
+    Input('btn-diario-cal-mes-next', 'n_clicks'),
+    Input('btn-diario-cal-ano-prev', 'n_clicks'),
+    Input('btn-diario-cal-ano-next', 'n_clicks'),
     State('diario-calendario-mes', 'data'),
     prevent_initial_call=True,
 )
-def navegar_calendario_classico(n_prev, n_next, mes_atual):
+def navegar_calendario_classico(n_mes_prev, n_mes_next, n_ano_prev, n_ano_next, mes_atual):
+    """Setas de mês e de ano são controles TOTALMENTE separados (feedback
+    2026-07-12: um único par de setas reaproveitado pros dois modos —
+    trocando de significado conforme `diario-modo-ano` — fazia o usuário
+    clicar esperando andar um mês e o calendário pular um ano inteiro,
+    3 vezes reportado mesmo depois de rotular os botões dinamicamente. A
+    seta de mês SEMPRE anda mês a mês (com rollover de ano) e a de ano
+    SEMPRE anda ano a ano, não importa qual grade (`diario-modo-ano`) está
+    sendo exibida — `modo_ano` não é mais lido aqui, só decide o que
+    `atualizar_periodo_estatisticas` desenha embaixo."""
     ctx = callback_context
     if not ctx.triggered or not mes_atual:
         return no_update
+    trigger = ctx.triggered[0]
+    if not trigger['value']:
+        # Um clique de verdade SEMPRE incrementa `n_clicks` (nunca zera
+        # sozinho) — um trigger com valor 0 só pode vir do próprio botão
+        # tendo sido recriado (Dash reseta `n_clicks` de um componente
+        # novo pra 0), nunca de uma ação do usuário. Guarda defensiva:
+        # com os botões agora fixos (nunca recriados, ver
+        # `_construir_diario_estatisticas`) isso não deveria mais
+        # acontecer, mas custa nada blindar contra o mesmo bug voltando
+        # se algum código futuro recriar os botões de novo por engano.
+        return no_update
     ano, mes = (int(x) for x in mes_atual.split('-'))
-    origem = ctx.triggered[0]['prop_id'].split('.')[0]
-    mes += -1 if origem == 'btn-diario-cal-prev' else 1
-    if mes == 0:
-        mes, ano = 12, ano - 1
-    elif mes == 13:
-        mes, ano = 1, ano + 1
+    origem = trigger['prop_id'].split('.')[0]
+    if origem in ('btn-diario-cal-mes-prev', 'btn-diario-cal-mes-next'):
+        passo = -1 if origem == 'btn-diario-cal-mes-prev' else 1
+        mes += passo
+        if mes == 0:
+            mes, ano = 12, ano - 1
+        elif mes == 13:
+            mes, ano = 1, ano + 1
+    else:
+        passo = -1 if origem == 'btn-diario-cal-ano-prev' else 1
+        ano += passo
     return f"{ano:04d}-{mes:02d}"
 
 
 @app.callback(
+    Output('diario-modo-ano', 'data'),
+    Input('btn-diario-modo-ano', 'n_clicks'),
+    State('diario-modo-ano', 'data'),
+    prevent_initial_call=True,
+)
+def alternar_modo_ano(n_clicks, modo_atual):
+    if not n_clicks:  # ver comentário em navegar_calendario_classico
+        return no_update
+    return not bool(modo_atual)
+
+
+@app.callback(
+    Output('diario-cards-conteudo', 'children'),
     Output('diario-calendario-grid', 'children'),
-    Output('diario-calendario-label', 'children'),
+    Output('diario-calendario-label-mes', 'children'),
+    Output('diario-calendario-label-ano', 'children'),
+    Output('btn-diario-modo-ano', 'style'),
+    Output('diario-modo-ano-bolinha', 'style'),
+    Output('diario-resto-periodo-conteudo', 'children'),
     Input('diario-calendario-mes', 'data'),
-    Input('diario-por-dia-store', 'data'),
+    Input('diario-modo-ano', 'data'),
+    State('store-tema', 'data'),
 )
-def atualizar_grade_calendario_classico(mes_atual, por_dia):
-    """Redesenha a grade a partir do `por_dia` já carregado no Store — mesma
-    razão de `diario_app_98.py::atualizar_grade_calendario_98`."""
+def atualizar_periodo_estatisticas(mes_atual, modo_ano, tema_atual):
+    """Recalcula estatísticas + calendário a cada troca de mês/ano/toggle —
+    ver `diario_app_98.py::atualizar_periodo_estatisticas_98` pro raciocínio
+    completo. Só atualiza `children`/`style` de componentes que já existem
+    (criados 1x em `_construir_diario_estatisticas`) — NUNCA substitui os
+    botões de navegação inteiros, pra não repetir o bug de `n_clicks`
+    resetando (ver comentário lá). Os labels de mês/ano são atualizados
+    SEMPRE, independente de `modo_ano` — as setas de mês e ano ficam
+    visíveis e funcionais nos dois modos de grade (ver
+    `navegar_calendario_classico`), só a grade abaixo (dias vs meses) muda."""
     if not mes_atual:
-        return no_update, no_update
+        return (no_update,) * 7
     ano, mes = (int(x) for x in mes_atual.split('-'))
-    return _grade_calendario(por_dia or {}, ano, mes), f"{_NOMES_MES[mes]} {ano}"
-
-
-@app.callback(
-    Output('diario-reconciliacao-tabela', 'children'),
-    Output('diario-reconciliar-status', 'children'),
-    Input('btn-diario-reconciliar', 'n_clicks'),
-    prevent_initial_call=True,
-)
-def reconciliar_classico(n_clicks):
-    try:
-        resultado = dt.reconciliar_com_mt5(dias_atras=30)
-    except Exception as e:
-        return no_update, f'⚠ Erro ao reconciliar: {str(e)[:100]}'
-    return _tabela_reconciliacao(resultado), f'Concluído — {len(resultado)} linhas.'
-
-
-@app.callback(
-    Output('diario-aderencia-sr-tabela', 'children'),
-    Output('diario-aderencia-sr-status', 'children'),
-    Input('btn-diario-aderencia-sr', 'n_clicks'),
-    prevent_initial_call=True,
-)
-def avaliar_aderencia_sr_classico(n_clicks):
-    try:
-        resultado = dt.avaliar_aderencia_sr()
-        todos = dt.listar_trades()
-        com_nivel = todos[todos['nivel_sr_referencia'].notna()]
-        sem_snapshot = len(com_nivel) - len(resultado)
-    except Exception as e:
-        return no_update, f'⚠ Erro ao avaliar: {str(e)[:100]}'
-    status = f'Concluído — {len(resultado)} avaliados'
-    if sem_snapshot > 0:
-        status += f', {sem_snapshot} com nível marcado mas sem snapshot (trades antigos).'
+    modo_ano = bool(modo_ano)
+    if modo_ano:
+        stats = dt.calcular_estatisticas(ano=ano)
+        grade = _grade_calendario_anual(stats['por_mes'], ano)
     else:
-        status += '.'
-    return _tabela_aderencia_sr(resultado), status
+        stats = dt.calcular_estatisticas(ano=ano, mes=mes)
+        grade = _grade_calendario(stats['por_dia'], ano, mes)
+    return (
+        _cards_ou_vazio_estatisticas(stats),
+        grade,
+        _NOMES_MES[mes],
+        str(ano),
+        _estilo_toggle_trilho(modo_ano),
+        _estilo_toggle_bolinha(modo_ano),
+        _resto_periodo_estatisticas(stats, tema_atual or 'light'),
+    )
+
+
+@app.callback(
+    Output('store-diario-sub-aba', 'data', allow_duplicate=True),
+    Output('diario-hist-filtro-data-calendario', 'data'),
+    Input({'type': 'diario-cal-dia', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def clicar_dia_calendario(n_clicks_lista):
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update, no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    componente_id = json.loads(prop_id)
+    return 'historico', componente_id['index']
 
 
 @app.callback(
@@ -1176,31 +3134,135 @@ def detectar_padroes_classico(n_clicks):
 
 @app.callback(
     Output('em-andamento-conteudo', 'children'),
+    Output('store-em-andamento-ids-conhecidos', 'data'),
     Input('interval-em-andamento', 'n_intervals'),
     Input('store-diario-sub-aba', 'data'),
+    Input('store-posicao-ativo-subaba', 'data'),
+    State('store-em-andamento-ids-conhecidos', 'data'),
 )
-def atualizar_em_andamento(n, sub_aba_ativa):
+def atualizar_em_andamento(n, sub_aba_ativa, ativo_selecionado, ids_conhecidos):
+    """Feedback 2026-07-20: "após o trade ser finalizado na plataforma, a
+    seção não apareceu automaticamente, tive que mudar de aba e entrar de
+    novo" — E "o formulário deve ficar logo abaixo do bloco do trade
+    aberto" (ver `_bloco_posicao_completo`). Isso juntou os dois Outputs
+    antigos (`em-andamento-conteudo` só-leitura + `em-andamento-
+    formularios` editável, nunca tocado pelo interval de propósito — ver
+    histórico de `_renderizar_formularios_em_andamento`) num só, agora
+    guiado pelo MESMO interval de 6s.
+
+    Isso reintroduziria o bug do "Neutro piscando" (2026-07-11: um campo
+    reconstruído com `value=` fresco do disco sobrescreve o que o usuário
+    está digitando) se reconstruísse TUDO a cada tick — mas com o
+    auto-save contínuo (2026-07-20, cada campo salva sozinho ao mudar) já
+    não existe mais "edição não salva" pra perder na maioria do tempo. A
+    salvaguarda que resta: só reconstrói de verdade quando o CONJUNTO de
+    posições rastreadas muda de verdade (posição nova, fechou, virou par)
+    — comparado via `_ids_rastreados` contra o último render. Enquanto
+    nada muda, um tick do interval não toca a árvore de componentes."""
+    ctx = callback_context
+    disparado_por_interval = bool(ctx.triggered) and ctx.triggered[0]['prop_id'] == 'interval-em-andamento.n_intervals'
     if sub_aba_ativa != 'posicao':
+        return no_update, no_update
+
+    posicoes = dt.listar_posicoes_abertas()
+    _, por_ativo_abertas, por_ativo_prontas = _preparar_registros_posicao(posicoes)
+    ativo = ativo_selecionado or 'WIN'
+    ids_agora = _ids_rastreados(_registros_por_ativo(por_ativo_prontas, ativo),
+                                 _registros_por_ativo(por_ativo_abertas, ativo))
+    if disparado_por_interval and ids_agora == (ids_conhecidos or []):
+        return no_update, no_update
+    return _renderizar_posicao_completa(posicoes, dt.listar_ordens_pendentes(), ativo), ids_agora
+
+
+@app.callback(
+    Output('store-posicao-ativo-subaba', 'data'),
+    Input('btn-posicao-ativo-WIN', 'n_clicks'),
+    Input('btn-posicao-ativo-WDO', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def selecionar_subaba_posicao(n_win, n_wdo):
+    ctx = callback_context
+    if not ctx.triggered:
         return no_update
-    return _renderizar_em_andamento(dt.listar_posicoes_abertas(), dt.listar_ordens_pendentes())
+    id_disparado = ctx.triggered[0]['prop_id'].split('.')[0]
+    return 'WIN' if id_disparado == 'btn-posicao-ativo-WIN' else 'WDO'
+
+
+@app.callback(
+    Output('btn-posicao-ativo-WIN', 'style'),
+    Output('btn-posicao-ativo-WDO', 'style'),
+    Input('store-posicao-ativo-subaba', 'data'),
+)
+def atualizar_estilo_subaba_posicao(ativo_ativo):
+    return _estilo_subaba_diario('WIN', ativo_ativo), _estilo_subaba_diario('WDO', ativo_ativo)
+
+
+
+@app.callback(
+    Output({'type': 'ea-nota', 'index': dash.MATCH}, 'value'),
+    Output({'type': 'ea-status', 'index': dash.MATCH}, 'children', allow_duplicate=True),
+    Input({'type': 'ea-nota', 'index': dash.MATCH}, 'n_blur'),
+    State({'type': 'ea-nota', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-nota', 'index': dash.MATCH}, 'id'),
+    prevent_initial_call=True,
+)
+def salvar_nota_em_andamento(_n_blur, nota, id_componente):
+    """Salva a nota (append no log cronológico) sozinha ao sair do campo
+    (`n_blur`) e limpa a caixa depois — sem botão "Salvar" (feedback
+    2026-07-20). Limpar após salvar evita reenviar a MESMA nota de novo se
+    o usuário só clicar pra fora e voltar sem editar (o campo é sempre
+    "escreva uma NOVA anotação", nunca um texto persistente editável)."""
+    if not nota or not nota.strip():
+        return no_update, no_update
+    ok = dt.atualizar_rascunho(_ticket_alvo(id_componente['index']), nota_texto=nota)
+    if not ok:
+        return no_update, '⚠ Ocupado — tente salvar a nota de novo.'
+    return '', '✔ Nota salva.'
 
 
 @app.callback(
     Output({'type': 'ea-status', 'index': dash.MATCH}, 'children'),
-    Input({'type': 'ea-btn-salvar', 'index': dash.MATCH}, 'n_clicks'),
-    State({'type': 'ea-nota', 'index': dash.MATCH}, 'value'),
-    State({'type': 'ea-estrategia', 'index': dash.MATCH}, 'value'),
-    State({'type': 'ea-sala', 'index': dash.MATCH}, 'value'),
-    State({'type': 'ea-alvo', 'index': dash.MATCH}, 'value'),
-    State({'type': 'ea-stop', 'index': dash.MATCH}, 'value'),
-    State({'type': 'ea-btn-salvar', 'index': dash.MATCH}, 'id'),
+    Input({'type': 'ea-estrategia', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-sala', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-alvo', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-stop', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-nivel-sr', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-resumo', 'index': dash.MATCH}, 'n_blur'),
+    Input({'type': 'ea-emo-confianca', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-emo-humor', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-emo-energia', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-emo-atencao', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-emo-presenca', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-sentimento-mercado', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-resumo', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'options'),
+    State({'type': 'ea-estrategia', 'index': dash.MATCH}, 'id'),
     prevent_initial_call=True,
 )
-def salvar_em_andamento(n_clicks, nota, estrategia, sala, alvo, stop, id_componente):
-    """Salva nota nova (sempre um append no log cronológico) + campos de
-    classificação preliminar — funciona com a posição aberta ou já fechada/
-    pendente, exatamente pra cobrir a análise que o Jesué faz durante E
-    depois do trade (ver `diario_trade.atualizar_rascunho`)."""
+def auto_salvar_campos_em_andamento(estrategia, sala, alvo, stop, nivel_sr, _resumo_blur,
+                                     emo_confianca, emo_humor, emo_energia, emo_atencao, emo_presenca,
+                                     tags_emocionais, sentimento_mercado,
+                                     resumo, opcoes_tags_emocionais, id_componente):
+    """Substitui o antigo botão "Salvar" (feedback 2026-07-20: "qualquer
+    sistema consegue salvar tudo imediatamente ao inserir as informações")
+    — cada campo de classificação grava sozinho assim que muda (Alvo/Stop/
+    Nível S/R têm `debounce=True`, disparam só ao sair do campo/Enter;
+    Resumo — `dcc.Textarea` não tem `debounce` — usa `n_blur`; dropdowns/
+    estrelas/slider são seleções discretas, já disparam só 1x por escolha).
+
+    Achado real (2026-07-20): um trade fechado (par hedge) virou "Pronta
+    pra Finalizar" com Estratégia/Resumo/Estrelas todos em branco — o
+    usuário tinha preenchido tudo isso enquanto a posição ainda estava
+    `aberta`, mas sem nenhum auto-save o dado nunca chegou a ser gravado;
+    quando a posição fechou e o card foi reconstruído do disco, não havia
+    nada lá pra mostrar. Não é bug de "amarração" entre ordens (ticket_a/
+    ticket_b de `detectar_pares_hedge`/`montar_posicao_sintetica_par`
+    concordam de forma independente sobre qual perna é a entrada, e
+    `sincronizar_posicoes_abertas` só faz `.update()` nos campos vindos do
+    MT5 — nunca toca `*_preliminar`/notas/imagens) — era ausência total de
+    auto-save."""
+    alvo, stop, nivel_sr = _num(alvo), _num(stop), _num(nivel_sr)
     campos = {}
     if estrategia is not None:
         campos['estrategia_tags'] = estrategia
@@ -1210,83 +3272,341 @@ def salvar_em_andamento(n_clicks, nota, estrategia, sala, alvo, stop, id_compone
         campos['alvo_pontos'] = alvo
     if stop is not None:
         campos['stop_pontos'] = stop
-    ok = dt.atualizar_rascunho(id_componente['index'], nota_texto=nota or None, campos=campos or None)
-    return '✔ Salvo.' if ok else '⚠ Ocupado — tente de novo.'
+    if nivel_sr is not None:
+        campos['nivel_sr_referencia'] = nivel_sr
+    if resumo is not None:
+        campos['resumo_operacional'] = resumo
+    if emo_confianca is not None:
+        campos['emo_confianca'] = emo_confianca
+    if emo_humor is not None:
+        campos['emo_humor'] = emo_humor
+    if emo_energia is not None:
+        campos['emo_energia'] = emo_energia
+    if emo_atencao is not None:
+        campos['emo_atencao'] = emo_atencao
+    if emo_presenca is not None:
+        campos['emo_presenca'] = emo_presenca
+    if tags_emocionais is not None:
+        campos['tags_emocionais'] = tags_emocionais
+    if sentimento_mercado is not None:
+        campos['sentimento_mercado'] = sentimento_mercado
+    if not campos:
+        return no_update
+
+    # Tag digitada na hora (ver `criar_tag_emocional_digitada_match`) só
+    # existe como chip temporário no dropdown — vira sugestão permanente
+    # de verdade (cadastro em `tags_emocionais.parquet`) só agora, quando a
+    # posição é efetivamente salva, não a cada tecla digitada.
+    if tags_emocionais:
+        slugs_cadastrados = set(dt.listar_tags_emocionais()['slug'])
+        rotulos = {o['value']: o['label'] for o in (opcoes_tags_emocionais or [])}
+        for slug in tags_emocionais:
+            if slug not in slugs_cadastrados:
+                dt.criar_tag_emocional(rotulos.get(slug, slug))
+
+    ok = dt.atualizar_rascunho(_ticket_alvo(id_componente['index']), campos=campos)
+    return '✔ Salvo automaticamente.' if ok else '⚠ Ocupado — tente de novo.'
 
 
 @app.callback(
-    Output('em-andamento-preview-imagem', 'children'),
-    Input('em-andamento-upload-imagem', 'contents'),
-    Input('store-diario-imagem-colada', 'data'),
+    Output({'type': 'ea-sentimento-label', 'index': dash.MATCH}, 'children'),
+    Output({'type': 'ea-sentimento-label', 'index': dash.MATCH}, 'style'),
+    Input({'type': 'ea-sentimento-mercado', 'index': dash.MATCH}, 'value'),
+)
+def atualizar_label_sentimento_posicao(valor):
+    resultado = dt.classificar_sentimento_mercado(valor)
+    if resultado is None:
+        return '—', {'fontSize': '12px', 'color': C['text2']}
+    nome, cor_chave = resultado
+    return nome, {'fontSize': '12px', 'fontWeight': '700', 'color': C.get(cor_chave, C['text'])}
+
+
+@app.callback(
+    Output({'type': 'ea-alvo', 'index': dash.MATCH}, 'value'),
+    Output({'type': 'ea-stop', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-rr-preset', 'index': dash.MATCH}, 'value'),
     prevent_initial_call=True,
 )
-def preview_imagem_em_andamento(upload_contents, imagem_colada):
+def aplicar_rr_preset_posicao(rr_valor):
+    preset = dt.obter_rr_preset(rr_valor)
+    if preset is None:
+        return no_update, no_update
+    return preset['alvo_pontos'], preset['stop_pontos']
+
+
+@app.callback(
+    Output({'type': 'ea-rr-preset', 'index': dash.MATCH}, 'value', allow_duplicate=True),
+    Input({'type': 'ea-alvo', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-stop', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-rr-preset', 'index': dash.MATCH}, 'value'),
+    prevent_initial_call=True,
+)
+def resetar_rr_posicao_se_editado(alvo, stop, rr_atual):
+    if not rr_atual:
+        return no_update
+    preset = dt.obter_rr_preset(rr_atual)
+    if preset is None:
+        return no_update
+    if _num(alvo) == preset['alvo_pontos'] and _num(stop) == preset['stop_pontos']:
+        return no_update
+    return None
+
+
+@app.callback(
+    Output({'type': 'ea-rr-calculado', 'index': dash.MATCH}, 'children'),
+    Input({'type': 'ea-alvo', 'index': dash.MATCH}, 'value'),
+    Input({'type': 'ea-stop', 'index': dash.MATCH}, 'value'),
+)
+def calcular_rr_em_andamento(alvo, stop):
+    """R:R calculado sozinho a partir de Alvo/Stop (feedback 2026-07-20) —
+    complementa o dropdown de presets acima (que faz o inverso: escolhe um
+    R:R salvo e PREENCHE Alvo/Stop)."""
+    alvo_num, stop_num = _num(alvo), _num(stop)
+    if not alvo_num or not stop_num:
+        return '—'
+    return f'{alvo_num / stop_num:.2f} : 1'
+
+
+@app.callback(
+    Output({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'value'),
+    Output({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'options'),
+    Output({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'search_value'),
+    Input({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'search_value'),
+    State({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'options'),
+    prevent_initial_call=True,
+)
+def criar_tag_emocional_digitada_match(search_value, valor_atual, opcoes_atuais):
+    """Feedback 2026-07-20: "eu digito as tags preocupação;sono;... e ao
+    colocar vírgula ou ponto e vírgula, o texto vira tag". `dcc.Dropdown`
+    não tem um modo "criar opção nova" nativo — só aceita valores já
+    presentes em `options` — então cada tecla digitada chega aqui via
+    `search_value`, e só agimos quando o ÚLTIMO caractere é um separador
+    (as demais teclas são `no_update`, baratas). O chip novo entra em
+    `value`+`options` na hora (efeito visual imediato); o cadastro
+    DEFINITIVO da tag (pra virar sugestão nos próximos trades) só acontece
+    ao salvar de verdade, ver `auto_salvar_campos_em_andamento`."""
+    if not search_value or search_value[-1] not in (',', ';'):
+        return no_update, no_update, no_update
+    nome = search_value[:-1].strip()
+    if not nome:
+        return no_update, no_update, ''
+    slug = _slugificar_tag(nome)
+    valor_atual = list(valor_atual or [])
+    opcoes_atuais = list(opcoes_atuais or [])
+    if slug not in valor_atual:
+        valor_atual.append(slug)
+    if not any(o['value'] == slug for o in opcoes_atuais):
+        opcoes_atuais.append({'label': nome, 'value': slug})
+    return valor_atual, opcoes_atuais, ''
+
+
+@app.callback(
+    Output({'type': 'ea-preview-imagem', 'index': dash.MATCH}, 'children'),
+    Output({'type': 'ea-status', 'index': dash.MATCH}, 'children', allow_duplicate=True),
+    Input({'type': 'ea-upload-imagem', 'index': dash.MATCH}, 'contents'),
+    Input('store-diario-imagem-colada', 'data'),
+    State('store-diario-posicao-ativa-print', 'data'),
+    State({'type': 'ea-upload-imagem', 'index': dash.MATCH}, 'id'),
+    prevent_initial_call=True,
+)
+def preview_e_anexar_imagem_em_andamento(upload_contents, imagem_colada, posicao_ativa, id_componente):
+    """Mostra a preview E anexa à galeria na hora, sem clique em "Anexar"
+    nenhum (feedback 2026-07-20: "não faz sentido eu adicionar a imagem, e
+    depois clicar no botão para adicionar no registro")."""
     ctx = callback_context
     if not ctx.triggered:
-        return no_update
+        return no_update, no_update
     origem = ctx.triggered[0]['prop_id'].split('.')[0]
-    data_url = upload_contents if origem == 'em-andamento-upload-imagem' else imagem_colada
+    if origem == 'store-diario-imagem-colada':
+        if posicao_ativa != id_componente['index']:
+            return no_update, no_update  # Ctrl+V é global — só reage no card armado
+        data_url = imagem_colada
+    else:
+        data_url = upload_contents
     if not data_url:
-        return no_update
-    return html.Img(src=data_url, style={'maxWidth': '200px', 'borderRadius': '6px',
-                                          'border': f'1px solid {C["border"]}'})
+        return no_update, no_update
 
-
-@app.callback(
-    Output('em-andamento-anexar-status', 'children'),
-    Input('btn-em-andamento-anexar', 'n_clicks'),
-    State('em-andamento-select-posicao', 'value'),
-    State('em-andamento-upload-imagem', 'contents'),
-    State('store-diario-imagem-colada', 'data'),
-    prevent_initial_call=True,
-)
-def anexar_imagem_em_andamento(n_clicks, id_posicao, upload_contents, imagem_colada):
-    if not id_posicao:
-        return '⚠ Selecione a posição antes de anexar.'
-    data_url = upload_contents or imagem_colada
-    if not data_url:
-        return '⚠ Cole (Ctrl+V) ou envie uma imagem antes.'
+    preview = html.Img(src=data_url, style={'maxWidth': '200px', 'borderRadius': '6px',
+                                             'border': f'1px solid {C["border"]}'})
     try:
         imagem_bytes = base64.b64decode(data_url.split(',', 1)[1])
     except Exception:
-        return '⚠ Imagem inválida.'
-    ok = dt.atualizar_rascunho(id_posicao, imagem_bytes=imagem_bytes)
-    return '✔ Imagem anexada à galeria.' if ok else '⚠ Ocupado — tente de novo.'
+        return preview, '⚠ Imagem inválida — não foi possível anexar.'
+    # Par de hedge (ver _ticket_alvo): a galeria/imagem vive na perna de
+    # ENTRADA, mesma decisão de onde as notas/tags preliminares ficam.
+    ok = dt.atualizar_rascunho(_ticket_alvo(id_componente['index']), imagem_bytes=imagem_bytes)
+    return preview, ('✔ Print anexado automaticamente.' if ok else '⚠ Ocupado — tente colar/enviar de novo.')
 
 
 @app.callback(
     Output({'type': 'ea-status', 'index': dash.MATCH}, 'children', allow_duplicate=True),
+    Output('em-andamento-conteudo', 'children', allow_duplicate=True),
+    Output('store-em-andamento-ids-conhecidos', 'data', allow_duplicate=True),
     Input({'type': 'ea-btn-finalizar', 'index': dash.MATCH}, 'n_clicks'),
+    State({'type': 'ea-nota', 'index': dash.MATCH}, 'value'),
     State({'type': 'ea-estrategia', 'index': dash.MATCH}, 'value'),
     State({'type': 'ea-sala', 'index': dash.MATCH}, 'value'),
-    State({'type': 'ea-tipo-saida', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-alvo', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-stop', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-nivel-sr', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-resumo', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-emo-confianca', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-emo-humor', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-emo-energia', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-emo-atencao', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-emo-presenca', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-tags-emocionais', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-sentimento-mercado', 'index': dash.MATCH}, 'value'),
     State({'type': 'ea-tags-erro', 'index': dash.MATCH}, 'value'),
-    State({'type': 'ea-imagem-principal', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-imagem-principal', 'index': dash.MATCH}, 'data'),
+    State({'type': 'ea-upload-imagem', 'index': dash.MATCH}, 'contents'),
+    State('store-diario-imagem-colada', 'data'),
+    State('store-diario-posicao-ativa-print', 'data'),
+    State({'type': 'ea-preco-saida-correcao', 'index': dash.MATCH}, 'value'),
+    State({'type': 'ea-datahora-saida-correcao', 'index': dash.MATCH}, 'value'),
+    State('store-posicao-ativo-subaba', 'data'),
     State({'type': 'ea-btn-finalizar', 'index': dash.MATCH}, 'id'),
     prevent_initial_call=True,
 )
-def finalizar_em_andamento(n_clicks, estrategia, sala, tipo_saida, tags_erro, imagem_principal, id_componente):
-    """Encerra o rascunho e grava o trade definitivo — chama
-    `diario_trade.finalizar_posicao`, que por sua vez chama o
-    `registrar_trade` já existente sem alterá-lo. A lista some da tela no
-    próximo refresh do `interval-em-andamento` (até 6s) ou ao trocar de aba."""
+def finalizar_em_andamento(n_clicks, nota, estrategia, sala, alvo, stop, nivel_sr, resumo,
+                            emo_confianca, emo_humor, emo_energia, emo_atencao, emo_presenca,
+                            tags_emocionais, sentimento_mercado, tags_erro, imagem_principal,
+                            upload_contents, imagem_colada, posicao_ativa,
+                            preco_saida_correcao, datahora_saida_correcao, ativo_selecionado, id_componente):
+    """Encerra o rascunho e grava o trade definitivo. Pra um ticket avulso,
+    chama `diario_trade.finalizar_posicao`; pra um PAR de hedge (ver
+    `_parse_index_par` — `index` composto "ticket_a-ticket_b", achado real
+    2026-07-15: SL/TP via OCO gera posição oposta nova em vez de fechar a
+    original), chama `diario_trade.finalizar_par_hedge`, que grava 1 único
+    trade líquido em vez de 2 linhas quebradas. `tipo_saida` NÃO entra mais
+    aqui — derivado sozinho a partir do MT5.
+
+    Feedback 2026-07-17: "se eu já preenchi as informações do trade e
+    salvei em Posições, não faz sentido aparecer pendência/confirmação no
+    histórico" — o card "pronto pra finalizar" voltou a morar na aba
+    Posição (ver `_renderizar_posicao_completa`), então quando finaliza com
+    sucesso este MESMO callback já re-renderiza `em-andamento-conteudo` na
+    hora (2º Output, `allow_duplicate=True` — também atualiza o 3º Output,
+    `store-em-andamento-ids-conhecidos`, pra o próximo tick do interval não
+    achar que "nada mudou" e pular um refresh que na verdade já aconteceu
+    aqui), sem esperar o próximo tick do `interval-em-andamento` de 6s nem
+    uma troca de aba manual.
+
+    Feedback 2026-07-17 (mais cedo): "não há necessidade de tantos
+    botões... o salvamento tem que ser automático, apenas um botão". Antes,
+    resumo/estrelas/tags/nota/print só entravam no trade se o usuário
+    clicasse "Salvar" e "Anexar à galeria" ANTES de "Finalizar" — esse
+    clique já tinha sumido da tela (ver `_bloco_posicao_form`), mas o antigo
+    `finalizar_em_andamento` só lia o que já estava gravado em disco, então
+    qualquer edição feita neste último passo sem ter clicado nos botões
+    extras era silenciosamente perdida. Agora este único clique chama
+    `atualizar_rascunho` primeiro (mesma função que os botões antigos
+    chamavam, auto-salvando nota/classificação/print) e só then finaliza —
+    nada se perde."""
+    id_pos = id_componente['index']
+    par = _parse_index_par(id_pos)
+    ticket_alvo = _ticket_alvo(id_pos)
+
+    alvo, stop, nivel_sr = _num(alvo), _num(stop), _num(nivel_sr)
+    campos_rascunho = {}
+    if estrategia is not None:
+        campos_rascunho['estrategia_tags'] = estrategia
+    if sala is not None:
+        campos_rascunho['sala_analise'] = sala
+    if alvo is not None:
+        campos_rascunho['alvo_pontos'] = alvo
+    if stop is not None:
+        campos_rascunho['stop_pontos'] = stop
+    if nivel_sr is not None:
+        campos_rascunho['nivel_sr_referencia'] = nivel_sr
+    if resumo is not None:
+        campos_rascunho['resumo_operacional'] = resumo
+    if emo_confianca is not None:
+        campos_rascunho['emo_confianca'] = emo_confianca
+    if emo_humor is not None:
+        campos_rascunho['emo_humor'] = emo_humor
+    if emo_energia is not None:
+        campos_rascunho['emo_energia'] = emo_energia
+    if emo_atencao is not None:
+        campos_rascunho['emo_atencao'] = emo_atencao
+    if emo_presenca is not None:
+        campos_rascunho['emo_presenca'] = emo_presenca
+    if tags_emocionais is not None:
+        campos_rascunho['tags_emocionais'] = tags_emocionais
+    if sentimento_mercado is not None:
+        campos_rascunho['sentimento_mercado'] = sentimento_mercado
+
+    data_url = upload_contents or (imagem_colada if posicao_ativa == id_pos else None)
+    imagem_bytes = None
+    if data_url:
+        try:
+            imagem_bytes = base64.b64decode(data_url.split(',', 1)[1])
+        except Exception:
+            imagem_bytes = None
+
+    if nota or campos_rascunho or imagem_bytes is not None:
+        if not dt.atualizar_rascunho(ticket_alvo, nota_texto=nota or None,
+                                      campos=campos_rascunho or None, imagem_bytes=imagem_bytes):
+            return '⚠ Ocupado — tente de novo (nada foi perdido).', no_update, no_update
+
+    # Sem seleção manual de "Imagem principal", a última imagem da galeria
+    # vira a capa automaticamente — cobre tanto o print colado NESTE clique
+    # quanto um já anexado antes, enquanto a posição ainda estava aberta
+    # (achado real 2026-07-20: um print anexado durante o trade caía em
+    # `imagens_adicionais` em vez de virar a capa, por só considerar o
+    # anexado NA HORA do finalizar).
+    if imagem_principal is None:
+        df_atual = dt.listar_posicoes_abertas()
+        linha_atual = df_atual[df_atual['id_posicao'] == ticket_alvo]
+        if not linha_atual.empty:
+            imagens_atuais = _lista_segura(linha_atual.iloc[0].get('imagens_em_andamento'))
+            if imagens_atuais:
+                imagem_principal = imagens_atuais[-1]
+
     # Só entra no dict quem tem valor de verdade — se o usuário não mexeu
-    # num campo (None), o default `*_preliminar` já escrito durante a
-    # operação (aplicado dentro de `finalizar_posicao`) não é sobrescrito
-    # por engano com uma lista/valor vazio.
+    # num campo (None), o default `*_preliminar` já escrito acima (ou
+    # durante a operação) não é sobrescrito por engano com uma lista/valor
+    # vazio.
     campos_classificacao = {'conta': 'real'}
     if estrategia is not None:
         campos_classificacao['estrategia_tags'] = estrategia
     if sala is not None:
         campos_classificacao['sala_analise'] = sala
-    if tipo_saida is not None:
-        campos_classificacao['tipo_saida'] = tipo_saida
     if tags_erro is not None:
         campos_classificacao['tags_setup_erro'] = tags_erro
-    id_trade = dt.finalizar_posicao(id_componente['index'], campos_classificacao, imagem_principal=imagem_principal)
+
+    if par:
+        # Par de hedge: a saída já é o preço REAL da perna oposta (não uma
+        # estimativa) — não há o que corrigir, `corrigir_saida_rascunho`
+        # nem se aplica (não existe uma linha só com esse índice composto).
+        ticket_a, ticket_b = par
+        id_trade = dt.finalizar_par_hedge(ticket_a, ticket_b, campos_classificacao, imagem_principal=imagem_principal)
+    else:
+        # Grava a correção de saída (se houver) ANTES de finalizar — ver
+        # diario_app_98.py::finalizar_em_andamento_98 pro mesmo raciocínio
+        # (nunca deixar `finalizar_posicao` gravar o valor fabricado do
+        # fallback de `sincronizar_posicoes_abertas` sem essa confirmação).
+        preco_corrigido = _num(preco_saida_correcao)
+        if preco_corrigido is not None:
+            datahora_corrigida = pd.to_datetime(datahora_saida_correcao, errors='coerce') if datahora_saida_correcao else None
+            if datahora_corrigida is None or pd.isna(datahora_corrigida):
+                return '⚠ Data/Hora de Saída inválida — use o formato AAAA-MM-DD HH:MM.', no_update, no_update
+            if not dt.corrigir_saida_rascunho(id_pos, preco_corrigido, datahora_corrigida):
+                return '⚠ Ocupado — tente de novo.', no_update, no_update
+        id_trade = dt.finalizar_posicao(id_pos, campos_classificacao, imagem_principal=imagem_principal)
+
     if id_trade is None:
-        return '⚠ Não foi possível finalizar agora — tente novamente.'
-    return f'✔ Finalizado como operação #{id_trade} no Diário.'
+        return '⚠ Não foi possível finalizar agora — tente novamente.', no_update, no_update
+
+    posicoes_atuais = dt.listar_posicoes_abertas()
+    ativo_atual = ativo_selecionado or 'WIN'
+    _, por_ativo_abertas, por_ativo_prontas = _preparar_registros_posicao(posicoes_atuais)
+    ids_agora = _ids_rastreados(_registros_por_ativo(por_ativo_prontas, ativo_atual),
+                                 _registros_por_ativo(por_ativo_abertas, ativo_atual))
+    return (f'✔ Finalizado como operação #{id_trade} no Diário.',
+            _renderizar_posicao_completa(posicoes_atuais, dt.listar_ordens_pendentes(), ativo_atual),
+            ids_agora)
 
 
 if __name__ == '__main__':

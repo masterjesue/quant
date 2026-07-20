@@ -118,11 +118,19 @@ def extrair_metricas(df: pd.DataFrame, n_snapshot: int = 500) -> dict:
     # curta — nunca lança KeyError.
     def _extrair_niveis(lado: str) -> list:
         niveis = []
+        rank_idx_arr = df.attrs.get(f'_rank_idx_{lado}')  # usa o df PARÂMETRO
+        # (histórico completo), não o `snap` truncado em .tail(n_snapshot) —
+        # preservação de .attrs através de fatiamento/copy não deve ser
+        # assumida (pandas trata isso como "experimental").
         for rank in range(1, cfg.N_NIVEIS_SR + 1):
             pref = f'sr_{lado}_{rank}'
             preco = ultimo.get(pref, np.nan)
             if pref not in snap.columns or (isinstance(preco, float) and np.isnan(preco)):
                 continue
+            cluster_id = None
+            if rank_idx_arr is not None and len(rank_idx_arr):
+                k = int(rank_idx_arr[-1, rank - 1])
+                cluster_id = k if k != -1 else None
             niveis.append({
                 'rank': rank,
                 'preco': preco,
@@ -141,6 +149,23 @@ def extrair_metricas(df: pd.DataFrame, n_snapshot: int = 500) -> dict:
                 'zona_espelho_id': ultimo.get(f'{pref}_zona_espelho_id', np.nan),
                 'prob_bounce': ultimo.get(f'{pref}_prob_bounce', np.nan),
                 'rompimento_hoje': str(ultimo.get(f'{pref}_rompimento_hoje', 'nenhum')),
+                'cluster_id': cluster_id,
+                'bipolar': _info_bipolar(df, cluster_id),
+                'regime': montar_regime(_detalhes_toques_cluster(df, cluster_id),
+                                         _fronteira_regime_cluster(df, cluster_id)),
+                # Blocos de força (2026-07-13, ver
+                # especificacao_forca_zonas_price_action.md) — já calculados
+                # por features.calcular_prob_niveis_sr, só expostos aqui.
+                # Mesma nomenclatura de analisar_linha_generica (Traçados/
+                # MME21), pra os cards reaproveitarem o mesmo código de render.
+                'combustivel_score': ultimo.get(f'{pref}_combustivel_score', np.nan),
+                'aproximacao_score': ultimo.get(f'{pref}_aproximacao_score', np.nan),
+                'rejeicao_score': ultimo.get(f'{pref}_rejeicao_score', np.nan),
+                'acao': {
+                    'postura': ultimo.get(f'{pref}_postura'),
+                    'magnitude_esperada': ultimo.get(f'{pref}_magnitude_esperada'),
+                    'invalidacao': ultimo.get(f'{pref}_invalidacao', np.nan),
+                },
             })
         return niveis
 
@@ -172,6 +197,16 @@ def extrair_metricas(df: pd.DataFrame, n_snapshot: int = 500) -> dict:
 
     m['pivo_imediato_acima']  = _extrair_pivo_imediato('acima')
     m['pivo_imediato_abaixo'] = _extrair_pivo_imediato('abaixo')
+
+    # Pivô em formação (tático, features.py::detectar_pivo_em_formacao) — o
+    # candidato a topo/fundo mais recente que AINDA não teve chance de
+    # confirmar (menos que N_CONFIRM_PIVOS candles depois dele). Responde
+    # "esse preço (ex.: mínima do dia) já é um fundo validado, ou ainda está
+    # esperando confirmação?" — pergunta distinta de pivo_imediato (que só
+    # mostra pivôs JÁ confirmados).
+    _pivo_formacao = features.detectar_pivo_em_formacao(df)
+    m['pivo_em_formacao_acima']  = _pivo_formacao.get('topo')
+    m['pivo_em_formacao_abaixo'] = _pivo_formacao.get('fundo')
 
     # Build-up
     m['buildup_ativo']   = _safe_bool(ultimo.get('buildup_ativo', False))
@@ -364,6 +399,238 @@ def mme21_ponto_live(df: pd.DataFrame, preco_live: float = None) -> dict | None:
     return {'time': int(pd.Timestamp(ultimo_dt).timestamp()), 'value': valor}
 
 
+def _unwrap(valor):
+    """Desembrulha um `features._SemDeepcopy` (estrutura grande de detalhe
+    por toque, protegida do deepcopy que `pandas.NDFrame.__finalize__`
+    dispara em quase toda operação — ver a classe em features.py). Passa
+    através qualquer outro valor sem mudança."""
+    return valor.valor if hasattr(valor, 'valor') else valor
+
+
+def _info_bipolar(df: pd.DataFrame, cluster_id) -> dict | None:
+    """
+    Reconstrói a história de bipolaridade (rompimento válido → reteste
+    confirmado → zona espelho com papel invertido) de um cluster do motor
+    automático, sem re-rodar clustering — só lê o que
+    `features.calcular_zonas_sr` já expôs via `df.attrs`
+    (`_clusters_sr`/`_zonas_espelho`/`_zona_espelho_id_por_cluster`).
+    Funciona tanto pra um cluster ORIGEM (que já rompeu e gerou um espelho)
+    quanto pro próprio cluster ESPELHO (que sabe de onde veio). Retorna
+    `None` se não houver dado disponível (schema antigo, cluster sem
+    reversão, ou `cluster_id` ausente).
+    """
+    if cluster_id is None:
+        return None
+    try:
+        cluster_id = int(cluster_id)
+    except (TypeError, ValueError):
+        return None
+    if cluster_id < 0:
+        return None
+
+    clusters = df.attrs.get('_clusters_sr')
+    zonas_espelho = _unwrap(df.attrs.get('_zonas_espelho'))
+    zona_espelho_id_por_cluster = df.attrs.get('_zona_espelho_id_por_cluster')
+    if clusters is None or zonas_espelho is None or zona_espelho_id_por_cluster is None:
+        return None
+
+    n_clusters = len(clusters.get('centros', []))
+    dts = df['datetime'].values
+
+    def _fmt(z, papel, zona_origem_id, zona_espelho_id_val):
+        return {
+            'papel_no_cruzamento': papel,
+            'zona_origem_id': int(zona_origem_id),
+            'zona_espelho_id': int(zona_espelho_id_val),
+            'idx_rompimento': int(z['idx_rompimento']),
+            'timestamp_rompimento': pd.Timestamp(dts[int(z['idx_rompimento'])]).isoformat(),
+            'idx_reteste': int(z['idx_criacao']),
+            'timestamp_reteste': pd.Timestamp(dts[int(z['idx_criacao'])]).isoformat(),
+            'forca_herdada': float(z['forca_herdada']),
+        }
+
+    if cluster_id >= n_clusters:
+        idx_novo = cluster_id - n_clusters
+        if idx_novo < 0 or idx_novo >= len(zonas_espelho):
+            return None
+        z = zonas_espelho[idx_novo]
+        return _fmt(z, 'espelho', z['origem_k'], cluster_id)
+
+    if cluster_id >= len(zona_espelho_id_por_cluster):
+        return None
+    espelho_id = zona_espelho_id_por_cluster[cluster_id]
+    if espelho_id is None or int(espelho_id) == -1:
+        return None
+    idx_novo = int(espelho_id) - n_clusters
+    if idx_novo < 0 or idx_novo >= len(zonas_espelho):
+        return None
+    z = zonas_espelho[idx_novo]
+    return _fmt(z, 'origem', cluster_id, espelho_id)
+
+
+def _detalhes_toques_cluster(df: pd.DataFrame, cluster_id) -> list:
+    """Detalhe por toque (data/hora, tipo de pivô, rejeição/agressão/
+    impulso/peso) de um cluster do motor automático — clusters originais
+    via `_clusters_sr['detalhe_toques_zona']`, espelhos via
+    `_zonas_espelho[...]['detalhe_toques']`. Lista vazia se não houver
+    dado (schema antigo ou cluster_id ausente)."""
+    if cluster_id is None:
+        return []
+    cluster_id = int(cluster_id)
+    clusters = df.attrs.get('_clusters_sr')
+    if clusters is None:
+        return []
+    n_clusters = len(clusters.get('centros', []))
+    if cluster_id < n_clusters:
+        detalhe_por_cluster = _unwrap(clusters.get('detalhe_toques_zona'))
+        if detalhe_por_cluster is None or cluster_id >= len(detalhe_por_cluster):
+            return []
+        return detalhe_por_cluster[cluster_id]
+    zonas_espelho = _unwrap(df.attrs.get('_zonas_espelho'))
+    if zonas_espelho is None:
+        return []
+    idx_novo = cluster_id - n_clusters
+    if idx_novo < 0 or idx_novo >= len(zonas_espelho):
+        return []
+    return zonas_espelho[idx_novo].get('detalhe_toques', [])
+
+
+def _fronteira_regime_cluster(df: pd.DataFrame, cluster_id) -> list:
+    """Monta um `eventos_regime` (mesmo shape de
+    `features.analisar_linha_generica`) de 1 evento a partir da última
+    transição registrada em `_zonas_sr_status_timeline[cluster_id]` — lista
+    vazia se o cluster nunca mudou de status (sempre 'ativa', regime
+    único)."""
+    if cluster_id is None:
+        return []
+    cluster_id = int(cluster_id)
+    status_timeline = df.attrs.get('_zonas_sr_status_timeline')
+    if not status_timeline or cluster_id >= len(status_timeline):
+        return []
+    tl = status_timeline[cluster_id]
+    if len(tl) < 2:
+        return []
+    idx_ultimo = int(tl[-1][0])
+    dts = df['datetime'].values
+    return [{'idx': idx_ultimo, 'timestamp': pd.Timestamp(dts[idx_ultimo]).isoformat()}]
+
+
+def localizar_zona_automatica(df: pd.DataFrame, preco: float, tolerancia_atr: float = None) -> dict | None:
+    """
+    Cruzamento traçado manual ↔ zona automática: verifica se `preco` cai
+    dentro (± folga) de alguma zona já catalogada por
+    `features.calcular_zonas_sr`, e devolve sua história de bipolaridade
+    (via `_info_bipolar`), se houver. `None` se nada coincidir — comum,
+    já que o clustering automático olha só ~23 dias
+    (`JANELA_CLUSTERING_CANDLES`), bem menos que o histórico completo que
+    os traçados enxergam (`janela=len(df)`).
+    """
+    clusters = df.attrs.get('_clusters_sr')
+    if clusters is None:
+        return None
+    centros = clusters.get('centros')
+    zona_min = clusters.get('zona_min')
+    zona_max = clusters.get('zona_max')
+    toques = clusters.get('toques')
+    if centros is None or len(centros) == 0:
+        return None
+
+    tol_mult = tolerancia_atr if tolerancia_atr is not None else cfg.TOLERANCIA_CRUZAMENTO_TRACADO_ATR
+    atr_med = float(np.nanmedian(df['atr'].values)) if 'atr' in df.columns else np.nan
+    folga = tol_mult * atr_med if not np.isnan(atr_med) else 0.0
+
+    candidatos = [k for k in range(len(centros))
+                  if (zona_min[k] - folga) <= preco <= (zona_max[k] + folga)]
+    if not candidatos:
+        return None
+    melhor_k = min(candidatos, key=lambda k: abs(preco - centros[k]))
+
+    status_timeline = df.attrs.get('_zonas_sr_status_timeline')
+    status_atual = 'ativa'
+    if status_timeline and melhor_k < len(status_timeline):
+        status_atual = status_timeline[melhor_k][-1][1]
+
+    return {
+        'cluster_id': int(melhor_k),
+        'zona_min': float(zona_min[melhor_k]),
+        'zona_max': float(zona_max[melhor_k]),
+        'toques': int(toques[melhor_k]),
+        'status': status_atual,
+        'bipolar': _info_bipolar(df, melhor_k),
+    }
+
+
+def montar_regime(detalhes_toques: list, eventos_regime: list = None,
+                   cruzamento_automatico: dict = None) -> dict:
+    """
+    Agrega `detalhes_toques` (shape de `features.analisar_linha_generica`
+    ou de `_detalhes_toques_cluster`) em blocos REGIME_ATUAL/REGIME_ANTIGO
+    — puramente numérico, a leitura em texto fica por conta de cada
+    dashboard (mesmo split de sempre entre fatos aqui e prosa lá).
+
+    A fronteira entre os regimes vem do último evento em `eventos_regime`
+    (shape `{'idx','timestamp',...}`, de `analisar_linha_generica` ou de
+    `_fronteira_regime_cluster`) — a MENOS que `cruzamento_automatico`
+    traga uma bipolaridade confirmada pelo motor automático (rompimento +
+    reteste reais, não só a flag simples de `violado`), que PREVALECE por
+    ser a história de verdade, não uma aproximação.
+
+    Cada bloco ganha `toques`, `toques_fortes` (só os com
+    `tipo_pivo=='forte'`) e `forte` — critério corrigido (2026-07-13):
+    exige toques dentro do PRÓPRIO bloco (nunca o histórico inteiro) E
+    pelo menos `TOQUES_FORTES_MINIMOS_TRACADO` toques com confirmação de 3
+    candles, não só toques fracos de 1 candle (achado real: sem isso,
+    qualquer nível dentro de uma consolidação longa vinha sempre "FORTE").
+    """
+    detalhes_toques = detalhes_toques or []
+    eventos_regime = eventos_regime or []
+
+    fronteira_idx = eventos_regime[-1]['idx'] if eventos_regime else None
+    fronteira_timestamp = eventos_regime[-1]['timestamp'] if eventos_regime else None
+
+    bip = cruzamento_automatico.get('bipolar') if cruzamento_automatico else None
+    if bip:
+        fronteira_idx = bip['idx_reteste']
+        fronteira_timestamp = bip['timestamp_reteste']
+
+    def _bloco(lista):
+        toques = len(lista)
+        toques_fortes = sum(1 for d in lista if d.get('tipo_pivo') == 'forte')
+        forte = (toques >= cfg.TOQUES_MINIMOS_TRACADO_MANUAL_FORTE and
+                 toques_fortes >= cfg.TOQUES_FORTES_MINIMOS_TRACADO)
+        pesos = [d['peso'] for d in lista if d.get('peso') is not None]
+        forca_toques = round(float(sum(pesos)), 2) if pesos else 0.0
+        rejeicoes = [d['rejeicao'] for d in lista if d.get('rejeicao') is not None]
+        rejeicao_media = (round(float(np.average(rejeicoes, weights=pesos)), 3)
+                           if pesos and rejeicoes else None)
+        detalhes_ordenados = sorted(lista, key=lambda d: d['idx'], reverse=True)
+        return {
+            'toques': toques,
+            'toques_fortes': toques_fortes,
+            'forte': bool(forte),
+            'forca_toques': forca_toques,
+            'rejeicao_media': rejeicao_media,
+            'detalhes': detalhes_ordenados[:cfg.MAX_TOQUES_TIMELINE_EXIBIDOS],
+        }
+
+    if fronteira_idx is None:
+        return {
+            'tem_divisao': False,
+            'fronteira_idx': None, 'fronteira_timestamp': None,
+            'regime_atual': _bloco(detalhes_toques), 'regime_antigo': None,
+        }
+
+    atuais = [d for d in detalhes_toques if d['idx'] >= fronteira_idx]
+    antigos = [d for d in detalhes_toques if d['idx'] < fronteira_idx]
+    return {
+        'tem_divisao': True,
+        'fronteira_idx': int(fronteira_idx),
+        'fronteira_timestamp': fronteira_timestamp,
+        'regime_atual': _bloco(atuais),
+        'regime_antigo': _bloco(antigos),
+    }
+
+
 def analisar_mme21(df: pd.DataFrame, tendencia: str = None) -> dict:
     """Leitura quantitativa da MME21 pra seção "Rastreador de Tendência" —
     mesma linguagem do Price Action (toques/força/probabilidade), via
@@ -389,3 +656,54 @@ def analisar_mme21(df: pd.DataFrame, tendencia: str = None) -> dict:
         if lateral else None
     )
     return analise
+
+
+def analisar_tracados(df: pd.DataFrame, tracados: pd.DataFrame) -> list:
+    """
+    Leitura quantitativa (toques/força/probabilidade) de cada traçado
+    manual do usuário — mesmo motor de `analisar_mme21`
+    (`features.analisar_linha_generica`), mas com a doutrina do S/R
+    ESTÁTICO, não a da MME21: `TOQUES_MINIMOS_TRACADO_MANUAL_FORTE` (=3,
+    igual ao S/R automático) em vez do limiar mais permissivo da MME21
+    (=1), e `janela=len(df)` (histórico INTEIRO disponível) em vez de uma
+    janela curta — um nível marcado à mão pelo Jesué é candidato a nível
+    ESTRUTURAL, mesma doutrina do motor automático (`calcular_zonas_sr`
+    também analisa o histórico inteiro, não uma janela fixa).
+
+    Só `tipo='horizontal'` é suportado por enquanto — outros tipos (ver
+    ROADMAP em tracados.py) são ignorados aqui, não fazem a UI quebrar, só
+    não aparecem na seção Estudos até serem implementados.
+
+    Retorna uma lista de dicts — cada um é o resultado de
+    `analisar_linha_generica` mesclado com `id_tracado`/`cor`, pra a UI
+    conseguir renderizar o card e linkar o botão de apagar de volta ao
+    traçado certo.
+    """
+    if df is None or df.empty or tracados is None or tracados.empty:
+        return []
+
+    resultados = []
+    for _, tracado in tracados.iterrows():
+        if tracado['tipo'] != 'horizontal':
+            continue  # 'trendline'/'canal'/'figura' — ver ROADMAP em tracados.py
+        preco = float(tracado['preco'])
+        linha = np.full(len(df), preco)
+
+        analise = features.analisar_linha_generica(
+            df, linha, janela=len(df),
+            toques_min_forte=cfg.TOQUES_MINIMOS_TRACADO_MANUAL_FORTE,
+        )
+        # Cruzamento com o motor automático (bipolaridade real, se o traçado
+        # coincidir com uma zona já rompida+retestada) + resumo por regime —
+        # ver montar_regime. O badge FORTE do card usa
+        # regime['regime_atual']['forte'], não mais o `forte` agregado
+        # acima (achado real 2026-07-13: níveis dentro de uma consolidação
+        # longa vinham sempre FORTE contando o histórico inteiro).
+        cruzamento = localizar_zona_automatica(df, preco)
+        analise['cruzamento_automatico'] = cruzamento
+        analise['regime'] = montar_regime(analise['detalhes_toques'], analise['eventos_regime'],
+                                           cruzamento_automatico=cruzamento)
+        analise['id_tracado'] = tracado['id_tracado']
+        analise['cor'] = tracado.get('cor')
+        resultados.append(analise)
+    return resultados

@@ -1,0 +1,27 @@
+- Hoje a nossa base de curto prazo é de 500 candles, vamos ajustar para 565 (cada pregão tem 113 candles no timeframe de 5 minutos).
+
+QUANT LAB:
+Crie uma seção "Rastreador de Tendência". A seção deve ter: Tendência Maior, 565 candles -5 dias - (remova o bloco Tendência do MARKET VIEW); Tendência Média, 226 candles - dois dias; Tendência Menor, 113 candles - um dia, Tendência Micro, 56 candles.
+Traga a MME21 para essa seção da mesma forma que já mostra + Tendência Atual (dos últimos 21 candles).
+
+PRICE ACTION:
+Essa seção ainda não está funcionando corretamente, acredito que só vamos conseguir análises confiáveis depois de testarmos, validarmos no dia-a-dia e fazer backtesting.
+Por isso decidi que vamos fazer a análise reversa. Ao invés do sistema me indicar os suportes e resistências, eu vou alimentar o sistema com os suportes e resistências que estou trabalhando, o quant lab deve entrar em modo de aprendizagem e receber as informações dos traçados e do diário para refinar o motor de inteligência do price action. Crie uma estrutura autodidata para o Super Quant. Na aba de configurações coloque um switch marcando se o motor do sistema está em modo aprendizagem ou modo padrão. Enquanto estiver em modo aprendizagem o Super Quant faz o cruzamento do meu operacional real com a lógica de análise do sistema, ajustes finos são feitos automaticamente, ajustes estruturais pedem confirmação.
+ 
+### Aqui eu preciso que analise qual é a melhor forma de fazermos isso, eu não sei qual é complexidade de criar um motor 100% autodidata. Então eu imagino que as mudanças e ajustes efetivas devam ser feitas aqui no laboratório de programação e o modo aprendizagem seja na verdade um sistema robusto de log, análise comparativa ou algo assim - Veja as possibilidades e o melhor caminho para chegar no resultado que eu quero ###
+
+Seja em modo aprendizagem ou modo de motor padrão, uma outra mudança estrutural é a seguinte: O sistema não deve mais sugerir as regiões de suporte e resistência, a análise agora será sempre a partir dos suportes e resistências inseridas no gráfico. Preserve todos os indicadores que construímos até aqui PRICE ACTION + ESTUDOS de TRAÇADOS - ao inserir uma linha de preço quero ver a análise mais completa possível (inclusive adicione um campo para inserir \ editar o preço da linha desenhada ou, para inserir a linha digitando o preço diretamente).
+Ou seja, TRAÇADOS E PRICE ACTION viram uma coisa só no mesmo lugar, no QUANT LAB.
+Então, remova o gráfico do PRICE ACTION e traga no lugar o gráfico editável dos TRAÇADOS. Preserve os indicadores, não quero o sistema mostre menos informações, estamos mudando apenas o ponto de partida da análise.
+
+Colque RASTREADOR DE TENDÊNCIA abaixo de MARKET VIEW.
+A Seção BIG PLAYERs não teve nenhuma relevância para mim até agora. Vamos desativar por enquanto. Resuma o BIG PLAYERS FOOTPRINTS em um indicador só com a indicação explicativa do que fazer com isso, e coloque na seção hero ao lado dos Correlacionados.
+
+Já que estamos criando uma estrutura de aprendizagem, já prepare o campo para criarmos o módulo de backtesting (após terminarmos toda essa etapa).
+
+CRIE UM PLANO ROBUSTO E DETALHISTA, ESSE É O CORAÇÃO DO SUPER QUANT, SE NÃO CONSEGUIRMOS CHEGAR NO NÍVEL DE QUALIDADE ANÁLITCA QUE PRECISAMOS ATRAVÉS DA APRENDIZAGEM DO MEU OPERACIONAL, ENTÃO VAMOS ABORTAR O PROJETO.
+
+Outras formas para melhorar o motor quant de price action:
+- Análise de transcrições e frames de gravações de vídeo do professor Igor.
+- Análise massiva de prints das minhas operações.
+- Usar os ticks entre a entrada e saída de cada operação para fazer uma análise mais profunda.

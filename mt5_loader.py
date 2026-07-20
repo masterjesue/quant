@@ -101,7 +101,8 @@ def exigir_conexao_saudavel(ticker_teste: str = "WINQ26", latencia_max_ms: float
     if status['status'] == 'symbol_sem_resposta':
         raise ConnectionError(f"[mt5_loader] Símbolo {ticker_teste} não respondeu — verifique Market Watch.")
     if status['status'] == 'latencia_alta':
-        print(f"[mt5_loader] ⚠️ Latência alta detectada ({status['latencia_ms']}ms). "
+        # Sem emoji de propósito — ver comentário em `_com_retry_permite_vazio`.
+        print(f"[mt5_loader] AVISO: latencia alta detectada ({status['latencia_ms']}ms). "
               f"Operações pesadas podem ser lentas ou instáveis. Considere trocar "
               f"de servidor MT5 Access antes de continuar (Ferramentas > Opções > Servidor).")
     else:
@@ -123,6 +124,16 @@ _LETRA_MES = {
 }
 
 _PADRAO_TICKER = re.compile(r'^([A-Z]+)([FGHJKMNQUVXZ])(\d{2})$')
+
+# Deslocamento entre o relógio do terminal MT5 (servidor, ~UTC) e o horário
+# real local (BRT) — validado empiricamente em 30/06/2026 pra copy_ticks_from
+# (ver buscar_ticks_periodo) e reconfirmado em 2026-07-15 pra
+# history_deals_get/positions_get: pedir X-3h e depois somar 3h de volta ao
+# `time` retornado bate exatamente com o horário real do negócio (testado
+# contra os tickets reais 307608945/307609756, 11:28:09/12:38:08 no
+# ProfitPRO). Nível de módulo pra ser reaproveitado por qualquer função que
+# consulte essas 3 APIs, não só copy_ticks_from.
+DESLOCAMENTO_TIMEZONE_MT5 = timedelta(hours=3)
 
 
 def _chave_ordenacao_vencimento(ticker: str):
@@ -174,7 +185,8 @@ def detectar_contrato_mais_recente(prefixo: str) -> str | None:
         candidatos_brutos.append((chave, s.name))
 
     if not candidatos_brutos:
-        print(f"[mt5_loader] ⚠️ Nenhum contrato candidato para prefixo '{prefixo}'")
+        # Sem emoji de propósito — ver comentário em `_com_retry_permite_vazio`.
+        print(f"[mt5_loader] AVISO: nenhum contrato candidato para prefixo '{prefixo}'")
         return None
 
     candidatos_brutos.sort(key=lambda x: x[0])  # mais antigo primeiro
@@ -198,7 +210,7 @@ def detectar_contrato_mais_recente(prefixo: str) -> str | None:
         futuros = [(c, t) for c, t in candidatos_brutos if c >= (hoje.year, hoje.month)]
         if futuros:
             fallback = futuros[0][1]
-            print(f"[mt5_loader] ⚠️ Nenhum candidato com negociação ativa agora "
+            print(f"[mt5_loader] AVISO: nenhum candidato com negociacao ativa agora "
                   f"(mercado pode estar fechado). Usando estimativa: {fallback}")
             return fallback
         return None
@@ -244,7 +256,51 @@ def _com_retry(funcao, *args, tentativas=None, delay=None, **kwargs):
         if tentativa < tentativas:
             time.sleep(delay)
 
-    print(f"[mt5_loader] ⚠️ Falhou após {tentativas} tentativas. Último erro: {ultimo_erro}")
+    # Sem emoji de propósito — ver o mesmo print em `_com_retry_permite_vazio`
+    # logo abaixo pro bug real que isso corrige (UnicodeEncodeError no
+    # console cp1252 do Windows matando a thread de sync a cada retry
+    # esgotado).
+    print(f"[mt5_loader] AVISO: falhou apos {tentativas} tentativas. Ultimo erro: {ultimo_erro}")
+    return None
+
+
+def _com_retry_permite_vazio(funcao, *args, tentativas=None, delay=None, **kwargs):
+    """
+    Mesma proteção de `_com_retry` contra falha transitória do MT5, mas
+    pra chamadas onde um retorno VAZIO (tupla `()`) é um resultado normal
+    e frequente, não um sinal de falha — `positions_get()`/
+    `history_deals_get()` retornam `()` o tempo todo (sem posição aberta
+    agora, sem negócio nas últimas 24h), ao contrário de candles/ticks
+    (`_com_retry` original), onde vazio durante o pregão quase sempre
+    indica problema. Só re-tenta em `None` (a chamada de fato falhou);
+    `()` é aceito de imediato como sucesso, sem re-tentativa nem delay.
+    """
+    tentativas = tentativas or cfg.RETRY_TENTATIVAS
+    delay = delay or cfg.RETRY_DELAY_SEGUNDOS
+
+    ultimo_erro = None
+    for tentativa in range(1, tentativas + 1):
+        resultado = funcao(*args, **kwargs)
+        if resultado is not None:
+            return resultado
+        ultimo_erro = mt5.last_error()
+        if tentativa < tentativas:
+            time.sleep(delay)
+
+    # BUG REAL (2026-07-17): o emoji '⚠️' (U+26A0 U+FE0F) não tem mapeamento no
+    # codepage cp1252 do console do Windows — imprimir isso levantava
+    # UnicodeEncodeError e MATAVA a própria thread de sincronização (rodando
+    # em background a cada 3s, `interval-posicao-sync`), sempre bem no meio
+    # de `buscar_execucoes_periodo`. Resultado: o preço/hora de saída REAL de
+    # um trade fechado nunca conseguia ser confirmado (a exceção acontecia
+    # antes do resultado do MT5 ser sequer usado), a posição ficava presa
+    # pra sempre em `saida_estimada=True` — e por até 1-2h (atraso conhecido
+    # do MT5 pra parar de listar um ticket já fechado) o "auto-recuperação"
+    # dessa mesma função revertia a posição pra 'aberta' a cada ciclo,
+    # apagando a correção manual que o usuário acabou de preencher no
+    # formulário "Finalizar e gravar no Diário" — explica o achado real de
+    # Jesué: preencheu a correção, clicou em finalizar, nada foi salvo.
+    print(f"[mt5_loader] AVISO: falhou apos {tentativas} tentativas. Ultimo erro: {ultimo_erro}")
     return None
 
 
@@ -282,6 +338,47 @@ def buscar_candles_apos(ticker: str, data_referencia: datetime) -> pd.DataFrame 
     if todos is None:
         return None
     return todos[todos['datetime'] >= data_referencia].reset_index(drop=True)
+
+
+def buscar_variacao_dia(ticker: str) -> float | None:
+    """
+    Variação percentual do dia (fechamento diário atual vs. anterior) de
+    QUALQUER símbolo MT5 — usado pro painel de ativos correlacionados no
+    hero (DI1FUT, ver correlacao_ativos.py), não passa pelo pipeline pesado
+    de candle M5/backtest, só um lookup direto de 2 barras diárias. Nunca
+    lança — símbolo inexistente ou sem 2 barras diárias (ex: mercado
+    recém-aberto, contrato sem histórico) retorna None, degradando
+    graciosamente (o item some da lista em vez de quebrar o painel inteiro).
+    """
+    if not mt5.symbol_select(ticker, True):
+        return None
+    rates = mt5.copy_rates_from_pos(ticker, mt5.TIMEFRAME_D1, 0, 2)
+    if rates is None or len(rates) < 2:
+        return None
+    fechamento_anterior, fechamento_atual = float(rates[-2]['close']), float(rates[-1]['close'])
+    if fechamento_anterior == 0:
+        return None
+    return (fechamento_atual - fechamento_anterior) / fechamento_anterior * 100
+
+
+def buscar_fechamentos_diarios(ticker: str, n_dias: int) -> pd.Series | None:
+    """
+    Histórico de N fechamentos diários (D1) de QUALQUER símbolo MT5 — usado
+    pra correlacionar DI1FUT contra WIN/WDO (ver
+    correlacao_ativos.calcular_correlacao_di). Mesmo espírito de
+    `buscar_variacao_dia` (lookup direto, sem passar pelo pipeline pesado de
+    candle M5/backtest) mas pedindo N barras em vez de só 2. Retorna None se
+    o símbolo não resolver ou não tiver ao menos 2 barras — nunca lança,
+    degrada graciosamente (mesmo padrão de `buscar_variacao_dia`).
+    """
+    if not mt5.symbol_select(ticker, True):
+        return None
+    rates = mt5.copy_rates_from_pos(ticker, mt5.TIMEFRAME_D1, 0, n_dias)
+    if rates is None or len(rates) < 2:
+        return None
+    df = pd.DataFrame(rates)
+    df['datetime'] = pd.to_datetime(df['time'], unit='s')
+    return df.set_index('datetime')['close']
 
 
 # -----------------------------------------------------------------------------
@@ -332,13 +429,11 @@ def buscar_ticks_periodo(ticker: str, inicio: datetime, fim: datetime) -> pd.Dat
     """
     mt5.symbol_select(ticker, True)
 
-    DESLOCAMENTO_TIMEZONE = timedelta(hours=3)
-
     todos_ticks = []
     ponto_atual = inicio  # mantido como datetime.datetime nativo o tempo todo
 
     while ponto_atual < fim:
-        ponto_ajustado = ponto_atual - DESLOCAMENTO_TIMEZONE
+        ponto_ajustado = ponto_atual - DESLOCAMENTO_TIMEZONE_MT5
 
         # Garantia explícita de tipo nativo — não confiar em cálculos
         # anteriores não terem introduzido um pandas.Timestamp por engano
@@ -366,9 +461,10 @@ def buscar_ticks_periodo(ticker: str, inicio: datetime, fim: datetime) -> pd.Dat
         ultimo_tempo_real = pd.to_datetime(lote[-1]['time'], unit='s').to_pydatetime()
 
         if len(lote) >= cfg.TICKS_POR_CHAMADA and ultimo_tempo_real == ponto_atual:
-            print(f"[mt5_loader] ⚠️ Lote veio CHEIO ({len(lote)} ticks) sem avançar do "
-                  f"ponto anterior ({ultimo_tempo_real}) — possível volume extremo "
-                  f"num único segundo. Considere aumentar TICKS_POR_CHAMADA.")
+            # Sem emoji de propósito — ver comentário em `_com_retry_permite_vazio`.
+            print(f"[mt5_loader] AVISO: lote veio cheio ({len(lote)} ticks) sem avancar do "
+                  f"ponto anterior ({ultimo_tempo_real}) - possivel volume extremo "
+                  f"num unico segundo. Considere aumentar TICKS_POR_CHAMADA.")
 
         if ultimo_tempo_real <= ponto_atual:
             # Não avançou de fato — evita loop infinito
@@ -432,8 +528,17 @@ def buscar_execucoes_periodo(inicio: datetime, fim: datetime) -> pd.DataFrame | 
     mas ao vivo e via API. Retorna None se a chamada ao MT5 falhar (conexão
     fora do ar); DataFrame vazio (não None) se a chamada funcionou mas não
     houve fills no período — situação normal, não é erro.
+
+    `inicio`/`fim` são horário LOCAL real (BRT) — a correção de fuso
+    (`DESLOCAMENTO_TIMEZONE_MT5`) fica contida aqui: desloca a consulta
+    pro relógio do terminal antes de perguntar ao MT5, e desloca o `time`
+    de volta pra BRT antes de devolver. Validado empiricamente em
+    2026-07-15 contra os tickets reais 307608945/307609756 (o `time` cru
+    do MT5 vinha 3h atrasado — 08:28/09:38 em vez do horário real
+    11:28/12:38 confirmado no relatório da corretora).
     """
-    deals = mt5.history_deals_get(inicio, fim)
+    deals = _com_retry_permite_vazio(mt5.history_deals_get,
+                                      inicio - DESLOCAMENTO_TIMEZONE_MT5, fim - DESLOCAMENTO_TIMEZONE_MT5)
     if deals is None:
         return None
 
@@ -443,7 +548,7 @@ def buscar_execucoes_periodo(inicio: datetime, fim: datetime) -> pd.DataFrame | 
             continue  # sem symbol = operação de saldo/ajuste da conta, não é fill de contrato
         linhas.append({
             'ticket': d.ticket,
-            'time': datetime.fromtimestamp(d.time),
+            'time': datetime.fromtimestamp(d.time) + DESLOCAMENTO_TIMEZONE_MT5,
             'symbol': d.symbol,
             'raiz_contrato': _extrair_raiz_contrato(d.symbol),
             'tipo': 'compra' if d.type == mt5.DEAL_TYPE_BUY else ('venda' if d.type == mt5.DEAL_TYPE_SELL else 'outro'),
@@ -464,6 +569,17 @@ def agrupar_posicoes(df_deals: pd.DataFrame) -> pd.DataFrame:
     perna(s) IN, preço de saída e profit líquido vêm da(s) perna(s) OUT.
     Posições sem perna IN visível na janela pesquisada (aberta antes do
     período) são descartadas — não dá pra reconciliar sem o preço de entrada.
+
+    `pernas_out` inclui `DEAL_ENTRY_OUT_BY` (entry=3) além de OUT/INOUT
+    (1/2) — achado real 2026-07-16: esta conta (BTG) eventualmente cruza
+    as duas pernas de um hedge (long+short opostos) via OUT_BY, com atraso
+    de 1-2h em relação ao momento em que o usuário efetivamente "fechou" a
+    posição (a ordem OCO/SL-TP disparando cria uma posição nova, não fecha
+    a original — ver `diario_trade.detectar_pares_hedge`). Confirmado com
+    os tickets reais 86510889/86510890 (position_id 307608945/307609756):
+    profit real R$80/R$0 batendo exato com o relatório do ProfitPRO. Sem
+    isso, `pernas_out` ficava vazio pra esses casos e o fechamento real
+    nunca era encontrado.
     """
     colunas = ['position_id', 'raiz_contrato', 'tipo', 'preco_entrada', 'preco_saida',
                'datetime_entrada', 'datetime_saida', 'volume', 'profit_total',
@@ -474,7 +590,7 @@ def agrupar_posicoes(df_deals: pd.DataFrame) -> pd.DataFrame:
     linhas = []
     for position_id, grupo in df_deals.groupby('position_id'):
         pernas_in = grupo[grupo['entry'] == 0]
-        pernas_out = grupo[grupo['entry'].isin([1, 2])]
+        pernas_out = grupo[grupo['entry'].isin([1, 2, mt5.DEAL_ENTRY_OUT_BY])]
         if pernas_in.empty:
             continue
 
@@ -504,18 +620,25 @@ def buscar_posicoes_abertas(ticker: str | None = None) -> pd.DataFrame | None:
     """
     Wrap de mt5.positions_get() — posições REALMENTE abertas agora na conta
     conectada (mesma conta real da reconciliação, ver comentário acima de
-    _extrair_raiz_contrato). Chamada direta, sem _com_retry: roda num tick
-    de alguns segundos (não o de 1s), mesmo espírito de
-    atualizar_candle_atual/symbol_info_tick em dashboard.py — se falhar
-    numa rodada, o próximo ciclo tenta de novo, nunca trava a UI.
+    _extrair_raiz_contrato). Usa `_com_retry_permite_vazio` (não
+    `_com_retry`): "nenhuma posição aberta" é um resultado NORMAL e comum
+    (não indica falha), mas uma falha transitória real do MT5 (já
+    documentada neste módulo como recorrente) não deve ser confundida com
+    isso — daí precisar de um retry que só insiste em `None`, nunca em `()`.
+    Achado real (2026-07-15): sem esse retry, uma falha transitória de UM
+    ciclo de 3s fazia `sincronizar_posicoes_abertas` achar que a posição
+    tinha fechado (ela só sumiu momentaneamente do retorno), gerando um
+    "fechamento" fantasma numa posição que na verdade seguia aberta.
 
-    Retorna None se a chamada ao MT5 falhar; DataFrame vazio (colunas
-    garantidas) se a chamada funcionou mas não há posição aberta agora.
+    Retorna None se a chamada ao MT5 falhar de verdade (todas as
+    tentativas); DataFrame vazio (colunas garantidas) se a chamada
+    funcionou mas não há posição aberta agora.
     """
     colunas = ['ticket', 'ativo', 'contrato', 'tipo_operacao', 'volume',
                'preco_entrada', 'preco_atual', 'sl', 'tp', 'profit',
                'datetime_entrada', 'comment']
-    posicoes = mt5.positions_get(symbol=ticker) if ticker else mt5.positions_get()
+    posicoes = (_com_retry_permite_vazio(mt5.positions_get, symbol=ticker) if ticker
+                else _com_retry_permite_vazio(mt5.positions_get))
     if posicoes is None:
         return None
     if len(posicoes) == 0:
@@ -534,7 +657,7 @@ def buscar_posicoes_abertas(ticker: str | None = None) -> pd.DataFrame | None:
             'sl': p.sl or None,
             'tp': p.tp or None,
             'profit': p.profit,
-            'datetime_entrada': datetime.fromtimestamp(p.time),
+            'datetime_entrada': datetime.fromtimestamp(p.time) + DESLOCAMENTO_TIMEZONE_MT5,
             'comment': _corrigir_mojibake(p.comment),
         })
     return pd.DataFrame(linhas, columns=colunas)

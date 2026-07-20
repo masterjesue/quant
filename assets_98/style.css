@@ -45,12 +45,72 @@
 /* Botão Win98 pressionado ao clique — inverte o bevel (raised -> sunken).
    Precisa ser :active porque style inline não tem pseudo-classe. */
 .win98-btn:active {
-    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
-                inset -2px -2px #DFDFDF, inset 2px 2px #808080 !important;
+    /* Camadas 2/4 estavam trocadas em relação a _BEVEL_SUNKEN
+       (estilo_win98.py) — 1px devia ser 'shadow' (#808080) e 2px devia ser
+       'shadow_dk' (#000000), não o contrário. Contribuía pro efeito de
+       "bordas brancas inconsistentes" reportado no SQ'98. */
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #808080,
+                inset -2px -2px #DFDFDF, inset 2px 2px #000000 !important;
 }
 .win98-btn:focus-visible {
     outline: 1px dotted #000000;
     outline-offset: -4px;
+}
+
+/* Esconde as setas +/- nativas de <input type=number> — só fazem sentido
+   no campo Lote (poucas unidades); em Alvo/Stop/Preço/Resultado/Saldo
+   (podem ter várias casas decimais) ninguém vai clicar +/- até o valor
+   certo (feedback diário.txt). */
+.no-spinner::-webkit-outer-spin-button,
+.no-spinner::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+.no-spinner[type=number] {
+    -moz-appearance: textfield;
+}
+
+/* dcc.Slider (feedback 2026-07-12, corrigido de vez em 2026-07-16) — ver
+   assets/style.css pro raciocínio completo: o Slider deste Dash renderiza
+   via Radix UI, não rc-slider — o "número solto" é um
+   `<input class="dash-range-slider-input">` sempre visível (não um
+   tooltip de hover), e o `transform` das marcas de ponta é inline (só
+   `!important` vence). Seletor/regra corrigidos pro elemento real. */
+[id*="sentimento-mercado"] .dash-range-slider-input {
+    display: none !important;
+}
+.dash-slider-mark {
+    transform: translateX(-50%);
+}
+.dash-slider-mark:first-of-type {
+    transform: translateX(0) !important;
+}
+.dash-slider-mark:last-of-type {
+    transform: translateX(-100%) !important;
+}
+
+/* Avaliação em estrelas clicável (Autoavaliação Emocional / Bem-Estar,
+   feedback 2026-07-11: "coloque apenas as estrelas... como tem
+   normalmente nos apps") — substitui o dcc.Slider com marks de ★. Ver
+   assets/style.css::.diario-estrela pro mesmo raciocínio (classe .ativa
+   via ::before evita um 2º output de `children` no clientside_callback).
+   Cor navy — mesmo acento usado no resto da UI Win98 (ver estilo_win98.py
+   C['gold'], renomeado mas repassado pra navy). */
+.diario98-estrela {
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+    user-select: none;
+    color: #808080;
+}
+.diario98-estrela::before {
+    content: '☆';
+}
+.diario98-estrela.ativa {
+    color: #000080;
+}
+.diario98-estrela.ativa::before {
+    content: '★';
 }
 
 /* Scrollbar clássica — valores copiados literalmente do CSS compilado de
@@ -137,6 +197,33 @@ html, body, #react-entry-point {
     background: #C0C0C0;
 }
 
+/* Ver window_manager.js::setInteracting pro raciocínio completo — some
+   temporariamente com a captura de mouse dos iframes (Diário/Posição)
+   enquanto uma janela está sendo arrastada/redimensionada, senão o
+   `mousemove` que o drag escuta no `window` do documento pai nunca chega
+   quando o cursor passa por cima do iframe (browsing context separado). */
+.win98-interacting iframe {
+    pointer-events: none;
+}
+
+/* Janelas Diário/Posição (win-diario, win-posicao) embutem um <iframe> pra
+   diario_app_98.py, que agora tem sua PRÓPRIA região de scroll interna
+   (feedback 2026-07-12: "não consigo ver as informações completas, mesmo
+   redimensionando" — a raiz do layout do Diário ganhou `overflow-y: auto`
+   de verdade). Isso deixou o `overflow-y: auto` daqui redundante pra essas
+   duas janelas especificamente — o iframe já é 100%/100% do
+   .win98-window-body, então qualquer diferença de arredondamento entre os
+   dois (padding/box-sizing) fazia ESTE contêiner TAMBÉM mostrar uma
+   barra própria, uma por cima da do iframe ("duas barras de rolagem").
+   `overflow: hidden` aqui garante uma única barra de verdade (a de dentro
+   do iframe) sem afetar as outras janelas (Quant Lab, Price Action etc.),
+   que não têm scroll próprio e continuam precisando do overflow-y do
+   .win98-window-body padrão acima. */
+#win-diario .win98-window-body,
+#win-posicao .win98-window-body {
+    overflow: hidden;
+}
+
 /* Janela sem foco — titlebar cinza em vez de navy (decidido 100% no
    cliente, via window_manager.js alternando esta classe) */
 .win98-window.inactive .win98-titlebar {
@@ -144,8 +231,8 @@ html, body, #react-entry-point {
 }
 
 .win98-titlebar-btn:active {
-    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
-                inset -2px -2px #DFDFDF, inset 2px 2px #808080 !important;
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #808080,
+                inset -2px -2px #DFDFDF, inset 2px 2px #000000 !important;
 }
 
 /* Handles de redimensionar — injetados via JS (window_manager.js) só nas
@@ -187,8 +274,8 @@ html, body, #react-entry-point {
 }
 .win98-start-btn:active,
 .win98-start-btn.open {
-    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
-                inset -2px -2px #DFDFDF, inset 2px 2px #808080 !important;
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #808080,
+                inset -2px -2px #DFDFDF, inset 2px 2px #000000 !important;
 }
 .win98-taskbar-sep {
     width: 2px;
@@ -226,8 +313,8 @@ html, body, #react-entry-point {
                 inset -2px -2px #808080, inset 2px 2px #DFDFDF;
 }
 .win98-task-btn.active {
-    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #000000,
-                inset -2px -2px #DFDFDF, inset 2px 2px #808080;
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #808080,
+                inset -2px -2px #DFDFDF, inset 2px 2px #000000;
 }
 
 .win98-start-menu {
@@ -363,8 +450,17 @@ html, body, #react-entry-point {
    adivinhação errada: pega QUALQUER elemento dentro do controle fechado.
    A LISTA ABERTA de opções pode renderizar fora da árvore de #chat-modelo
    (padrão comum de portal em componentes Radix) — por isso essas regras
-   não são escopadas pelo id. Só existe 1 dropdown na página, sem risco de
-   colidir com outro. */
+   não são escopadas pelo id.
+   AVISO (2026-07-11): "só existe 1 dropdown na página" deixou de ser
+   verdade assim que o Diário (diario_app_98.py, mesma pasta assets_98/)
+   ganhou dropdowns próprios com `.win98-dropdown` — CSS é compartilhado
+   entre os dois processos porque ambos usam assets_folder='assets_98'. As
+   regras `#chat-modelo *` abaixo continuam escopadas pelo id (não vazam),
+   mas a regra `.dash-dropdown-value-item` logo depois ERA global sem
+   querer (pensada só pra esse seletor) e truncava os chips de qualquer
+   multi-select do Diário até sumirem — motivo do bug "as tags somem" do
+   feedback. Ver `.win98-dropdown`/`.win98-dropdown-tags` abaixo pro
+   equivalente genérico usado no resto do app. */
 #chat-modelo, #chat-modelo * {
     background-color: #FFFFFF !important;
     color: #000 !important;
@@ -404,11 +500,49 @@ html, body, #react-entry-point {
 #chat-modelo *:focus, #chat-modelo *:focus-visible {
     outline: none !important; box-shadow: none !important;
 }
-.dash-dropdown-value-item {
+/* Escopada pro #chat-modelo (era global, ver aviso acima) — trunca com
+   reticências só o seletor secundário do chat, que é mesmo estreito. */
+#chat-modelo .dash-dropdown-value-item {
     overflow: hidden !important; text-overflow: ellipsis !important;
     white-space: nowrap !important; max-width: 140px !important;
     display: inline-block !important;
 }
+
+/* Dropdowns do Diário (2026-07-11) — nenhum `dcc.Dropdown` do Diário tinha
+   estilo próprio (só `style={'width':...}` inline), então a caixa FECHADA
+   caía no branco cru padrão do Dash enquanto a lista ABERTA (regra
+   `.dash-dropdown-content` abaixo) já era cinza Win98 — destoava do resto
+   da UI. `.win98-dropdown` dá o mesmo bevel sunken + fundo branco de
+   `win98_field()` pra caixa fechada, pra combinar com os campos de texto. */
+.win98-dropdown .dash-dropdown-grid-container.dash-dropdown-trigger {
+    background-color: #FFFFFF !important;
+    border-radius: 0 !important;
+    box-shadow: inset -1px -1px #fff, inset 1px 1px #808080,
+                inset -2px -2px #dfdfdf, inset 2px 2px #000 !important;
+    min-height: 21px !important;
+    font-size: 11px !important;
+}
+.win98-dropdown .dash-dropdown-value,
+.win98-dropdown .dash-dropdown-value-item {
+    color: #000 !important;
+}
+/* Multi-select de tags (Estratégia / Tags Setup-Erro / Print Emocional):
+   o max-width:140px vazado (ver aviso acima) truncava os chips
+   selecionados até sumirem visualmente — aqui o campo tem espaço de sobra
+   e quebra linha ao invés de truncar. */
+.win98-dropdown-tags .dash-dropdown-grid-container.dash-dropdown-trigger {
+    flex-wrap: wrap !important;
+    height: auto !important;
+    min-height: 23px !important;
+    padding: 2px !important;
+}
+.win98-dropdown-tags .dash-dropdown-value-item {
+    max-width: none !important;
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+}
+
 .dash-dropdown-content {
     background-color: #C0C0C0 !important; border-radius: 0 !important; color: #000 !important;
     box-shadow: inset -1px -1px #000, inset 1px 1px #fff,
@@ -416,7 +550,10 @@ html, body, #react-entry-point {
     z-index: 9500 !important; /* acima da taskbar (9000) e do Start Menu (9001) */
 }
 .dash-dropdown-option {
-    background-color: #C0C0C0 !important; color: #000 !important; font-size: 9px !important;
+    /* 11px pra bater com a caixa fechada (.win98-dropdown, também 11px) —
+       era 9px, menor que o resto da UI (paridade com o ajuste em
+       assets/style.css, 2026-07-11). */
+    background-color: #C0C0C0 !important; color: #000 !important; font-size: 11px !important;
 }
 .dash-dropdown-option:hover,
 .dash-dropdown-option[data-highlighted],
@@ -448,4 +585,59 @@ html, body, #react-entry-point {
 .clippy-balloon.clippy-bottom-left .clippy-tip {
     top: 0; margin-top: -16px; left: 100%; margin-left: -50px;
     background-position: 0 -16px;
+}
+
+/* Barra de ferramentas de desenho — janela "Traçados" (ver
+   assets_98/lwchart.js). Estado "ativa" alternado via classList direto no
+   JS, nunca recriado por callback Dash (mesmo motivo de window_manager.js
+   não usar Dash pra chrome de UI — n_clicks resetando por recriação já foi
+   a causa raiz do bug do calendário do Diário, corrigido em 2026-07-12). */
+.tracado-tool-btn-98 {
+    background: #C0C0C0;
+    color: #000000;
+    border: none;
+    border-radius: 0;
+    box-shadow: inset -1px -1px #000000, inset 1px 1px #FFFFFF,
+                inset -2px -2px #808080, inset 2px 2px #DFDFDF;
+    padding: 2px 10px;
+    cursor: pointer;
+    font-family: Tahoma, "Segoe UI", Verdana, Arial, sans-serif;
+    font-size: 11px;
+}
+.tracado-tool-btn-98:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.tracado-tool-btn-98.tracado-tool-ativa-98 {
+    box-shadow: inset -1px -1px #FFFFFF, inset 1px 1px #808080,
+                inset -2px -2px #DFDFDF, inset 2px 2px #000000;
+}
+
+/* Popup de imagem do Diário (Histórico) — ver assets/style.css pro mesmo
+   raciocínio (feedback 2026-07-20: preencher o bloco + zoom por scroll +
+   arrastar). Mecânica em assets_98/diario_zoom.js. */
+.diario-zoom-container {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.3);
+    cursor: zoom-in;
+    touch-action: none;
+}
+.diario-zoom-container.diario-zoom-ativo {
+    cursor: grab;
+}
+.diario-zoom-container.diario-zoom-arrastando {
+    cursor: grabbing;
+}
+.diario-zoom-img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    user-select: none;
+    -webkit-user-drag: none;
+    transform-origin: 0 0;
+    will-change: transform;
 }

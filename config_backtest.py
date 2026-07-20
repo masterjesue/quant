@@ -49,6 +49,29 @@ CONTRATOS_PILARES_MT5 = {
 CONTRATOS_EXCLUIDOS = ["WDOX26", "WDOV26"]
 
 # -----------------------------------------------------------------------------
+# DI1FUT (2026-07-16, simplificado a pedido do Jesué — antes rastreava 2
+# vencimentos de DI1 + DOLFUT + INDFUT; painel do hero agora usa só
+# DI1FUT/WINFUT/WDOFUT). O ProfitPro do Jesué mostra um ticker genérico
+# "DI1FUT" que NÃO existe como símbolo contínuo no feed MT5 (confirmado por
+# consulta direta: só há vencimentos específicos DI1Fxx/Gxx/Hxx/etc — o
+# único símbolo "DI1D" existente tem bid/ask/volume zerados, não é cotado de
+# verdade). DI1F27 é o vencimento mais próximo com negociação real ativa
+# hoje (bid/ask ao vivo, volume diário >400k) — usado como proxy do
+# "DI1FUT" que Jesué acompanha no ProfitPro. Reavaliar se o vencimento
+# líquido mudar (rollover natural da curva de juros).
+# -----------------------------------------------------------------------------
+SIMBOLO_DI1FUT = 'DI1F27'
+
+# -----------------------------------------------------------------------------
+# CORRELAÇÃO DI1FUT×WINFUT×WDOFUT (2026-07-15, ampliado 2026-07-16) — ver
+# correlacao_ativos.py
+# -----------------------------------------------------------------------------
+JANELA_CORRELACAO_DIAS = 20  # mesmo espírito de JANELA_SEGURANCA_DIAS
+                              # (indice_medo_ganancia.py) — correlação de
+                              # Pearson sobre os retornos diários dos
+                              # últimos N dias de pregão.
+
+# -----------------------------------------------------------------------------
 # CORREÇÃO DE ESCALA — validado empiricamente em 30/06/2026
 # -----------------------------------------------------------------------------
 
@@ -287,6 +310,114 @@ SCORE_PROB_MIN               = 5     # nunca reportar 0% (evita falsa certeza)
 SCORE_PROB_MAX               = 95    # nunca reportar 100%
 
 # -----------------------------------------------------------------------------
+# BLOCOS DE FORÇA (combustível / aproximação / rejeição) + camada de ação
+# (2026-07-13, ver especificacao_forca_zonas_price_action.md). Decompõe o
+# score único de calcular_prob_niveis_sr em 3 perguntas distintas ao invés de
+# um score cego — motivado por um bug real: zonas com 12/14/11 toques e
+# idades de 217/888/222 candles saíam com a MESMA probabilidade (93%) e o
+# MESMO texto de interpretação, porque os termos dominantes do score antigo
+# eram compartilhados por candle (tendência/fase/saúde/fluxo), não por zona,
+# e `idade` nunca influenciava zonas normais. Pesos abaixo são heurística de
+# engenharia documentada, mesmo espírito das seções acima — CALIBRAR via
+# backtest é etapa futura, não desta entrega.
+# -----------------------------------------------------------------------------
+
+# --- Bloco 1: combustível de liquidez (frescor da zona) ---
+ESCALA_FORCA_TOQUES_COMBUSTIVEL = 8.0  # escala de saturação (tanh) da força
+                                      # de toques já ponderada (_peso_toque)
+                                      # dentro do combustível — substitui o
+                                      # teto raso TOQUES_TETO_SCORE=6 que
+                                      # igualava 6/11/14/84 toques
+PESO_FORCA_TOQUES_COMBUSTIVEL = 25.0 # penalidade máxima de combustível
+                                      # consumido por toques (satura via tanh,
+                                      # nunca corta abruptamente)
+MEIA_VIDA_COMBUSTIVEL_IDADE = 1500   # candles p/ o "combustível por idade" cair
+                                      # pela metade, independente de toques —
+                                      # ~13-14 dias de pregão M5. Aplica a
+                                      # QUALQUER zona (diferente do decaimento
+                                      # de forca_herdada, que é só p/ espelho).
+JANELA_BASE_LIMPA_CANDLES = 10       # candles ANTES da origem do pivô avaliados
+                                      # p/ medir se a base foi rápida/concentrada
+                                      # (poucos candles, range estreito) ou
+                                      # larga/diluída (ordens dispersas)
+PESO_INTENSIDADE_ORIGEM = 15         # bônus de combustível se o candle de
+                                      # origem teve range/velocidade bem acima
+                                      # da média (proxy de volume, sem tape
+                                      # confiável em WIN/WDO)
+PESO_BASE_LIMPA = 10                 # bônus se a base de formação foi estreita
+                                      # e rápida (ordens concentradas)
+PESO_PROFUNDIDADE_MITIGACAO = -12    # penalidade de combustível pela
+                                      # profundidade média de penetração nos
+                                      # toques já ocorridos (0=tocou a borda,
+                                      # 1=atravessou a zona inteira)
+PESO_IDADE_COMBUSTIVEL = 15          # peso do termo de decaimento por idade
+
+# --- Bloco 2: qualidade da aproximação (perna até o toque) — inteiramente
+#     novo nesta entrega, não existia nenhuma versão anterior ---
+JANELA_APROXIMACAO_CANDLES = 15      # candles olhados pra trás a partir do
+                                      # toque, pra avaliar a perna de chegada
+LIMIAR_CORPO_DECISIVO_ATR = 0.5      # corpo/range acima disso conta como
+                                      # candle "decisivo" (estrutura impulsiva)
+LIMIAR_CANAL_R2 = 0.6                # R² mínimo pra considerar a perna "em
+                                      # canal" (senão, "errática")
+LIMIAR_ESTICADA_CANAL_ATR = 1.5      # desvio do canal (em ATR) que caracteriza
+                                      # "esticada" (excesso especulativo)
+K_VELOCIDADE_ULTIMA_PERNA = 4        # candles finais comparados contra os K
+                                      # imediatamente anteriores, p/ medir
+                                      # aceleração/desaceleração
+PESO_ESFORCO_RESULTADO = -15         # penalidade quando o esforço (range/
+                                      # velocidade) cresce sem o resultado
+                                      # (distância) correspondente — exaustão
+                                      # antes mesmo do toque
+PESO_ESTRUTURA_IMPULSIVA = 10        # bônus se a perna foi decisiva (poucos
+                                      # candles de corpo grande) vs. corretiva
+                                      # (muitos candles pequenos sobrepostos)
+PESO_CANAL_DEFINIDO = 8              # bônus se a perna veio em canal bem
+                                      # definido (não errática)
+PESO_CANAL_ESTICADO = -10            # penalidade se o canal esticou nos
+                                      # últimos candles (clímax especulativo)
+PESO_ESTRUTURA_TOPOS_FUNDOS_APROXIMACAO = 12  # bônus/penalidade conforme os
+                                      # pivôs intermediários da perna
+                                      # confirmam (higher-lows numa
+                                      # aproximação de alta, lower-highs numa
+                                      # de baixa) ou já divergem do preço
+PESO_VELOCIDADE_ULTIMA_PERNA = -8    # penalidade quando a última perna
+                                      # acelera muito (clímax de euforia) vs.
+                                      # desaceleração controlada
+
+# --- Bloco 3: qualidade da rejeição no toque — refina o que já existe
+#     (rejeicao_media via wick, agressao_media, impulso_medio) ---
+PESO_PUREZA_CORPO = 8                # bônus quando o corpo do candle de
+                                      # rejeição é grande (decisão de fluxo),
+                                      # penaliza velas de indecisão (doji)
+PESO_RETRACOES_SAIDA = -6            # penalidade por retração (reentrada na
+                                      # zona) durante a janela de saída
+                                      # (N_CANDLES_IMPULSO) — cada uma dilui o
+                                      # sinal de rejeição
+
+# --- Camada de ação: postura por regra explícita (nunca texto livre, seção
+#     6.3 da spec — sempre rastreável até os 3 scores que a compõem) ---
+LIMIAR_POSTURA_FAVORECE = 70         # média combustível+aproximação+rejeição
+                                      # (0-100) acima disso, com os 3 na
+                                      # mesma direção => "favorece entrada"
+LIMIAR_POSTURA_AGUARDAR = 55         # entre AGUARDAR e FAVORECE => "aguardar
+                                      # confirmação adicional" (sinal presente,
+                                      # incompleto)
+LIMIAR_POSTURA_FRACO = 40            # abaixo de AGUARDAR e acima disso =>
+                                      # "sinal fraco / operar reduzido"
+                                      # (abaixo disso => "evitar / não operar")
+MAGNITUDE_COMBUSTIVEL_CURTA_MAX = 35     # combustivel_score até aqui => magnitude "curta"
+MAGNITUDE_COMBUSTIVEL_MODERADA_MAX = 65  # até aqui => "moderada"; acima => "longa"
+
+# --- Combinação dos 3 blocos no score final (prob_bounce) — cada bloco
+#     contribui proporcional ao seu desvio de 50 (neutro), nesta amplitude
+#     máxima de pontos; forte/status/rompimento_hoje continuam como ajustes
+#     à parte, fora dos blocos (ver calcular_prob_niveis_sr) ---
+AMPLITUDE_BLOCO_COMBUSTIVEL = 20.0
+AMPLITUDE_BLOCO_APROXIMACAO = 15.0
+AMPLITUDE_BLOCO_REJEICAO    = 20.0
+
+# -----------------------------------------------------------------------------
 # ANÁLISE DE LINHA GENÉRICA — MME21 e (mais tarde) traçados manuais
 # (2026-07-10, ver plano em vamos-trabalhar-no-ux-dapper-music.md). Motor
 # compartilhado: mesma leitura de toques/força/probabilidade do S/R
@@ -302,6 +433,43 @@ TOQUES_MINIMOS_MME21_FORTE = 1       # testada E respeitada só 1x já é "forte
                                       # não exige a mesma repetição de um nível estrutural)
 TOLERANCIA_LINHA_GENERICA_ATR = 0.5  # mesmo multiplicador de TOLERANCIA_CLUSTER_SR_ATR,
                                       # reaproveitado pra "toque" numa linha qualquer
+TOQUES_MINIMOS_TRACADO_MANUAL_FORTE = TOQUES_MINIMOS_NIVEL_FORTE
+                                      # 3 — doutrina do S/R ESTÁTICO, não o limiar mais
+                                      # permissivo da MME21 (=1): um nível marcado à mão
+                                      # por Jesué na aba/janela "Traçados" é candidato a
+                                      # nível ESTRUTURAL (mesmo peso de evidência que o
+                                      # motor automático exige), não uma média móvel —
+                                      # ver metricas.analisar_tracados, que também usa
+                                      # `janela=len(df)` (histórico inteiro, não uma
+                                      # janela curta como JANELA_RESPEITO_MME21) pelo
+                                      # mesmo motivo.
+
+# --- Cruzamento traçado ↔ zona automática (bipolaridade) + critério FORTE
+# por regime (2026-07-13) ---
+TOLERANCIA_CRUZAMENTO_TRACADO_ATR = TOLERANCIA_CLUSTER_SR_ATR
+                                      # mesma tolerância do clustering automático — um
+                                      # traçado manual "coincide" com uma zona automática
+                                      # se cai dentro de zona_min/zona_max ± essa folga
+MAX_TOQUES_TIMELINE_EXIBIDOS = 30    # teto de itens na timeline expandida (2 anos de
+                                      # histórico podem gerar dezenas de toques por
+                                      # regime) — mostra os mais recentes de cada bloco
+TOQUES_FORTES_MINIMOS_TRACADO = 1
+                                      # achado real (Jesué, 2026-07-13): 4 traçados
+                                      # "aleatórios" dentro de uma consolidação longa
+                                      # (jan-jul/2026) vieram TODOS "FORTE" — o gate
+                                      # antigo (toques>=3 no histórico INTEIRO, sem
+                                      # distinguir toque forte de fraco) é trivial de
+                                      # bater dentro de qualquer lateralização de meses,
+                                      # já que toque fraco (fundo_simples/topo_simples,
+                                      # só 1 candle de confirmação) é comum em qualquer
+                                      # chop. Confirmado: o FORTE de um TRAÇADO passa a
+                                      # exigir (1) toques dentro do REGIME ATUAL apenas
+                                      # (não histórico total, ver metricas.montar_regime)
+                                      # E (2) pelo menos este tanto de toques com
+                                      # confirmação de 3 candles (não só toques fracos).
+                                      # Escopo: SÓ traçados — o "forte" das zonas
+                                      # automáticas de Price Action (_rankear_niveis_sr,
+                                      # já calibrado empiricamente) não muda.
 
 # -----------------------------------------------------------------------------
 # JANELAS DO PREGÃO — confirmado por Jesué em 30/06/2026
