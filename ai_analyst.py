@@ -8,6 +8,9 @@ from datetime import datetime
 import numpy as np
 import config_backtest as cfg
 import diario_trade
+import persistencia
+import tracados as tracados_mod
+import metricas as metricas_mod
 
 
 def _eh_preco(texto: str) -> float | None:
@@ -23,12 +26,20 @@ def _eh_preco(texto: str) -> float | None:
     return None
 
 
-def montar_contexto(metricas: dict, ativo: str, diario_recente: str | None = None) -> str:
+def montar_contexto(metricas: dict, ativo: str, diario_recente: str | None = None,
+                     tracados_analisados: list | None = None) -> str:
     """
     Monta contexto compacto de mercado para o prompt. `diario_recente`
     (opcional, produzido por `diario_trade.resumo_recente_para_ia`) é só
     anexado se fornecido — esta função continua pura/sem I/O, quem busca o
-    diário é `_montar_prompt`.
+    diário (e os traçados) é `_montar_prompt`.
+
+    `tracados_analisados` (opcional, produzido por
+    `metricas.analisar_tracados`) substitui os níveis de S/R AUTOMÁTICOS
+    como fonte de "RESISTÊNCIA/SUPORTE MAIS RELEVANTE" — Modo
+    Aprendizagem.txt, 2026-07-20: o motor não sugere mais S/R sozinho, o
+    Mentor IA agora comenta sobre os traçados que o próprio Jesué desenhou,
+    não mais um detector em que ele decidiu não confiar.
     """
     m = metricas
     def _f(v, d=0):
@@ -47,48 +58,38 @@ def montar_contexto(metricas: dict, ativo: str, diario_recente: str | None = Non
             return '(nenhum — já coberto pelo nível acima ou sem pivô recente do lado certo do preço)'
         return f"{_f(pivo['preco'], 0)} ({pivo['idade']} candles atrás, 1º toque, AINDA SEM RETESTE)"
 
-    # Nível #1 rankeado (rico — forte/status/rompimento hoje/probabilidade),
-    # não só os escalares legados (preço/distância/toques). Caso real que
-    # motivou (WIN, 08/07/2026): o Mentor recomendou CANCELAR uma entrada em
-    # 172.051 e esperar confirmação — uma cautela genérica de mentor que
-    # contradizia o próprio sistema, que já tinha esse nível como REGIÃO
-    # FORTE + PULLBACK CONFIRMADO HOJE + 85% de probabilidade calculada de
-    # bounce. O motivo raiz: o contexto só passava preço/distância/toques,
-    # nunca esses três sinais — o modelo não tinha como saber que o setup já
-    # estava validado. Ver reforço equivalente em GEMINI_SYSTEM_PROMPT.
+    # Traçado mais próximo de cada lado (Modo Aprendizagem.txt, 2026-07-20)
+    # — substitui o antigo "nível #1 rankeado" do detector automático.
+    # `tipo` já vem calculado por analisar_linha_generica relativo ao
+    # preço ATUAL (resistencia = acima do preço, suporte = abaixo), então
+    # o mais próximo de cada lado é só o de menor/maior `linha_atual`.
     def _rank1(lado: str) -> dict:
-        niveis = m.get(f'niveis_sr_{lado}') or []
-        return niveis[0] if niveis else {}
+        alvo_tipo = 'resistencia' if lado == 'acima' else 'suporte'
+        candidatos = [t for t in (tracados_analisados or []) if t.get('tipo') == alvo_tipo]
+        if not candidatos:
+            return {}
+        chave = min if lado == 'acima' else max
+        return chave(candidatos, key=lambda t: t.get('linha_atual', 0))
 
-    def _fmt_nivel(lado: str, preco_legado, dist_legado, toques_legado) -> str:
+    def _fmt_nivel(lado: str) -> str:
         r = _rank1(lado)
         if not r:
-            return f"{_f(preco_legado, 0)} ({_f(dist_legado, 1)} ATR | {int(toques_legado or 0)} toques)"
+            return '(nenhum traçado marcado deste lado — desenhe uma linha na aba Traçados)'
         extras = []
         if r.get('forte'):
             extras.append('REGIÃO FORTE')
-        status = r.get('status', 'ativa')
-        if status != 'ativa':
-            extras.append(status.upper().replace('_', ' '))
-        romp_hoje = r.get('rompimento_hoje', 'nenhum')
-        if romp_hoje != 'nenhum':
-            extras.append(romp_hoje.upper().replace('_', ' '))
-        # Bipolaridade (2026-07-13) — sem isso, o modelo não sabia que o
-        # nível #1 rankeado É uma reversão de papel confirmada (nasceu de
-        # uma zona rompida), mesmo já mandando o status/badge isolado —
-        # mesmo espírito do reforço de 2026-07-08 acima: dar o sinal já
-        # validado, não deixar o modelo "recalcular" cautela genérica.
-        bip = r.get('bipolar')
-        if bip and bip.get('papel_no_cruzamento') == 'espelho':
-            extras.append(
-                f"REVERSÃO CONFIRMADA (rompeu {bip['timestamp_rompimento']}, "
-                f"reteste {bip['timestamp_reteste']})"
-            )
-        # Camada de ação (2026-07-13, ver
-        # especificacao_forca_zonas_price_action.md) — postura já vem
-        # decidida por regra explícita (montar_acao), não texto livre; dar
-        # isso pronto ao modelo evita que ele "recalcule" uma leitura
-        # própria a partir só da probabilidade agregada.
+        # Bipolaridade/regime (mesmo campo que a UI de Traçados usa nos
+        # cards de Estudos, ver dashboard.py::_card_estudo_tracado) — dá o
+        # sinal já validado ao modelo, mesmo espírito do reforço de
+        # 2026-07-08/2026-07-13 que motivou os campos abaixo originalmente
+        # (ver GEMINI_SYSTEM_PROMPT).
+        regime = r.get('regime') or {}
+        regime_atual = regime.get('regime_atual') or {}
+        if regime_atual.get('forte'):
+            extras.append('FORTE NO REGIME ATUAL')
+        cruzamento = r.get('cruzamento_automatico')
+        if cruzamento:
+            extras.append('COINCIDE COM ZONA JÁ ROMPIDA+RETESTADA')
         acao = r.get('acao') or {}
         postura = acao.get('postura')
         if postura:
@@ -103,7 +104,8 @@ def montar_contexto(metricas: dict, ativo: str, diario_recente: str | None = Non
         if prob is not None and not (isinstance(prob, float) and np.isnan(prob)):
             prob_txt = f" | Probabilidade JÁ CALCULADA pelo sistema: {prob:.0f}% bounce / {100-prob:.0f}% rompimento"
         extras_txt = f" | {' | '.join(extras)}" if extras else ''
-        return f"{_f(r['preco'], 0)} ({r.get('dist_atr', 0):.1f} ATR | {int(r.get('toques', 0))} toques{extras_txt}{prob_txt})"
+        return (f"{_f(r.get('linha_atual'), 0)} (traçado manual do Jesué | "
+                f"{int(r.get('toques', 0))} toques{extras_txt}{prob_txt})")
 
     return f"""
 ATIVO: {ativo} | {datetime.now().strftime('%H:%M:%S')}
@@ -113,8 +115,8 @@ CANDLE ATUAL: {m.get('tipo_candle','—')}
 ATR: {_f(m.get('atr'), 0)} pts
 DELTA ACUMULADO (500 candles): {m.get('delta_acum','—')} {'(fluxo disponível)' if m.get('tem_fluxo') else '(sem dado de fluxo)'}
 RAZÃO AGRESSÃO: {_f(m.get('razao_agressao'), 3) if m.get('razao_agressao') else '—'}
-RESISTÊNCIA MAIS RELEVANTE: {_fmt_nivel('acima', m.get('sr_acima'), m.get('dist_sr_acima_atr'), m.get('qualidade_sr_acima'))}
-SUPORTE MAIS RELEVANTE: {_fmt_nivel('abaixo', m.get('sr_abaixo'), m.get('dist_sr_abaixo_atr'), m.get('qualidade_sr_abaixo'))}
+RESISTÊNCIA MAIS RELEVANTE: {_fmt_nivel('acima')}
+SUPORTE MAIS RELEVANTE: {_fmt_nivel('abaixo')}
 TOPO EM FORMAÇÃO (mais tático, pode estar mais perto que a resistência acima): {_fmt_pivo(m.get('pivo_imediato_acima'))}
 FUNDO EM FORMAÇÃO (mais tático, pode estar mais perto que o suporte acima): {_fmt_pivo(m.get('pivo_imediato_abaixo'))}
 BUILD-UP: {'Ativo há ' + str(m.get('buildup_duracao',0)) + ' candles' if m.get('buildup_ativo') else 'Inativo'}
@@ -126,7 +128,23 @@ def _montar_prompt(metricas: dict, pergunta: str, ativo: str) -> str:
     """Monta o prompt completo (system + contexto de mercado + pergunta) —
     compartilhado por todos os provedores (Gemini, OpenRouter)."""
     diario_recente = diario_trade.resumo_recente_para_ia(ativo)
-    contexto = montar_contexto(metricas, ativo, diario_recente=diario_recente)
+    # Traçados manuais (Modo Aprendizagem.txt, 2026-07-20) — lê candles
+    # fresco do disco (mesmo padrão de diario_trade/metricas.
+    # montar_snapshot_diario: este processo não tem acesso ao estado em
+    # memória do dashboard, é I/O independente por design). Falha (base ou
+    # traçados ausentes) vira lista vazia, nunca exceção — _fmt_nivel já
+    # trata isso como "nenhum traçado marcado deste lado".
+    try:
+        df_ativo = persistencia.carregar_candles(ativo)
+        tracados_df = tracados_mod.listar_tracados(ativo)
+        tracados_analisados = (
+            metricas_mod.analisar_tracados(df_ativo, tracados_df)
+            if df_ativo is not None else []
+        )
+    except Exception:
+        tracados_analisados = []
+    contexto = montar_contexto(metricas, ativo, diario_recente=diario_recente,
+                                tracados_analisados=tracados_analisados)
     preco_alvo = _eh_preco(pergunta)
 
     if preco_alvo:

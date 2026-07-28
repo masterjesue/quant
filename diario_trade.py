@@ -17,7 +17,14 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import math
+
+# Mesmo logger nomeado configurado em dashboard.py/dashboard_98.py (que já
+# rodou e anexou o FileHandler antes desta função ser chamada — ver
+# `_sincronizar_posicoes_background` nos dois arquivos). Pegar pelo nome
+# aqui reaproveita o handler existente sem reconfigurar nada.
+_log_sync = logging.getLogger('sync_posicoes')
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -101,13 +108,20 @@ TAGS_EMOCIONAIS_INICIAIS = [
 
 # Faixas do "Sentimento de Mercado" (0-100) — mesma escala do Fear & Greed
 # Index pesquisado (CNN): 0-24 Medo Extremo, 25-49 Medo, 50 Neutro,
-# 51-74 Ganância, 75-100 Ganância Extrema.
+# 51-75 Ganância, 76-100 Ganância Extrema.
+# Bug real 2026-07-21 (achado testando o slider ao vivo): as marcas visuais
+# do componente ficam em 0/25/50/75/100 (ver `_MARCAS_SENTIMENTO_MERCADO`),
+# mas o corte original entre Ganância/Ganância Extrema caía em 74/75 — o
+# valor exato 75 (onde a marca diz "Ganância") classificava como "Ganância
+# Extrema". As outras 2 marcas (25 e 50) já batiam certinho com o corte de
+# faixa; só essa ficou 1 ponto deslocada. Corrigido movendo o corte pra
+# 75/76, incluindo a marca na faixa que ela nomeia.
 SENTIMENTO_MERCADO_FAIXAS = [
     (0, 24, "Medo Extremo", "red"),
     (25, 49, "Medo", "yellow"),
     (50, 50, "Neutro", "text2"),
-    (51, 74, "Ganância", "yellow"),
-    (75, 100, "Ganância Extrema", "green"),
+    (51, 75, "Ganância", "yellow"),
+    (76, 100, "Ganância Extrema", "green"),
 ]
 
 
@@ -410,7 +424,7 @@ def desativar_tag_emocional(id_tag: int) -> bool:
 # se o usuário reabrir no mesmo dia); Roda da Vida é append-only (cada
 # registro é um retrato no tempo, a Roda "atual" é sempre o mais recente).
 # Hawkins não persiste valor calculado — sempre recomputado a partir do
-# check-in + trades do dia (mesmo espírito de `avaliar_aderencia_sr`: nunca
+# check-in + trades do dia (mesmo espírito de `avaliar_aderencia_tracados`: nunca
 # guardar um número derivado que pode ficar desatualizado).
 # -----------------------------------------------------------------------------
 
@@ -674,13 +688,21 @@ COLUNAS_DIARIO = [
 COLUNAS_RECONCILIACAO = [
     "id_trade", "mt5_position_id", "mt5_ticket_entrada", "mt5_ticket_saida",
     "mt5_divergencia_reais", "confianca", "mt5_match_status",
+    "ativo", "data", "saldo_estimado",
+    # Campos completos (2026-07-21) só preenchidos pra `sem_correspondencia_
+    # diario` — pré-carregam o pop-up de edição de pendência no Histórico
+    # (ver `materializar_pendencia_como_rascunho`) com o que o MT5 já
+    # capturou, sem o usuário precisar redigitar nada.
+    "contrato", "tipo_operacao", "volume",
+    "preco_entrada", "preco_saida", "datetime_entrada", "datetime_saida",
 ]
 
-# Idem — recomputável via `avaliar_aderencia_sr`, não é histórico do trade.
-COLUNAS_ADERENCIA_SR = [
+# Idem — recomputável via `avaliar_aderencia_tracados`, não é histórico do trade.
+COLUNAS_ADERENCIA_TRACADOS = [
     "id_trade", "data_op", "ativo", "nivel_sr_referencia", "nivel_sr_tipo_informado",
-    "lado_geometrico", "nivel_motor_preco", "nivel_motor_rank", "diferenca_atr",
-    "forte", "status", "prob_bounce", "rompimento_hoje", "classificacao",
+    "lado_geometrico", "tracado_preco", "tracado_id", "diferenca_atr",
+    "forte", "toques", "prob_bounce", "postura", "magnitude_esperada",
+    "combustivel_score", "aproximacao_score", "rejeicao_score", "classificacao",
 ]
 
 
@@ -1068,6 +1090,180 @@ def calcular_score_confiabilidade(df: pd.DataFrame | None = None, min_amostra: i
     return resultado
 
 
+def _parear_hedge_deals(posicoes: pd.DataFrame) -> pd.DataFrame:
+    """
+    Funde pares de posições opostas (long+short, mesmo `raiz_contrato` e
+    mesmo `volume`) que vieram de `mt5_loader.agrupar_posicoes` SEM perna
+    OUT própria (`preco_saida` nulo) num único round-trip líquido — mesma
+    lógica de `detectar_pares_hedge` (conta é hedging, não netting: uma
+    ordem OCO/SL-TP que dispara cria uma posição NOVA em vez de fechar a
+    original), só que adaptada às colunas de `agrupar_posicoes` (deals
+    brutos, `tipo` = 'compra'/'venda', sem coluna `status`).
+
+    Achado real 2026-07-21: sem isso, `reconciliar_com_mt5` reportava CADA
+    metade de um hedge como uma "posição sem correspondência no diário"
+    separada, sempre com `profit_total=0.0` (nenhuma perna OUT = fallback
+    zero de `agrupar_posicoes`) — Jesué viu isso como uma enxurrada de
+    pendências no Histórico, TODAS com R$0,00, o que era o sintoma certo
+    (64 pendências reais, 100% delas exatamente zero — estatisticamente
+    impossível pra day trade real, confirmou o diagnóstico antes de mexer
+    no código). Posições que JÁ têm perna OUT própria (`preco_saida`
+    preenchido, profit_total real vindo do MT5) não são tocadas aqui.
+    """
+    if posicoes.empty:
+        return posicoes
+    orfas = posicoes[posicoes["preco_saida"].isna()].copy()
+    fechadas = posicoes[posicoes["preco_saida"].notna()].copy()
+    if orfas.empty:
+        # Sem perna órfã não há nada pro pareamento antigo fazer — mas as
+        # pernas JÁ CRUZADAS pela corretora ainda precisam ser fundidas
+        # (bug real 2026-07-27; este `return` antecipado era o que pulava
+        # `_fundir_pernas_fechadas_espelhadas` justamente no caso mais comum,
+        # que é o dia inteiro já fechado).
+        return _fundir_pernas_fechadas_espelhadas(fechadas)
+
+    usados = set()
+    fundidas = []
+    # Agrupa por CONTRATO exato (WDOQ26), não pela raiz (WDO) — senão pernas
+    # de vencimentos diferentes podiam virar um "par". E as 2 pernas precisam
+    # ter aberto no MESMO DIA. Ambas as travas espelham
+    # `detectar_pares_hedge` (bug real 2026-07-27: sem elas o pareamento
+    # fabricou o trade #167 de −R$225 juntando uma posição de 22/07 com uma de
+    # 23/07). Esta função é o gêmeo histórico daquela — as regras têm que ser
+    # as mesmas, senão a aba Posição e o Histórico discordam sobre o que é um
+    # par.
+    for contrato, grupo in orfas.groupby("contrato"):
+        raiz = grupo["raiz_contrato"].iloc[0]
+        compras = grupo[grupo["tipo"] == "compra"].sort_values("datetime_entrada")
+        vendas = grupo[grupo["tipo"] == "venda"].sort_values("datetime_entrada")
+        for _, compra in compras.iterrows():
+            if compra["position_id"] in usados:
+                continue
+            candidatas = vendas[
+                (vendas["volume"] == compra["volume"]) & (~vendas["position_id"].isin(usados))
+            ]
+            if candidatas.empty:
+                continue
+            mesmo_dia = candidatas["datetime_entrada"].apply(
+                lambda t: pd.notna(t) and pd.notna(compra["datetime_entrada"])
+                and pd.Timestamp(t).date() == pd.Timestamp(compra["datetime_entrada"]).date()
+            )
+            candidatas = candidatas[mesmo_dia]
+            if candidatas.empty:
+                continue
+            venda = candidatas.iloc[0]
+            usados.add(compra["position_id"])
+            usados.add(venda["position_id"])
+
+            if compra["datetime_entrada"] <= venda["datetime_entrada"]:
+                entrada, saida, tipo_operacao = compra, venda, "long"
+            else:
+                entrada, saida, tipo_operacao = venda, compra, "short"
+
+            pnl_pts = _pnl_pontos(tipo_operacao, entrada["preco_entrada"], saida["preco_entrada"])
+            valor_ponto = cfg.VALOR_PONTO.get(raiz, 0.0)
+            profit = pnl_pts * valor_ponto * entrada["volume"]
+
+            fundidas.append({
+                "position_id": entrada["position_id"], "raiz_contrato": raiz,
+                "contrato": entrada["contrato"],
+                "tipo": entrada["tipo"], "preco_entrada": entrada["preco_entrada"],
+                "preco_saida": saida["preco_entrada"],
+                "datetime_entrada": entrada["datetime_entrada"], "datetime_saida": saida["datetime_entrada"],
+                "volume": entrada["volume"], "profit_total": profit,
+                "tickets_entrada": entrada["tickets_entrada"], "tickets_saida": saida["tickets_entrada"],
+            })
+
+    restantes = orfas[~orfas["position_id"].isin(usados)]
+    fechadas = _fundir_pernas_fechadas_espelhadas(fechadas)
+    partes = [fechadas]
+    if fundidas:
+        partes.append(pd.DataFrame(fundidas, columns=posicoes.columns))
+    partes.append(restantes)
+    return pd.concat(partes, ignore_index=True)
+
+
+def _fundir_pernas_fechadas_espelhadas(fechadas: pd.DataFrame) -> pd.DataFrame:
+    """
+    Funde as DUAS pernas de um hedge que a corretora já cruzou (DEAL_ENTRY_
+    OUT_BY) — o caso que `_parear_hedge_deals` não cobria.
+
+    BUG REAL 2026-07-27 (achado comparando o Diário com o relatório de
+    performance do ProfitPro): `_parear_hedge_deals` só funde pernas SEM
+    preço de saída. Quando o BTG cruza as duas pernas, AS DUAS ganham preço
+    de saída e escapam do pareamento. Pior: o MT5 devolve `profit=0` nesse
+    tipo de fechamento, então `mt5_loader.agrupar_posicoes` recalcula o
+    resultado pelo movimento de preço — de cada perna SEPARADAMENTE, como se
+    cada uma fosse um round-trip próprio. Uma operação real de −R$30 virava
+    duas posições de −R$30, e a que não estava na lápide ficava para sempre
+    como "operação sem registro no diário" no Histórico. Foi o que o Jesué
+    viu como "ordens fantasmas de hedge".
+
+    Assinatura usada pra identificar o par (bem apertada de propósito, pra
+    nunca fundir dois round-trips independentes que por acaso caíram no mesmo
+    dia com o mesmo volume): mesmo contrato, mesmo volume, MESMO DIA, direções
+    opostas e preços ESPELHADOS — a entrada de uma é a saída da outra e
+    vice-versa. Esse espelhamento exato é a marca do cruzamento OUT_BY; dois
+    trades independentes não produzem isso.
+
+    O resultado do par é o do trade REAL: entra pela perna que abriu primeiro
+    e sai no preço da outra — exatamente o que o relatório da corretora mostra
+    numa linha só.
+    """
+    if fechadas.empty:
+        return fechadas
+
+    def mesmo_preco(a, b):
+        return a is not None and b is not None and abs(float(a) - float(b)) < 1e-9
+
+    usados = set()
+    fundidas = []
+    for _, grupo in fechadas.groupby("contrato"):
+        linhas = [linha for _, linha in grupo.sort_values("datetime_entrada").iterrows()]
+        for i, a in enumerate(linhas):
+            if a["position_id"] in usados:
+                continue
+            for b in linhas[i + 1:]:
+                if b["position_id"] in usados:
+                    continue
+                if a["tipo"] == b["tipo"] or a["volume"] != b["volume"]:
+                    continue
+                if pd.isna(a["datetime_entrada"]) or pd.isna(b["datetime_entrada"]):
+                    continue
+                if pd.Timestamp(a["datetime_entrada"]).date() != pd.Timestamp(b["datetime_entrada"]).date():
+                    continue
+                # Espelhamento exato: entrada de A == saída de B e vice-versa.
+                if not (mesmo_preco(a["preco_entrada"], b["preco_saida"])
+                        and mesmo_preco(a["preco_saida"], b["preco_entrada"])):
+                    continue
+
+                usados.add(a["position_id"])
+                usados.add(b["position_id"])
+                entrada, saida = (a, b) if a["datetime_entrada"] <= b["datetime_entrada"] else (b, a)
+                tipo_operacao = "long" if entrada["tipo"] == "compra" else "short"
+                raiz = entrada["raiz_contrato"]
+                pnl_pts = _pnl_pontos(tipo_operacao, entrada["preco_entrada"], entrada["preco_saida"])
+                profit = pnl_pts * cfg.VALOR_PONTO.get(raiz, 0.0) * entrada["volume"]
+                fundidas.append({
+                    "position_id": entrada["position_id"], "raiz_contrato": raiz,
+                    "contrato": entrada["contrato"], "tipo": entrada["tipo"],
+                    "preco_entrada": entrada["preco_entrada"],
+                    "preco_saida": entrada["preco_saida"],
+                    "datetime_entrada": entrada["datetime_entrada"],
+                    "datetime_saida": saida["datetime_saida"],
+                    "volume": entrada["volume"], "profit_total": profit,
+                    "tickets_entrada": entrada["tickets_entrada"],
+                    "tickets_saida": saida["tickets_saida"],
+                })
+                break
+
+    if not fundidas:
+        return fechadas
+    sobraram = fechadas[~fechadas["position_id"].isin(usados)]
+    return pd.concat([sobraram, pd.DataFrame(fundidas, columns=fechadas.columns)],
+                     ignore_index=True)
+
+
 def reconciliar_com_mt5(dias_atras: int = 30) -> pd.DataFrame:
     """
     Casa trades logados (reais, não simulados) dos últimos `dias_atras`
@@ -1084,18 +1280,67 @@ def reconciliar_com_mt5(dias_atras: int = 30) -> pd.DataFrame:
 
     df_deals = mt5_loader.buscar_execucoes_periodo(inicio, fim)
     if df_deals is None:
-        resultado = pd.DataFrame(columns=COLUNAS_RECONCILIACAO)
-        persistencia.salvar_reconciliacao(resultado)
-        return resultado
+        # Achado real 2026-07-21: MT5 cai e volta sozinho o tempo todo
+        # (IPC instável, ver mt5_loader.py) — NUNCA sobrescreve o cache
+        # com um resultado vazio quando essa rodada específica não
+        # conseguiu falar com o MT5. Antes disso, um ciclo de background
+        # rodando bem na hora de uma queda apagava TODAS as pendências
+        # reais já detectadas (cache virava 0 linhas), fazendo o botão
+        # "Editar" de uma linha PENDENTE ainda visível na tela virar
+        # no-op silencioso (`materializar_pendencia_como_rascunho` não
+        # achava mais o ticket em `listar_pendencias_diario()`). Mantém o
+        # último resultado bom — só o próximo ciclo com MT5 de verdade
+        # acessível é que atualiza o cache.
+        anterior = persistencia.carregar_reconciliacao()
+        return anterior if anterior is not None else pd.DataFrame(columns=COLUNAS_RECONCILIACAO)
 
     posicoes = mt5_loader.agrupar_posicoes(df_deals)
+    posicoes = _parear_hedge_deals(posicoes)
     posicoes["data"] = posicoes["datetime_entrada"].apply(lambda t: t.date() if t is not None else None)
     posicoes["usado"] = False
 
     trades = listar_trades(data_ini=inicio.date(), data_fim=fim.date(), is_simulated=False)
 
     linhas = []
+
+    # PASSO 0 — casamento IDENTITÁRIO pela lápide, antes de qualquer heurística.
+    #
+    # BUG REAL 2026-07-27 (achado comparando o Diário com o relatório de
+    # performance do ProfitPro: 46 operações contra 42): o casamento abaixo é
+    # por `(ativo, data)` e consome UMA posição por trade. Só que um par de
+    # hedge são DUAS posições do MT5 que viram UM trade — a segunda perna
+    # sobrava e virava "sem_correspondencia_diario" PARA SEMPRE, enchendo a
+    # lista PENDENTE do Histórico de operações que já estavam registradas.
+    # Confirmado: os tickets 307609756/307636545/308768994 apareciam como
+    # pendentes mesmo com os trades #147/#149/#173 já gravados. Foi isso que
+    # levou 2 dessas "pendências" a serem finalizadas de novo, criando trades
+    # duplicados em 03/07.
+    #
+    # `tickets_finalizados.parquet` guarda o vínculo exato ticket→trade, então
+    # aqui ele resolve o que a heurística não tem como resolver: marca as N
+    # posições que compõem um trade como já reconciliadas, de uma vez.
+    mapa_lapide = _mapa_tickets_finalizados()
+    if mapa_lapide and not posicoes.empty:
+        ja_ligadas = posicoes["position_id"].isin(mapa_lapide.keys())
+        posicoes.loc[ja_ligadas, "usado"] = True
+        for _, pos in posicoes[ja_ligadas].iterrows():
+            id_trade_ligado = mapa_lapide[int(pos["position_id"])]
+            linhas.append({
+                "id_trade": id_trade_ligado, "mt5_position_id": pos["position_id"],
+                "mt5_ticket_entrada": pos["tickets_entrada"][0] if pos["tickets_entrada"] else None,
+                "mt5_ticket_saida": pos["tickets_saida"][-1] if pos["tickets_saida"] else None,
+                "mt5_divergencia_reais": None,
+                "confianca": "exato",  # veio da lápide, não de heurística
+                "mt5_match_status": "ok",
+            })
+
+    # Trades já reconciliados no passo 0 não entram na heurística — senão
+    # consumiriam uma posição de OUTRO trade e recriariam o mesmo furo.
+    trades_ja_ligados = set(mapa_lapide.values())
+
     for _, trade in trades.iterrows():
+        if trade["id_trade"] in trades_ja_ligados:
+            continue
         candidatas = posicoes[
             (posicoes["raiz_contrato"] == trade["ativo"])
             & (posicoes["data"] == trade["data_op"])
@@ -1130,7 +1375,10 @@ def reconciliar_com_mt5(dias_atras: int = 30) -> pd.DataFrame:
         })
 
     # Posições reais da conta sem nenhum trade logado correspondente —
-    # execuções que aconteceram mas não foram registradas no diário.
+    # execuções que aconteceram mas não foram registradas no diário. Ganha
+    # ativo/data/saldo_estimado (2026-07-21) pra virar uma linha PENDENTE
+    # de verdade no Histórico (ver listar_pendencias_diario), não só um
+    # número agregado no badge da aba Estatísticas.
     for _, pos in posicoes[~posicoes["usado"]].iterrows():
         linhas.append({
             "id_trade": None, "mt5_position_id": pos["position_id"],
@@ -1138,6 +1386,14 @@ def reconciliar_com_mt5(dias_atras: int = 30) -> pd.DataFrame:
             "mt5_ticket_saida": pos["tickets_saida"][-1] if pos["tickets_saida"] else None,
             "mt5_divergencia_reais": None, "confianca": None,
             "mt5_match_status": "sem_correspondencia_diario",
+            "ativo": pos.get("raiz_contrato"), "data": pos.get("data"),
+            "saldo_estimado": float(pos["profit_total"]) if pd.notna(pos.get("profit_total")) else None,
+            "contrato": pos.get("contrato"),
+            "tipo_operacao": "long" if pos.get("tipo") == "compra" else ("short" if pos.get("tipo") == "venda" else None),
+            "volume": float(pos["volume"]) if pd.notna(pos.get("volume")) else None,
+            "preco_entrada": float(pos["preco_entrada"]) if pd.notna(pos.get("preco_entrada")) else None,
+            "preco_saida": float(pos["preco_saida"]) if pd.notna(pos.get("preco_saida")) else None,
+            "datetime_entrada": pos.get("datetime_entrada"), "datetime_saida": pos.get("datetime_saida"),
         })
 
     resultado = pd.DataFrame(linhas, columns=COLUNAS_RECONCILIACAO)
@@ -1165,28 +1421,370 @@ def resumo_reconciliacao() -> dict:
     }
 
 
-# Thresholds de classificação de `avaliar_aderencia_sr` — primeiro palpite,
-# não validado ainda contra casos reais. Ajustar aqui depois de conferir a
-# olho 3-5 trades reais (mesmo padrão de validação empírica já usado no
-# projeto — nunca confiar de olhos fechados numa métrica nova).
-ADERENCIA_SR_ATR_PRECISO = 0.15
-ADERENCIA_SR_ATR_PROXIMO = 0.5
+def listar_pendencias_diario() -> pd.DataFrame:
+    """
+    Execuções REAIS na conta MT5 que não têm nenhum trade correspondente
+    logado no Diário (`mt5_match_status == 'sem_correspondencia_diario'`,
+    calculado por `reconciliar_com_mt5`, cache lido daqui — não dispara
+    reconciliação nova). 2026-07-21: pedido direto do Jesué depois de notar
+    que operações reais do dia não apareciam em lugar nenhum do Diário —
+    iam parar só num contador agregado no badge da aba Estatísticas
+    ("N sem registro no diário"), fácil de não notar. Agora o Histórico
+    (`_construir_diario_historico`/`_98`) funde essas linhas junto das
+    reais, com uma badge "PENDENTE" e um botão "Editar".
+
+    2026-07-21 (revisão): o botão "Editar" antes só trocava pra aba Novo
+    Trade sem carregar nada (Jesué reportou: "vai para a tela de novo trade
+    sem carregar as informações já capturadas do trade") — agora abre um
+    pop-up reaproveitando o MESMO formulário da aba Posição (`_bloco_
+    posicao_live`/`_bloco_posicao_form`), via `materializar_pendencia_como_
+    rascunho` — por isso esta função agora devolve os campos completos
+    (contrato/tipo_operacao/volume/preços/datas) capturados pelo MT5, não
+    só o resumo pro badge.
+
+    Retorna vazio se nenhuma reconciliação rodou ainda (mesmo caso de
+    `resumo_reconciliacao`) ou se não há pendência nenhuma.
+    """
+    colunas = ["mt5_position_id", "ativo", "data", "saldo_estimado",
+               "contrato", "tipo_operacao", "volume",
+               "preco_entrada", "preco_saida", "datetime_entrada", "datetime_saida"]
+    df = persistencia.carregar_reconciliacao()
+    if df is None or df.empty:
+        return pd.DataFrame(columns=colunas)
+    pendentes = df[df["mt5_match_status"] == "sem_correspondencia_diario"]
+    return pendentes[colunas].reset_index(drop=True)
 
 
-def avaliar_aderencia_sr(dias_atras: int | None = None) -> pd.DataFrame:
+def listar_pendencias_historico() -> pd.DataFrame:
+    """
+    União de TODAS as posições/execuções reais que ainda precisam virar um
+    trade classificado no Diário — 2026-07-21, pedido direto do Jesué
+    ("Posição fechada deve ir para o histórico automaticamente, com edição
+    pendente"). Antes, um fechamento capturado AO VIVO pela sincronização
+    (`sincronizar_posicoes_abertas`) só aparecia na aba Posição ("Pronta
+    pra Finalizar"); esta função traz ELE TAMBÉM pro Histórico, no mesmo
+    formato de pendência editável já usado pelas descobertas históricas da
+    reconciliação de 30 dias (ver `listar_pendencias_diario`).
+
+    Combina 2 fontes, sem duplicar:
+    1. `posicoes_abertas.parquet` com `status='fechada_pendente'` — pares
+       de hedge já mesclados (`detectar_pares_hedge`/`montar_posicao_
+       sintetica_par`) + avulsas fechadas sem par. Já são rascunhos reais,
+       "Editar" abre o pop-up direto, sem materializar nada.
+    2. `listar_pendencias_diario()` (reconciliação) — só as que NÃO
+       aparecem em (1) (a sincronização ao vivo ainda não as viu — coisas
+       de antes do processo estar rodando, ou fora da janela de 3s do
+       sync). "Editar" precisa materializar primeiro (ver
+       `materializar_pendencia_como_rascunho`).
+
+    `id_editar` é o valor usado como `index` do botão "Editar" — composto
+    `"ticket_a-ticket_b"` pra par de hedge (mesma convenção de
+    `finalizar_par_hedge`/`_parse_index_par`), ticket avulso (int) nos
+    outros 2 casos.
+    """
+    colunas = ["id_editar", "ativo", "data", "saldo_estimado"]
+    linhas = []
+    # BUG REAL 2026-07-27 (reincidência dos duplicados #154-158, agora #169-182):
+    # a lápide `tickets_finalizados.parquet` — que existe exatamente pra impedir
+    # finalizar o MESMO ticket duas vezes — era lida SÓ por
+    # `sincronizar_posicoes_abertas`, nunca aqui. Como `finalizar_posicao`
+    # REMOVE a linha de `posicoes_abertas.parquet` como último passo, e este
+    # `ids_ja_cobertos` era montado 100% a partir desse arquivo, finalizar
+    # DESPROTEGIA o ticket: a linha do cache de reconciliação (atualizado só a
+    # cada 5min, pelo processo PAI) voltava a aparecer como PENDENTE, e cada
+    # clique novo em "✓"/"Finalizar" gravava outro trade idêntico. O ticket
+    # 308536027 foi finalizado 14x assim. Começar o conjunto pela lápide
+    # resolve na raiz — e também some com pendências que já viraram trade há
+    # dias mas seguiam listadas (307609756 → #147, 307636545 → #149, ambos de
+    # 2026-07-16, ainda na tela em 2026-07-27).
+    # Além da lápide (ticket que já virou trade), o conjunto começa também com
+    # os tickets que o usuário marcou explicitamente como "não entra no
+    # Diário" (`ignorar_pendencia`, 2026-07-27) — senão uma operação real que
+    # ele conscientemente recusou voltaria como PENDENTE a cada ciclo.
+    ids_ja_cobertos = set(_tickets_ja_finalizados()) | set(_tickets_ignorados())
+
+    posicoes = listar_posicoes_abertas()
+    if posicoes is not None and not posicoes.empty:
+        # Qualquer ticket que a sincronização ao vivo já rastreia — mesmo
+        # ainda `aberta` (não fechada), sem par — nunca deve vir TAMBÉM da
+        # reconciliação histórica com um valor calculado por uma fórmula
+        # independente (`_parear_hedge_deals`/`agrupar_posicoes`, sobre
+        # deal history bruto, ciclo próprio de 5min). Reforço de robustez
+        # 2026-07-21 (varredura de bugs): antes só os tickets já pareados/
+        # fechados entravam aqui — um ticket simplesmente `aberta` e sem
+        # par ainda não era protegido, deixando margem pra um bug futuro
+        # em `agrupar_posicoes` classificar errado um ticket genuinamente
+        # ainda aberto como "pendente de classificação".
+        ids_ja_cobertos |= set(posicoes["id_posicao"])
+        fechadas = posicoes[posicoes["status"] == STATUS_POSICAO_FECHADA_PENDENTE]
+        pares = detectar_pares_hedge(posicoes)
+        tickets_pareados = {p["ticket_a"] for p in pares} | {p["ticket_b"] for p in pares}
+        # A data da pendência vem da ENTRADA, não da saída.
+        #
+        # BUG REAL 2026-07-28: usava `datetime_saida`, mas quando o fechamento
+        # real não é achado no MT5 o sync grava uma saída ESTIMADA com
+        # `datetime_saida = agora` (ver `sincronizar_posicoes_abertas`). Ou
+        # seja: uma operação de 27/07 aparecia na lista como 28/07, e ia
+        # "andando" de dia em dia enquanto não fosse registrada — justamente
+        # quando o usuário está conferindo o Diário contra o relatório da
+        # corretora POR DATA. Pior, era inconsistente com o que acontece ao
+        # finalizar: `finalizar_posicao`/`finalizar_par_hedge` gravam
+        # `data_op` a partir da ENTRADA. Agora a lista mostra a mesma data que
+        # o trade vai receber.
+        for par in pares:
+            data_entrada = par.get("datetime_entrada")
+            linhas.append({
+                "id_editar": f"{par['ticket_a']}-{par['ticket_b']}",
+                "ativo": par["ativo"],
+                "data": pd.Timestamp(data_entrada).date() if data_entrada is not None else None,
+                "saldo_estimado": par["pnl_reais"],
+            })
+            ids_ja_cobertos.add(par["ticket_a"])
+            ids_ja_cobertos.add(par["ticket_b"])
+        avulsas_fechadas = fechadas[~fechadas["id_posicao"].isin(tickets_pareados)]
+        for _, p in avulsas_fechadas.iterrows():
+            data_entrada = p.get("datetime_entrada")
+            linhas.append({
+                "id_editar": p["id_posicao"], "ativo": p["ativo"],
+                "data": pd.Timestamp(data_entrada).date() if pd.notna(data_entrada) else None,
+                "saldo_estimado": p.get("pnl_reais_final"),
+            })
+            ids_ja_cobertos.add(p["id_posicao"])
+
+    # `ids_ja_cobertos` mistura int puro (lápide), numpy.int64
+    # (`posicoes_abertas.parquet`) e a coluna `mt5_position_id` chega como
+    # float64 do parquet de reconciliação — normalizar os dois lados pra int
+    # de propósito, em vez de confiar na igualdade de hash entre tipos
+    # numéricos diferentes (funciona no CPython, mas é acidental demais pra
+    # sustentar uma trava contra gravação duplicada de dado real).
+    ids_ja_cobertos = {int(t) for t in ids_ja_cobertos if pd.notna(t)}
+    pend_reconciliacao = listar_pendencias_diario()
+    for _, p in pend_reconciliacao.iterrows():
+        if pd.isna(p["mt5_position_id"]):
+            continue
+        mt5_position_id = int(p["mt5_position_id"])
+        if mt5_position_id in ids_ja_cobertos:
+            continue  # sync ao vivo OU lápide já cobre esse ticket, não duplica
+        linhas.append({
+            "id_editar": mt5_position_id, "ativo": p["ativo"],
+            "data": p["data"], "saldo_estimado": p["saldo_estimado"],
+        })
+
+    resultado = pd.DataFrame(linhas, columns=colunas)
+    if not resultado.empty:
+        resultado = resultado.sort_values("data", ascending=False, na_position="last").reset_index(drop=True)
+    return resultado
+
+
+def materializar_pendencia_como_rascunho(id_editar) -> str | int | None:
+    """
+    Resolve um `id_editar` (ver `listar_pendencias_historico`) pro pop-up
+    de edição de pendência do Histórico — idempotente pros 3 casos
+    possíveis:
+
+    1. Composto `"ticket_a-ticket_b"` (par de hedge já capturado AO VIVO
+       pela sincronização) — os 2 tickets já existem de verdade em
+       `posicoes_abertas.parquet`, nada pra materializar; só confirma que
+       o par ainda existe (`detectar_pares_hedge`) e devolve o id como
+       veio.
+    2. Ticket avulso já em `posicoes_abertas.parquet` (sync ao vivo já
+       capturou, ou clique anterior já materializou) — devolve direto,
+       sem duplicar.
+    3. Ticket avulso só descoberto pela reconciliação histórica de 30 dias
+       (execução MT5 real sem trade logado, ver `listar_pendencias_
+       diario`) — materializa como um rascunho novo em `posicoes_abertas.
+       parquet` (`status='fechada_pendente'`), pra reaproveitar 100% do
+       formulário de classificação já construído pra aba Posição
+       (`_bloco_posicao_live`/`_bloco_posicao_form`/`finalizar_posicao`)
+       no pop-up, em vez de duplicar campos/callbacks inteiros só pra
+       esse caso. `saida_estimada=False` sempre aqui — ao contrário do
+       card "AGUARDANDO CONFIRMAÇÃO" da sincronização ao vivo (que pode
+       ter um preço de saída ainda não confirmado pela corretora), o
+       preço/data de saída já vêm de um deal HISTÓRICO real do MT5
+       (`mt5_loader.agrupar_posicoes`/`_parear_hedge_deals`), nunca uma
+       estimativa.
+
+    Retorna `None` se não conseguir resolver de nenhuma forma (ticket já
+    finalizado antes — ver a trava da lápide logo abaixo, par não existe
+    mais, ticket não existe em lugar nenhum, ou a trava do rascunho está
+    ocupada) — nesses casos o chamador simplesmente não abre o pop-up
+    (sem side-effect nenhum).
+    """
+    # BUG REAL 2026-07-27: sem esta trava, um clique numa linha PENDENTE que
+    # JÁ virou trade (tela stale, ou o cache de reconciliação de 5min ainda
+    # não tinha atualizado) recriava o rascunho do zero a partir do cache e
+    # deixava `finalizar_posicao` gravar o MESMO trade de novo — foi assim que
+    # o ticket 308536027 virou 14 trades. A checagem de idempotência que já
+    # existia aqui (linha do `df_existente` abaixo) só olhava
+    # `posicoes_abertas.parquet`, de onde `finalizar_posicao` justamente ACABA
+    # de remover a linha. A lápide é a única fonte que sobrevive ao finalizar.
+    # Ignorado explicitamente pelo usuário conta igual a já finalizado aqui:
+    # nos dois casos aquele ticket não pode virar rascunho de novo.
+    ja_finalizados = _tickets_ja_finalizados() | _tickets_ignorados()
+
+    texto = str(id_editar)
+    partes = texto.split("-") if "-" in texto else []
+    if len(partes) == 2:
+        try:
+            ticket_a, ticket_b = int(partes[0]), int(partes[1])
+        except ValueError:
+            return None
+        # Par: basta UMA perna já finalizada pra recusar — o trade líquido
+        # das duas já foi gravado (`finalizar_par_hedge` marca as 2 juntas).
+        if ticket_a in ja_finalizados or ticket_b in ja_finalizados:
+            return None
+        posicoes = listar_posicoes_abertas()
+        if posicoes is None or posicoes.empty:
+            return None
+        pares = detectar_pares_hedge(posicoes)
+        existe = any(p["ticket_a"] == ticket_a and p["ticket_b"] == ticket_b for p in pares)
+        return id_editar if existe else None
+
+    try:
+        mt5_position_id = int(id_editar)
+    except (TypeError, ValueError):
+        return None
+
+    if mt5_position_id in ja_finalizados:
+        return None
+
+    df_existente = persistencia.carregar_posicoes_abertas()
+    if df_existente is not None and not df_existente.empty and mt5_position_id in set(df_existente["id_posicao"]):
+        return mt5_position_id  # já é um rascunho real (sync ao vivo ou clique anterior) — reaproveita
+
+    df_pend = listar_pendencias_diario()
+    linha = df_pend[df_pend["mt5_position_id"] == mt5_position_id]
+    if linha.empty:
+        return None
+    p = linha.iloc[0]
+
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
+        if not adquirida:
+            return None
+        df = persistencia.carregar_posicoes_abertas()
+        if df is None:
+            df = pd.DataFrame(columns=COLUNAS_POSICOES_ABERTAS)
+        if not df.empty and mt5_position_id in set(df["id_posicao"]):
+            return mt5_position_id  # corrida com outro clique — já materializado nesse meio tempo
+
+        tipo_operacao = p.get("tipo_operacao")
+        preco_entrada = p.get("preco_entrada")
+        preco_saida = p.get("preco_saida")
+        pnl_pontos_final = None
+        if tipo_operacao and pd.notna(preco_entrada) and pd.notna(preco_saida):
+            pnl_pontos_final = _pnl_pontos(tipo_operacao, preco_entrada, preco_saida)
+
+        agora = datetime.now()
+        nova = {coluna: None for coluna in COLUNAS_POSICOES_ABERTAS}
+        nova.update({
+            "id_posicao": mt5_position_id, "ativo": p["ativo"], "contrato": p.get("contrato"),
+            "tipo_operacao": tipo_operacao, "volume": p.get("volume"),
+            "preco_entrada": preco_entrada, "datetime_entrada": p.get("datetime_entrada"),
+            "preco_atual": preco_saida,
+            "status": STATUS_POSICAO_FECHADA_PENDENTE,
+            "preco_saida": preco_saida, "datetime_saida": p.get("datetime_saida"),
+            "pnl_pontos_final": pnl_pontos_final,
+            "pnl_reais_final": float(p["saldo_estimado"]) if pd.notna(p.get("saldo_estimado")) else None,
+            "saida_estimada": False,
+            "criado_em": agora, "atualizado_em": agora,
+        })
+        df = pd.concat([df, pd.DataFrame([nova], columns=COLUNAS_POSICOES_ABERTAS)], ignore_index=True)
+        persistencia.salvar_posicoes_abertas(df)
+    return mt5_position_id
+
+
+_CAMPOS_CLASSIFICACAO_LISTA = (
+    "notas_cronologicas", "imagens_em_andamento",
+    "estrategia_tags_preliminar", "tags_emocionais_preliminar",
+)
+_CAMPOS_CLASSIFICACAO_ESCALAR = (
+    "sala_analise_preliminar", "alvo_pontos_preliminar", "stop_pontos_preliminar",
+    "nivel_sr_referencia_preliminar", "resumo_operacional_preliminar",
+    "emo_confianca_preliminar", "emo_humor_preliminar", "emo_energia_preliminar",
+    "emo_atencao_preliminar", "emo_presenca_preliminar", "sentimento_mercado_preliminar",
+)
+
+
+def descartar_rascunho_pendencia(id_posicao: int) -> bool:
+    """
+    Remove um rascunho `fechada_pendente` de `posicoes_abertas.parquet` sem
+    gravar nada no Diário — usado quando o usuário abre "Editar" numa
+    pendência do Histórico (ver `materializar_pendencia_como_rascunho`) e
+    confirma que aquele registro NÃO é uma operação real. Bug real
+    2026-07-21: sem isso, um rascunho aberto no pop-up e nunca finalizado
+    ficava órfão pra sempre em "AGUARDANDO CONFIRMAÇÃO" — indistinguível de
+    uma posição real (achado na varredura: ticket 306272514, 176925→176775,
+    congelado desde 2026-07-21 16:44).
+
+    Guarda-corpos deliberados (nunca some com dado do usuário em silêncio):
+    - Só remove linhas `status == STATUS_POSICAO_FECHADA_PENDENTE` — uma
+      posição `aberta` de verdade NUNCA é removida por esta função.
+    - Só remove se o rascunho ainda não tem NENHUMA classificação
+      preenchida (notas, tags, sala/análise, resumo, emocional etc.) — se o
+      usuário já começou a documentar a operação, esta função recusa e o
+      chamador deve orientar a passar por `finalizar_posicao`/
+      `finalizar_par_hedge` em vez de descartar.
+
+    Retorna True se removeu, False se não achou o ticket, se não está
+    elegível (aberta, ou já tem classificação), ou se a trava está ocupada.
+    """
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_posicoes_abertas()
+        if df is None or df.empty or id_posicao not in set(df["id_posicao"]):
+            return False
+        linha = df[df["id_posicao"] == id_posicao].iloc[0]
+        if linha["status"] != STATUS_POSICAO_FECHADA_PENDENTE:
+            return False
+        if any(len(_para_lista(linha.get(campo))) > 0 for campo in _CAMPOS_CLASSIFICACAO_LISTA):
+            return False
+        for campo in _CAMPOS_CLASSIFICACAO_ESCALAR:
+            valor = linha.get(campo)
+            if valor is not None and pd.notna(valor) and valor != '':
+                return False
+        df_restante = df[df["id_posicao"] != id_posicao]
+        persistencia.salvar_posicoes_abertas(df_restante)
+    return True
+
+
+# Thresholds de classificação de `avaliar_aderencia_tracados` — movidos
+# pra config_backtest.py (2026-07-21, Fase 3.3) junto das outras
+# constantes candidatas a ajuste fino automático do Modo Aprendizagem —
+# ver cfg.ADERENCIA_SR_ATR_PRECISO/_PROXIMO e cfg.AJUSTE_FINO_ALLOWLIST.
+ADERENCIA_SR_ATR_PRECISO = cfg.ADERENCIA_SR_ATR_PRECISO
+ADERENCIA_SR_ATR_PROXIMO = cfg.ADERENCIA_SR_ATR_PROXIMO
+
+
+def avaliar_aderencia_tracados(dias_atras: int | None = None) -> pd.DataFrame:
     """
     Compara, para cada trade com `nivel_sr_referencia` preenchido, o nível
-    marcado à mão por Jesué contra o que o motor via no instante do save
-    (`snapshot_mercado_json`, capturado por `metricas.montar_snapshot_diario`
-    em `registrar_trade`). Responde "o motor via esse nível?" — relatório
+    marcado à mão por Jesué contra os TRAÇADOS que estavam ativos no
+    instante do save (`snapshot_mercado_json['tracados']`, capturado por
+    `metricas.montar_snapshot_diario` em `registrar_trade`). Responde "o
+    motor leu direito a força do traçado perto desse nível?" — relatório
     de REVISÃO MANUAL, nunca ajuste automático de peso/lógica (volume de
     dados baixo demais pra isso ser seguro, mesma decisão já tomada pra
     reconciliação MT5).
 
+    Substitui `avaliar_aderencia_sr` (2026-07-21, Fase 3.2 do Modo
+    Aprendizagem) — o motor automático de S/R foi desativado
+    (`cfg.AUTO_DETECCAO_SR_ATIVA=False`), então a pergunta antiga ("o motor
+    via esse nível SOZINHO?", contra `niveis_sr_acima/abaixo`) deixou de
+    fazer sentido; a nova compara contra os traçados que o próprio Jesué
+    desenhou.
+
     Só considera trades com `nivel_sr_referencia` E `snapshot_mercado_json`
-    preenchidos — linhas migradas/antigas não têm snapshot e ficam de fora
-    automaticamente. `dias_atras`, se informado, restringe por `data_op`
-    (mesmo parâmetro de `reconciliar_com_mt5`).
+    preenchidos E o snapshot contendo pelo menos 1 traçado — trades
+    migrados/antigos (sem a chave `tracados`, ou salvos num instante sem
+    nenhum traçado ativo) ficam de fora automaticamente, mesmo raciocínio
+    de sempre pra dado que não dá pra comparar. `dias_atras`, se
+    informado, restringe por `data_op` (mesmo parâmetro de
+    `reconciliar_com_mt5`).
     """
     df = listar_trades()
     if dias_atras is not None:
@@ -1205,16 +1803,18 @@ def avaliar_aderencia_sr(dias_atras: int | None = None) -> pd.DataFrame:
 
         preco_snapshot = snapshot.get("preco")
         atr = snapshot.get("atr")
-        if preco_snapshot is None:
+        tracados_snap = snapshot.get("tracados")
+        if preco_snapshot is None or not tracados_snap:
             continue
 
         lado = "abaixo" if nivel_ref < preco_snapshot else "acima"
-        candidatos = snapshot.get(f"niveis_sr_{lado}") or []
+        tipo_esperado = "suporte" if lado == "abaixo" else "resistencia"
+        candidatos = [t for t in tracados_snap if t.get("tipo") == tipo_esperado and t.get("preco") is not None]
 
         casado = None
         diferenca_atr = None
         if candidatos:
-            casado = min(candidatos, key=lambda n: abs((n.get("preco") or 0) - nivel_ref))
+            casado = min(candidatos, key=lambda t: abs(t["preco"] - nivel_ref))
             diferenca_pts = abs(casado["preco"] - nivel_ref)
             diferenca_atr = (diferenca_pts / atr) if atr else None
 
@@ -1231,18 +1831,22 @@ def avaliar_aderencia_sr(dias_atras: int | None = None) -> pd.DataFrame:
             "id_trade": trade["id_trade"], "data_op": trade["data_op"], "ativo": trade["ativo"],
             "nivel_sr_referencia": nivel_ref, "nivel_sr_tipo_informado": trade.get("nivel_sr_tipo"),
             "lado_geometrico": lado,
-            "nivel_motor_preco": casado.get("preco") if casado else None,
-            "nivel_motor_rank": casado.get("rank") if casado else None,
+            "tracado_preco": casado.get("preco") if casado else None,
+            "tracado_id": casado.get("id_tracado") if casado else None,
             "diferenca_atr": diferenca_atr,
             "forte": casado.get("forte") if casado else None,
-            "status": casado.get("status") if casado else None,
+            "toques": casado.get("toques") if casado else None,
             "prob_bounce": casado.get("prob_bounce") if casado else None,
-            "rompimento_hoje": casado.get("rompimento_hoje") if casado else None,
+            "postura": casado.get("postura") if casado else None,
+            "magnitude_esperada": casado.get("magnitude_esperada") if casado else None,
+            "combustivel_score": casado.get("combustivel_score") if casado else None,
+            "aproximacao_score": casado.get("aproximacao_score") if casado else None,
+            "rejeicao_score": casado.get("rejeicao_score") if casado else None,
             "classificacao": classificacao,
         })
 
-    resultado = pd.DataFrame(linhas, columns=COLUNAS_ADERENCIA_SR)
-    persistencia.salvar_aderencia_sr(resultado)
+    resultado = pd.DataFrame(linhas, columns=COLUNAS_ADERENCIA_TRACADOS)
+    persistencia.salvar_aderencia_tracados(resultado)
     return resultado
 
 
@@ -1292,7 +1896,7 @@ def detectar_padroes_comportamentais(df: pd.DataFrame | None = None) -> pd.DataF
     a migração do xlsm por ter processado as linhas em ordem; não é
     garantia absoluta, só a melhor aproximação disponível sem horário real).
 
-    Relatório de REVISÃO MANUAL, mesmo espírito de `avaliar_aderencia_sr`/
+    Relatório de REVISÃO MANUAL, mesmo espírito de `avaliar_aderencia_tracados`/
     `reconciliar_com_mt5` — Jesué julga, nada se ajusta sozinho.
 
     Cada comparação decide sozinha a precisão via `_avaliar_janela_
@@ -1559,6 +2163,70 @@ def _tickets_ja_finalizados() -> set[int]:
     return set(int(t) for t in df["id_posicao"])
 
 
+COLUNAS_TICKETS_IGNORADOS = ["id_posicao", "motivo", "ignorado_em"]
+
+
+def ignorar_pendencia(id_editar, motivo: str = "") -> bool:
+    """Marca uma operação REAL do MT5 como "não entra no Diário", em
+    definitivo — some da lista PENDENTE e nunca mais volta.
+
+    Necessário desde 2026-07-27: a reconciliação reporta como pendente toda
+    operação real sem trade correspondente, então uma que o usuário
+    conscientemente NÃO quer registrar reaparecia a cada ciclo, pra sempre. A
+    única forma de calar era registrá-la — ou seja, aceitar justamente o que
+    se queria recusar.
+
+    Caso real que motivou: o relatório de performance da corretora é filtrado
+    por CARTEIRA, então operações da conta que estão fora da carteira
+    acompanhada não constam nele. O Jesué decidiu que o relatório é o guia até
+    27/07 — essas operações existem no MT5, mas não fazem parte do Diário.
+
+    `id_editar` aceita as duas formas da lista de pendências: ticket avulso ou
+    par de hedge `"a-b"` (aí os 2 tickets são marcados). Reversível apagando a
+    linha de `tickets_ignorados.parquet`.
+    """
+    texto = str(id_editar)
+    partes = texto.split("-") if "-" in texto else []
+    try:
+        tickets = ([int(partes[0]), int(partes[1])] if len(partes) == 2
+                   else [int(id_editar)])
+    except (TypeError, ValueError):
+        return False
+
+    df = persistencia.carregar_tickets_ignorados()
+    if df is None:
+        df = pd.DataFrame(columns=COLUNAS_TICKETS_IGNORADOS)
+    ja = set(df["id_posicao"]) if not df.empty else set()
+    novas = [{"id_posicao": t, "motivo": motivo or None, "ignorado_em": datetime.now()}
+             for t in tickets if t not in ja]
+    if not novas:
+        return True  # já estava ignorado — idempotente
+    df = pd.concat([df, pd.DataFrame(novas, columns=COLUNAS_TICKETS_IGNORADOS)],
+                   ignore_index=True)
+    persistencia.salvar_tickets_ignorados(df)
+    return True
+
+
+def _tickets_ignorados() -> set[int]:
+    df = persistencia.carregar_tickets_ignorados()
+    if df is None or df.empty:
+        return set()
+    return set(int(t) for t in df["id_posicao"])
+
+
+def _mapa_tickets_finalizados() -> dict[int, int]:
+    """`{id_posicao_mt5: id_trade}` — o vínculo IDENTITÁRIO entre um ticket do
+    MT5 e o trade que ele virou, gravado por `_marcar_tickets_finalizados`.
+
+    Usado por `reconciliar_com_mt5`: é infinitamente mais confiável que o
+    casamento heurístico por `(ativo, data)` de lá, e é a única forma de saber
+    que as DUAS pernas de um par de hedge pertencem ao MESMO trade."""
+    df = persistencia.carregar_tickets_finalizados()
+    if df is None or df.empty:
+        return {}
+    return {int(t): int(i) for t, i in zip(df["id_posicao"], df["id_trade"])}
+
+
 def sincronizar_posicoes_abertas(df_posicoes_mt5: pd.DataFrame | None) -> pd.DataFrame | None:
     """
     Diff entre as posições REALMENTE abertas agora no MT5
@@ -1708,7 +2376,17 @@ def sincronizar_posicoes_abertas(df_posicoes_mt5: pd.DataFrame | None) -> pd.Dat
                 pd.Timestamp(linhas_por_id[tid]["datetime_entrada"]) for tid in tickets_fechados_agora
             )
             inicio = min(entrada_mais_antiga, agora - timedelta(hours=24)) - timedelta(minutes=5)
-            df_deals = mt5_loader.buscar_execucoes_periodo(inicio, agora)
+            try:
+                df_deals = mt5_loader.buscar_execucoes_periodo(inicio, agora)
+            except Exception:
+                # Mesmo espírito do resto da função pra falha de MT5: uma
+                # falha SÓ nesta etapa (detecção de fechamento) não pode
+                # abortar a função inteira e impedir que posições novas/
+                # ainda abertas (já lidas com sucesso acima) sejam
+                # persistidas — bug real 2026-07-21, ver
+                # dashboard.py::_sincronizar_posicoes_background.
+                _log_sync.exception('Falha em buscar_execucoes_periodo (detecção de fechamento)')
+                df_deals = None
             posicoes_fechadas = (
                 mt5_loader.agrupar_posicoes(df_deals) if df_deals is not None
                 else pd.DataFrame(columns=["position_id"])
@@ -1766,19 +2444,55 @@ def detectar_pares_hedge(df_posicoes: pd.DataFrame) -> list[dict]:
     hedging (não netting), então uma ordem OCO (SL/TP) que dispara vira uma
     posição NOVA e independente no MT5 em vez de fechar a original (2
     posições opostas coexistindo, nunca 1 só). Pura, sem I/O — mesmo padrão
-    de `avaliar_aderencia_sr`/`detectar_padroes_comportamentais` (computada
+    de `avaliar_aderencia_tracados`/`detectar_padroes_comportamentais` (computada
     fresca a cada render, nunca persistida à parte).
 
     Considera elegíveis posições com status `aberta` OU
-    `fechada_pendente` — um par pode existir mesmo que uma ponta ainda não
-    tenha sido corrigida pelo ciclo de sync seguinte (ver auto-recuperação
-    em `sincronizar_posicoes_abertas`).
+    `fechada_pendente` — um par pode existir mesmo que a perna de ENTRADA
+    ainda não tenha sido corrigida pelo ciclo de sync seguinte (ver
+    auto-recuperação em `sincronizar_posicoes_abertas`).
 
     A perna aberta PRIMEIRO (menor `datetime_entrada`) é a "entrada" do
     trade líquido (direção dela vira a direção do trade); a perna mais
     NOVA é a "saída" (economicamente equivale a fechar a primeira no preço
     da segunda). Volume diferente = sem par nesta v1 (hedge parcial fica
     documentado como fora de escopo, não silenciosamente errado).
+
+    Achado real 2026-07-22 (dia em que todas as posições fecharam): quando
+    a perna de SAÍDA (a que nasceu do SL/TP de A) TAMBÉM fecha por conta
+    própria, ela passa a ter um resultado econômico PRÓPRIO (da entrada
+    dela até o fechamento real/estimado dela) — diferente de simplesmente
+    usar o preço de ENTRADA dela como "saída confirmada" de A (o que é só
+    uma aproximação válida enquanto ela ainda está aberta). As duas coisas
+    continuam representando 1 ÚNICA operação do ponto de vista do usuário
+    (pedido dele: "não quero sujeira do MT5 no diário, quero 1 linha por
+    operação"), então o par continua sendo formado nos dois casos — só o
+    CÁLCULO muda:
+    - Se a perna de saída ainda está `aberta`: usa o preço de ENTRADA dela
+      como fechamento de A (matemática exata pra um hedge travado — o P&L
+      combinado das 2 pernas é invariante ao preço de mercado atual).
+    - Se a perna de saída TAMBÉM já fechou (`fechada_pendente`, e a perna
+      de entrada também): soma o resultado JÁ REAL/estimado de cada perna
+      (`pnl_reais_final` de cada uma) — nunca descarta o que a perna de
+      saída rendeu depois de "nascer". `saida_estimada` do par vira True
+      se qualquer uma das pernas ainda depende de estimativa (preço real
+      de fechamento ainda não confirmado pelo cruzamento do MT5).
+
+    Considera elegíveis posições com status `aberta` OU
+    `fechada_pendente` — um par pode existir mesmo que a perna de ENTRADA
+    ainda não tenha sido corrigida pelo ciclo de sync seguinte (ver
+    auto-recuperação em `sincronizar_posicoes_abertas`).
+
+    A perna aberta PRIMEIRO (menor `datetime_entrada`) é a "entrada" do
+    trade líquido (direção dela vira a direção do trade); a perna mais
+    NOVA é a "saída" (economicamente equivale a fechar a primeira no preço
+    da segunda). Volume diferente = sem par nesta v1 (hedge parcial fica
+    documentado como fora de escopo, não silenciosamente errado).
+
+    As 2 pernas também precisam ter aberto no MESMO DIA de pregão (bug real
+    2026-07-27, ver comentário no loop de candidatos) — um par de hedge nasce
+    sempre no mesmo pregão, e sem essa trava o pareamento fabricava trades
+    misturando entrada de um dia com saída de outro.
 
     Retorna uma lista de dicts, um por par encontrado — cada posição só
     entra em NO MÁXIMO 1 par (a primeira correspondência de mesmo volume
@@ -1806,27 +2520,83 @@ def detectar_pares_hedge(df_posicoes: pd.DataFrame) -> list[dict]:
             ]
             if candidatos.empty:
                 continue
-            short_pos = candidatos.iloc[0]
+
+            # Tenta cada candidato até achar um em que a perna de ENTRADA
+            # esteja pronta (aberta, ou já fechada — ver docstring): se a
+            # de SAÍDA ainda está aberta, forma o par direto; se ela
+            # também já fechou, só forma o par se a de ENTRADA também já
+            # tiver um resultado próprio resolvido (senão a entrada ainda
+            # está genuinamente em aberto, não dá pra combinar um número
+            # final ainda).
+            short_pos = None
+            perna_entrada = perna_saida = None
+            for _, candidato in candidatos.iterrows():
+                if long_pos["datetime_entrada"] <= candidato["datetime_entrada"]:
+                    entrada_cand, saida_cand = long_pos, candidato
+                else:
+                    entrada_cand, saida_cand = candidato, long_pos
+                # BUG REAL 2026-07-27 (trade #167, R$ -225 fabricado): sem
+                # nenhuma restrição de tempo, este pareamento casou um WDO
+                # short aberto em 22/07 11:55 com uma posição de 23/07 —
+                # entrada de um dia, saída de outro, gerando um prejuízo que
+                # nunca existiu. Um par de hedge SEMPRE nasce no mesmo pregão
+                # (é a ordem OCO/SL-TP da própria posição disparando, minutos
+                # ou horas depois), então exigir o mesmo dia elimina a classe
+                # inteira de par falso sem perder nenhum par legítimo. Sem
+                # par, cada perna segue pelo caminho avulso normal — que
+                # mostra o número real do MT5, nunca um valor inventado.
+                mesmo_dia = (
+                    pd.Timestamp(entrada_cand["datetime_entrada"]).date()
+                    == pd.Timestamp(saida_cand["datetime_entrada"]).date()
+                )
+                if not mesmo_dia:
+                    continue
+                saida_aberta = saida_cand["status"] == STATUS_POSICAO_ABERTA
+                ambas_resolvidas = (
+                    saida_cand["status"] == STATUS_POSICAO_FECHADA_PENDENTE
+                    and entrada_cand["status"] == STATUS_POSICAO_FECHADA_PENDENTE
+                )
+                if saida_aberta or ambas_resolvidas:
+                    short_pos = candidato
+                    perna_entrada, perna_saida = entrada_cand, saida_cand
+                    break
+            if short_pos is None:
+                continue
+
             usados.add(long_pos["id_posicao"])
             usados.add(short_pos["id_posicao"])
 
-            if long_pos["datetime_entrada"] <= short_pos["datetime_entrada"]:
-                perna_entrada, perna_saida = long_pos, short_pos
-            else:
-                perna_entrada, perna_saida = short_pos, long_pos
-
-            pnl_pontos = _pnl_pontos(perna_entrada["tipo_operacao"],
-                                      perna_entrada["preco_entrada"], perna_saida["preco_entrada"])
             valor_ponto = cfg.VALOR_PONTO.get(perna_entrada["ativo"], 0.0)
-            pnl_reais = pnl_pontos * valor_ponto * perna_entrada["volume"]
+            if perna_saida["status"] == STATUS_POSICAO_ABERTA:
+                # Perna de saída ainda aberta: preço de ENTRADA dela é um
+                # fato confirmado, serve de "fechamento" de A.
+                pnl_pontos = _pnl_pontos(perna_entrada["tipo_operacao"],
+                                          perna_entrada["preco_entrada"], perna_saida["preco_entrada"])
+                pnl_reais = pnl_pontos * valor_ponto * perna_entrada["volume"]
+                preco_saida, datetime_saida = perna_saida["preco_entrada"], perna_saida["datetime_entrada"]
+                saida_estimada = False
+            else:
+                # As duas já fecharam por conta própria: soma o resultado
+                # JÁ REAL/estimado de cada uma (nunca descarta o que a
+                # perna de saída rendeu depois de "nascer" do hedge).
+                pnl_reais_entrada = perna_entrada.get("pnl_reais_final")
+                if pnl_reais_entrada is None or pd.isna(pnl_reais_entrada):
+                    pnl_reais_entrada = perna_entrada.get("pnl_reais") or 0.0
+                pnl_reais_saida = perna_saida.get("pnl_reais_final")
+                if pnl_reais_saida is None or pd.isna(pnl_reais_saida):
+                    pnl_reais_saida = perna_saida.get("pnl_reais") or 0.0
+                pnl_reais = float(pnl_reais_entrada) + float(pnl_reais_saida)
+                pnl_pontos = pnl_reais / (valor_ponto * perna_entrada["volume"]) if valor_ponto else None
+                preco_saida, datetime_saida = perna_saida.get("preco_saida"), perna_saida.get("datetime_saida")
+                saida_estimada = bool(perna_entrada.get("saida_estimada")) or bool(perna_saida.get("saida_estimada"))
 
             pares.append({
                 "ticket_a": int(perna_entrada["id_posicao"]), "ticket_b": int(perna_saida["id_posicao"]),
                 "contrato": contrato, "ativo": perna_entrada["ativo"], "volume": perna_entrada["volume"],
                 "tipo_operacao": perna_entrada["tipo_operacao"],
                 "preco_entrada": perna_entrada["preco_entrada"], "datetime_entrada": perna_entrada["datetime_entrada"],
-                "preco_saida": perna_saida["preco_entrada"], "datetime_saida": perna_saida["datetime_entrada"],
-                "pnl_pontos": pnl_pontos, "pnl_reais": pnl_reais,
+                "preco_saida": preco_saida, "datetime_saida": datetime_saida,
+                "pnl_pontos": pnl_pontos, "pnl_reais": pnl_reais, "saida_estimada": saida_estimada,
             })
     return pares
 
@@ -1868,11 +2638,15 @@ def montar_posicao_sintetica_par(par: dict, df_posicoes: pd.DataFrame) -> dict:
     Herda notas/imagens/tags preliminares da perna de ENTRADA (é "o trade"
     do ponto de vista do usuário — mesma decisão de `finalizar_par_hedge`).
     `status` sempre `fechada_pendente` (o par É um fechamento real, pronto
-    pra finalizar), `saida_estimada` sempre `False` (não é estimativa, é o
-    preço real da perna que fechou) — `par_hedge=True` marca explicitamente
-    a origem sintética, pra UI distinguir do card antigo de "saída não
-    confirmada" (são situações diferentes: aqui a saída É confirmada, só
-    que veio de uma posição oposta, não de uma perna OUT no mesmo ticket).
+    pra finalizar). `saida_estimada` vem do PRÓPRIO par (ver
+    `detectar_pares_hedge` — bug real 2026-07-22: antes vinha sempre
+    `False`, mesmo quando a perna de saída já tinha fechado sozinha usando
+    uma estimativa, o que mostrava "✓ confirmado" pra um valor que ainda
+    dependia de confirmação real do MT5) — `par_hedge=True` marca
+    explicitamente a origem sintética, pra UI distinguir do card antigo de
+    "saída não confirmada" (são situações diferentes: aqui a saída pode
+    ser confirmada OU estimada, só que vem de uma posição oposta, não de
+    uma perna OUT no mesmo ticket).
     """
     linha_entrada = df_posicoes[df_posicoes["id_posicao"] == par["ticket_a"]].iloc[0].to_dict()
     sintetica = dict(linha_entrada)
@@ -1886,7 +2660,7 @@ def montar_posicao_sintetica_par(par: dict, df_posicoes: pd.DataFrame) -> dict:
         "status": STATUS_POSICAO_FECHADA_PENDENTE,
         "preco_saida": par["preco_saida"], "datetime_saida": par["datetime_saida"],
         "pnl_pontos_final": par["pnl_pontos"], "pnl_reais_final": par["pnl_reais"],
-        "saida_estimada": False,
+        "saida_estimada": par.get("saida_estimada", False),
         "par_hedge": True,
     })
     return sintetica
@@ -1931,7 +2705,9 @@ def atualizar_rascunho(
     UI do Diário — deve mostrar erro/retry visível) ou se `id_posicao` não
     existe na tabela.
     """
-    with persistencia.lock_posicoes_abertas(tentativas=8, espera_segundos=0.15) as adquirida:
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
         if not adquirida:
             return False
         df = persistencia.carregar_posicoes_abertas()
@@ -1963,6 +2739,68 @@ def atualizar_rascunho(
         return True
 
 
+def remover_imagem_rascunho(id_posicao: int, nome_arquivo: str) -> bool:
+    """
+    Tira UM print da galeria de um rascunho (`imagens_em_andamento`) —
+    pedido do Jesué em 2026-07-27: "a thumb do print deve ter um X que
+    aparece ao passar o mouse, caso eu queira remover um print do trade".
+    Antes só dava pra anexar; um print colado por engano ficava lá até o
+    trade ser finalizado.
+
+    O arquivo em disco só é apagado se NENHUM outro registro citar aquele
+    nome — nem outro rascunho (`imagens_em_andamento`), nem um trade já
+    gravado (`imagem_arquivo`/`imagens_adicionais`). É barato conferir e
+    evita o pior caso possível aqui: sumir com a capa de um trade antigo
+    por causa de um clique numa tela de rascunho. Se estiver em uso, só a
+    referência deste rascunho sai e o arquivo continua onde está.
+
+    Retorna False se a trava estiver ocupada, se `id_posicao` não existir
+    ou se aquele nome não estiver na galeria dele.
+    """
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_posicoes_abertas()
+        if df is None or df.empty or id_posicao not in set(df["id_posicao"]):
+            return False
+        idx = df.index[df["id_posicao"] == id_posicao][0]
+        imagens = _para_lista(df.at[idx, "imagens_em_andamento"])
+        if nome_arquivo not in imagens:
+            return False
+        df.at[idx, "imagens_em_andamento"] = [i for i in imagens if i != nome_arquivo]
+        df.at[idx, "atualizado_em"] = datetime.now()
+        persistencia.salvar_posicoes_abertas(df)
+        df_restante = df
+
+    if not _imagem_em_uso(nome_arquivo, df_restante):
+        caminho = cfg.PASTA_DIARIO_IMAGENS / nome_arquivo
+        try:
+            caminho.unlink()
+        except (FileNotFoundError, OSError):
+            pass  # arquivo já sumiu ou está travado — a referência já saiu, que é o que importa
+    return True
+
+
+def _imagem_em_uso(nome_arquivo: str, df_posicoes: pd.DataFrame | None) -> bool:
+    """`nome_arquivo` ainda é citado por algum rascunho ou trade gravado?
+    Usado por `remover_imagem_rascunho` antes de apagar o arquivo do disco."""
+    if df_posicoes is not None and not df_posicoes.empty:
+        for valor in df_posicoes["imagens_em_andamento"]:
+            if nome_arquivo in _para_lista(valor):
+                return True
+    df_trades = persistencia.carregar_diario()
+    if df_trades is None or df_trades.empty:
+        return False
+    if (df_trades["imagem_arquivo"] == nome_arquivo).any():
+        return True
+    for valor in df_trades["imagens_adicionais"]:
+        if nome_arquivo in _para_lista(valor):
+            return True
+    return False
+
+
 def corrigir_saida_rascunho(id_posicao: int, preco_saida: float, datetime_saida) -> bool:
     """
     Corrige `preco_saida`/`datetime_saida` de um rascunho cuja saída veio do
@@ -1976,7 +2814,9 @@ def corrigir_saida_rascunho(id_posicao: int, preco_saida: float, datetime_saida)
 
     Retorna False se a trava estiver ocupada ou `id_posicao` não existir.
     """
-    with persistencia.lock_posicoes_abertas(tentativas=8, espera_segundos=0.15) as adquirida:
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
         if not adquirida:
             return False
         df = persistencia.carregar_posicoes_abertas()
@@ -2028,12 +2868,24 @@ def finalizar_posicao(
     notas é concatenado em `obs`.
 
     Retorna o `id_trade` criado, ou None se a trava do rascunho estiver
-    ocupada, se `id_posicao` não existir, ou se `registrar_trade` falhar
-    (trava do diário ocupada) — nesses casos o rascunho é preservado
-    intacto, nunca perdido.
+    ocupada, se `id_posicao` não existir, se o ticket JÁ tiver sido
+    finalizado antes (ver a trava de idempotência abaixo), ou se
+    `registrar_trade` falhar (trava do diário ocupada) — nesses casos o
+    rascunho é preservado intacto, nunca perdido.
     """
-    with persistencia.lock_posicoes_abertas(tentativas=8, espera_segundos=0.15) as adquirida:
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
         if not adquirida:
+            return None
+        # TRAVA DE IDEMPOTÊNCIA (bug real 2026-07-27) — dentro da trava, antes
+        # de qualquer escrita. As guardas de UI (botão que some, lista que
+        # filtra) são defesa secundária e sempre furam: clique duplo rápido,
+        # aba stale, e os DOIS processos do Diário (8052/8053) rodando ao mesmo
+        # tempo contra os mesmos parquets. Só uma checagem aqui, no caminho de
+        # escrita, garante de fato "1 ticket = no máximo 1 trade". Sem ela o
+        # ticket 308536027 virou 14 trades (#169-182) em 90 segundos.
+        if int(id_posicao) in _tickets_ja_finalizados():
             return None
         df = persistencia.carregar_posicoes_abertas()
         if df is None or df.empty or id_posicao not in set(df["id_posicao"]):
@@ -2099,7 +2951,9 @@ def finalizar_posicao(
         return None  # trava do diário ocupada — rascunho preservado, usuário tenta de novo
     _marcar_tickets_finalizados([id_posicao], id_trade)
 
-    with persistencia.lock_posicoes_abertas(tentativas=8, espera_segundos=0.15) as adquirida:
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
         if not adquirida:
             return id_trade  # trade já gravado; remoção do rascunho fica pro próximo ciclo/tentativa
         df = persistencia.carregar_posicoes_abertas()
@@ -2129,12 +2983,30 @@ def finalizar_par_hedge(
     pra rastreabilidade (qual ordem MT5 gerou o fechamento).
 
     Retorna o `id_trade` criado, ou None se a trava estava ocupada, se
-    algum dos 2 tickets não existir mais, ou se `registrar_trade` falhar
-    (mesmas condições de `finalizar_posicao`) — nesses casos as 2 linhas
-    do rascunho são preservadas intactas.
+    algum dos 2 tickets não existir mais, se qualquer uma das 2 pernas JÁ
+    tiver sido finalizada antes (ver a trava de idempotência abaixo), ou se
+    `registrar_trade` falhar (mesmas condições de `finalizar_posicao`) —
+    nesses casos as 2 linhas do rascunho são preservadas intactas.
+
+    Bug real 2026-07-22: esta função recalculava pnl/preço de saída do
+    zero (entrada-vs-entrada), duplicando — e divergindo de — a lógica já
+    corrigida em `detectar_pares_hedge` (que soma o resultado REAL de cada
+    perna quando ambas já fecharam, em vez de descartar o que a perna de
+    saída rendeu depois). Agora reaproveita o par já calculado por
+    `detectar_pares_hedge` como ÚNICA fonte de verdade — nunca recalcula
+    por conta própria.
     """
-    with persistencia.lock_posicoes_abertas(tentativas=8, espera_segundos=0.15) as adquirida:
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
         if not adquirida:
+            return None
+        # TRAVA DE IDEMPOTÊNCIA — ver `finalizar_posicao` pro raciocínio
+        # completo (bug real 2026-07-27). Basta UMA perna já marcada pra
+        # recusar: as 2 são marcadas juntas quando o par é finalizado, então
+        # uma perna na lápide já significa "este trade líquido já foi gravado".
+        ja_finalizados = _tickets_ja_finalizados()
+        if int(ticket_a) in ja_finalizados or int(ticket_b) in ja_finalizados:
             return None
         df = persistencia.carregar_posicoes_abertas()
         if df is None or df.empty:
@@ -2143,6 +3015,11 @@ def finalizar_par_hedge(
         if ticket_a not in ids_presentes or ticket_b not in ids_presentes:
             return None
 
+        par = next((p for p in detectar_pares_hedge(df)
+                    if {p["ticket_a"], p["ticket_b"]} == {ticket_a, ticket_b}), None)
+        if par is None:
+            return None  # não são mais um par elegível (ex: mudou de eligibilidade entre a leitura e o clique)
+
         linha_a = df[df["id_posicao"] == ticket_a].iloc[0].to_dict()
         linha_b = df[df["id_posicao"] == ticket_b].iloc[0].to_dict()
         if linha_a["datetime_entrada"] <= linha_b["datetime_entrada"]:
@@ -2150,10 +3027,8 @@ def finalizar_par_hedge(
         else:
             perna_entrada, perna_saida = linha_b, linha_a
 
-        pnl_pontos = _pnl_pontos(perna_entrada["tipo_operacao"],
-                                  perna_entrada["preco_entrada"], perna_saida["preco_entrada"])
-        valor_ponto = cfg.VALOR_PONTO.get(perna_entrada["ativo"], 0.0)
-        pnl_reais = pnl_pontos * valor_ponto * perna_entrada["volume"]
+        pnl_pontos, pnl_reais = par["pnl_pontos"], par["pnl_reais"]
+        preco_saida_par, datetime_saida_par = par["preco_saida"], par["datetime_saida"]
 
         notas = _para_lista(perna_entrada.get("notas_cronologicas"))
         narrativa = "\n".join(f"[{n['hora']}] {n['texto']}" for n in notas) or None
@@ -2183,9 +3058,17 @@ def finalizar_par_hedge(
             "ativo": perna_entrada["ativo"], "contrato": perna_entrada["contrato"],
             "tipo_operacao": perna_entrada["tipo_operacao"], "lote": perna_entrada["volume"],
             "preco_entrada": perna_entrada["preco_entrada"], "datetime_entrada": perna_entrada["datetime_entrada"],
-            "preco_saida": perna_saida["preco_entrada"], "datetime_saida": perna_saida["datetime_entrada"],
+            # `preco_saida`/`datetime_saida` exibidos vêm do PAR (real/
+            # estimado combinado, ver detectar_pares_hedge) — nunca mais
+            # só o preço de entrada da perna de saída, que ficou
+            # desatualizado assim que ela também fecha por conta própria.
+            "preco_saida": preco_saida_par, "datetime_saida": datetime_saida_par,
             "resultado_pontos": pnl_pontos, "saldo_operacao_reais": pnl_reais,
             "data_op": pd.Timestamp(perna_entrada["datetime_entrada"]).date(),
+            # `tipo_saida` (stop/alvo/manual) continua comparando contra o
+            # preço de ENTRADA da perna de saída de propósito — é o que
+            # realmente fechou A (o SL/TP de A disparando é o que criou a
+            # perna B), independente do que aconteceu com B depois.
             "tipo_saida": derivar_tipo_saida(
                 perna_entrada["tipo_operacao"], perna_entrada["preco_entrada"], perna_saida["preco_entrada"],
                 perna_entrada.get("sl"), perna_entrada.get("tp"),
@@ -2206,7 +3089,9 @@ def finalizar_par_hedge(
         return None
     _marcar_tickets_finalizados([ticket_a, ticket_b], id_trade)
 
-    with persistencia.lock_posicoes_abertas(tentativas=8, espera_segundos=0.15) as adquirida:
+    with persistencia.lock_posicoes_abertas(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
         if not adquirida:
             return id_trade
         df = persistencia.carregar_posicoes_abertas()

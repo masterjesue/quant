@@ -581,30 +581,77 @@ def agrupar_posicoes(df_deals: pd.DataFrame) -> pd.DataFrame:
     isso, `pernas_out` ficava vazio pra esses casos e o fechamento real
     nunca era encontrado.
     """
-    colunas = ['position_id', 'raiz_contrato', 'tipo', 'preco_entrada', 'preco_saida',
+    colunas = ['position_id', 'raiz_contrato', 'contrato', 'tipo', 'preco_entrada', 'preco_saida',
                'datetime_entrada', 'datetime_saida', 'volume', 'profit_total',
                'tickets_entrada', 'tickets_saida']
     if df_deals.empty:
         return pd.DataFrame(columns=colunas)
 
+    def _media_ponderada(pernas):
+        """Preço médio ponderado pelo volume de um conjunto de fills."""
+        vol = float(pernas['volume'].sum())
+        if vol <= 0:
+            return float(pernas['preco'].iloc[0])
+        return float((pernas['preco'] * pernas['volume']).sum() / vol)
+
     linhas = []
     for position_id, grupo in df_deals.groupby('position_id'):
+        # Ordenar por tempo é obrigatório: `history_deals_get` não garante
+        # ordem, e daqui pra baixo o código depende de "primeiro fill" e
+        # "último fill" (hora de entrada/saída da posição).
+        grupo = grupo.sort_values('time')
         pernas_in = grupo[grupo['entry'] == 0]
         pernas_out = grupo[grupo['entry'].isin([1, 2, mt5.DEAL_ENTRY_OUT_BY])]
         if pernas_in.empty:
             continue
 
         primeira_in = pernas_in.iloc[0]
+        # Preenchimento parcial (2026-07-27, revisão do motor): uma posição de
+        # N contratos pode chegar como VÁRIOS fills — 2 deals de 1 lote em vez
+        # de 1 deal de 2. Antes o código lia volume e preço só do PRIMEIRO
+        # fill, então uma entrada 1+1 virava volume 1 e o resultado saía pela
+        # metade, divergindo do relatório da corretora. Agora volume é a soma
+        # dos fills e o preço é a média ponderada por volume — que é como a
+        # corretora reporta a operação.
+        volume_total = float(pernas_in['volume'].sum())
+        preco_entrada = _media_ponderada(pernas_in)
+        preco_saida = _media_ponderada(pernas_out) if not pernas_out.empty else None
+        profit_total = float(pernas_out['profit'].sum()) if not pernas_out.empty else 0.0
+
+        # Achado real 2026-07-21: um fechamento via DEAL_ENTRY_OUT_BY (a
+        # perna oposta que fecha esta posição, ver docstring acima) grava
+        # `profit=0.0` no PRÓPRIO deal de saída no MT5, mesmo com o preço
+        # claramente tendo se movido — a conta é hedging, não netting, e o
+        # MT5 não calcula lucro líquido pra esse tipo de fechamento (o
+        # ticket fica com profit zerado por definição do próprio terminal,
+        # não é falha de leitura nossa). Confirmado com o ticket real
+        # 306272514 (WIN long 176.925→176.775, -150pts reais, `profit` cru
+        # do MT5 veio 0.0 para as 2 pernas). Sem isso, `reconciliar_com_mt5`
+        # reportava essas posições como pendências com saldo R$0,00
+        # fabricado, mesmo já tendo um preço de saída real — sintoma
+        # parecido mas causa DIFERENTE do bug de posições hedge órfãs (ver
+        # `diario_trade._parear_hedge_deals`, que só mexe em posições SEM
+        # preço de saída nenhum). Corrige recalculando pelo movimento de
+        # preço só quando o MT5 devolver exatamente zero com um preço de
+        # saída diferente do de entrada — nunca sobrescreve um profit
+        # real (não-zero) já reportado pelo MT5.
+        if profit_total == 0.0 and preco_saida is not None and preco_saida != preco_entrada:
+            bruto = preco_saida - preco_entrada
+            pnl_pontos = bruto if primeira_in['tipo'] == 'compra' else -bruto
+            valor_ponto = cfg.VALOR_PONTO.get(primeira_in['raiz_contrato'], 0.0)
+            profit_total = pnl_pontos * valor_ponto * volume_total
+
         linhas.append({
             'position_id': position_id,
             'raiz_contrato': primeira_in['raiz_contrato'],
+            'contrato': primeira_in['symbol'],
             'tipo': primeira_in['tipo'],
-            'preco_entrada': primeira_in['preco'],
-            'preco_saida': pernas_out.iloc[-1]['preco'] if not pernas_out.empty else None,
+            'preco_entrada': preco_entrada,
+            'preco_saida': preco_saida,
             'datetime_entrada': primeira_in['time'],
             'datetime_saida': pernas_out.iloc[-1]['time'] if not pernas_out.empty else None,
-            'volume': primeira_in['volume'],
-            'profit_total': float(pernas_out['profit'].sum()) if not pernas_out.empty else 0.0,
+            'volume': volume_total,
+            'profit_total': profit_total,
             'tickets_entrada': list(pernas_in['ticket']),
             'tickets_saida': list(pernas_out['ticket']),
         })

@@ -20,6 +20,13 @@ leitura assistida por IA (Gemini).
 ## Ativos e timeframe
 
 - **Ativos:** WIN (índice futuro) e WDO (dólar futuro) — `cfg.ATIVOS`.
+  - ⚠️ **Duas listas, de propósito** (2026-07-28): `cfg.ATIVOS` = ativos que o
+    MOTOR processa (candle/tick/features — é o que `csv_loader` e os
+    dashboards varrem); `cfg.ATIVOS_DIARIO` = ativos que o DIÁRIO aceita
+    registrar, conjunto maior. Hoje `ATIVOS_DIARIO` inclui **BIT** (futuro de
+    Bitcoin), operado de fato mas ainda sem pipeline de dados — ver
+    `spec_implementacao_bit.md`. Ao acrescentar um ativo, saber em qual das
+    duas ele entra.
 - **Timeframe:** M5 (5 minutos) — único timeframe hoje, ver nota MTF na
   seção "Frentes futuras" abaixo.
 
@@ -118,11 +125,32 @@ data/
     ├── WDO_candles.parquet        ← candles M5 + features calculadas
     ├── WDO_metadata.parquet       ← metadados de atualização (última busca, etc.)
     ├── WIN_candles.parquet
-    └── WIN_metadata.parquet
+    ├── WIN_metadata.parquet
+    │
+    │   ── Diário de Trade (dado INSUBSTITUÍVEL: não se regenera com
+    │      run_backtest.py, ao contrário dos candles) ──
+    ├── diario_trades.parquet      ← os trades definitivos
+    ├── posicoes_abertas.parquet   ← rascunhos ao vivo/pendentes de classificação
+    ├── tickets_finalizados.parquet ← "lápide": ticket MT5 que JÁ virou trade.
+    │                                 Impede o mesmo ticket virar 2 trades
+    │                                 (ver CHANGELOG 2026-07-27)
+    ├── tickets_ignorados.parquet  ← operação real do MT5 que o usuário decidiu
+    │                                 que NÃO entra no Diário. Distinto da
+    │                                 lápide: lá o ticket virou trade, aqui
+    │                                 nunca vai virar
+    ├── diario_reconciliacao.parquet ← cache do casamento MT5 × Diário (5 min)
+    ├── diario_estrategias.parquet, diario_tags_*.parquet, diario_rr_presets.parquet
+    ├── diario_checkin.parquet, diario_roda_vida.parquet   ← Bem-Estar
+    └── diario_imagens/            ← prints anexados aos trades
 ```
 
 Nunca editar os Parquet diretamente — sempre via `persistencia.py`
 (chamado por `merge_fontes.py`/`run_backtest.py --features`).
+
+`persistencia._salvar_parquet_atomico` grava num `.tmp<pid>.parquet` e troca
+com `os.replace`. Se o processo morrer no meio, o temporário fica órfão — a
+limpeza roda na primeira gravação de cada processo e só apaga `.tmp` cujo PID
+não corresponde a processo vivo (ver `testes/teste_limpeza_temporarios.py`).
 
 ---
 

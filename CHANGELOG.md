@@ -103,6 +103,67 @@ Lista viva — mover pra uma entrada datada quando resolvida, apagar daqui.
 
 ---
 
+## 2026-07-27 a 2026-07-28 — Motor MT5→Diário: duplicidade, pernas de hedge e alinhamento anual
+
+Detalhe cru (causa raiz de cada bug, com arquivo:linha) em
+`LOG_VARREDURA_BUGS.md`. Aqui só o porquê.
+
+**1. Um ticket virava vários trades.** `tickets_finalizados.parquet` existe pra
+impedir isso e registrou o ticket `308536027` sendo finalizado **14 vezes** —
+a marca era gravada certo e nunca lida. `finalizar_posicao` remove a linha de
+`posicoes_abertas.parquet` como último passo, e era só dali que
+`listar_pendencias_historico` se protegia: finalizar *desprotegia* o ticket.
+A lápide virou autoridade em 3 pontos, e a garantia real é uma trava de
+idempotência **dentro do lock** de `finalizar_posicao`/`finalizar_par_hedge` —
+guarda de UI sempre fura (clique duplo, aba stale, os 2 processos do Diário).
+
+**2. "O botão não faz nada" — duas causas.** (a) `prevent_initial_call` NÃO
+cobre inserção dinâmica: os botões do pop-up são criados com `n_clicks=0` e
+essa inserção dispara a callback. Sem guarda, *abrir* o pop-up já apagava o
+rascunho (`descartar_pendencia_editar`) e zerava a store que o "Finalizar"
+usaria pra fechar a janela. (b) Callbacks acopladas a ids de outra aba: o Dash
+rejeita a callback INTEIRA, em silêncio. Resolvido com um store global de
+invalidação (`store-diario-refresh`) — ação nenhuma escreve direto na tabela.
+Regra que fica: **callback que grava ou apaga dado nunca age com `n_clicks`
+falsy.**
+
+**3. Pernas de hedge viravam operações fantasma.** Conta hedging: 1 operação =
+2 posições no MT5. `_parear_hedge_deals` só fundia pernas SEM preço de saída —
+quando a corretora cruza as duas (OUT_BY), ambas ganham saída e escapavam. E
+como o MT5 devolve `profit=0` nesse cruzamento, cada perna tinha o resultado
+recalculado **separadamente**: uma operação de −R$30 virava duas de −R$30.
+Nova `_fundir_pernas_fechadas_espelhadas`, com assinatura apertada (mesmo
+contrato, volume, dia, direções opostas e **preços espelhados**).
+`agrupar_posicoes` também passou a somar volume e usar média ponderada — antes
+lia só o primeiro fill, então uma entrada parcial 1+1 saía **pela metade**.
+
+**4. Alinhamento do ano contra o ProfitPro.** De 162 operações/+R$33 para
+206/−R$351, batendo dia a dia. Faltavam fevereiro e março inteiros. Ferramenta
+nova `testes/auditar_vs_profit.py` compara Diário × export da corretora.
+
+**Erro meu, registrado de propósito:** apaguei 3 operações reais baseado num
+export de julho que estava **incompleto**, tratando ausência no relatório como
+prova de inexistência — mesmo com o MT5 dizendo que existiam. O export anual
+provou o contrário e elas foram restauradas. Lição: conferir a janela e o
+total de linhas do relatório antes de tratar uma falta como definitiva.
+
+**5. Recusar uma operação.** Faltava dizer "isto não entra no Diário": a
+reconciliação reportava a operação a cada ciclo e a única forma de calar era
+registrá-la. Novo `tickets_ignorados.parquet` + `ignorar_pendencia`, ligado ao
+botão "Descartar".
+
+**6. Groundwork de BIT.** 2 operações de BITG26 expuseram que `cfg.ATIVOS`
+misturava "ativo que o motor processa" com "ativo que o Diário registra".
+Separado em `ATIVOS_DIARIO`; `VALOR_PONTO["BIT"]=0.01` (validado contra o MT5:
+`tick_value 0.2 / tick_size 20`). Implementação completa planejada em
+`spec_implementacao_bit.md`.
+
+**7. Suíte de testes.** Nasceu `testes/` — 60+ asserts, com forte peso em
+casos NEGATIVOS (o que não pode ser fundido, apagado ou engolido), mais uma
+auditoria estática que reprova acoplamento de callback entre abas.
+
+---
+
 ## 2026-07-04
 
 ### Correção — clustering limitado a uma janela recente (fim da "grade densa")

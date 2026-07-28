@@ -76,6 +76,30 @@
     transform: translateX(22px); background: var(--panel);
 }
 
+/* Switch de Modo Aprendizagem (Configurações, 2026-07-21) — mesmo visual
+   do tema, mas com callback de SERVIDOR de verdade (persiste em
+   config_operacional.py, não é cosmético). O callback Python só escreve
+   `className` do próprio elemento (nunca recria via `children`) — mesma
+   lição de .tracado-tool-btn/.diario-estrela: n_clicks de um componente
+   recriado reseta e causa cliques fantasma. */
+.modo-aprendizagem-toggle {
+    position: relative; display: inline-block; width: 46px; height: 24px;
+    border-radius: 999px; background: var(--border);
+    border: 1px solid var(--border); cursor: pointer;
+    transition: background 0.15s ease; flex-shrink: 0; vertical-align: middle;
+}
+.modo-aprendizagem-toggle-knob {
+    position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+    border-radius: 50%; background: var(--text);
+    transition: transform 0.15s ease, background 0.15s ease;
+}
+.modo-aprendizagem-toggle.modo-aprendizagem-toggle--ativo {
+    background: var(--gold); border-color: var(--gold);
+}
+.modo-aprendizagem-toggle.modo-aprendizagem-toggle--ativo .modo-aprendizagem-toggle-knob {
+    transform: translateX(22px); background: var(--panel);
+}
+
 /* Feedback visual dos botões WIN/WDO/WIN×WDO — antes o clique era "seco"
    (sem hover, sem estado pressionado). Ver CHANGELOG.md 2026-07-04. */
 .btn-ativo:hover {
@@ -346,4 +370,166 @@
     -webkit-user-drag: none;
     transform-origin: 0 0;
     will-change: transform;
+}
+
+/* Widget de tags "de verdade" (ver assets/tag_input.js /
+   diario_app_classico.py::_campo_tag_widget) — bug real 2026-07-22: o CSS
+   nunca tinha sido escrito, o widget renderizava como divs cruas sem
+   estilo nenhum. */
+.tag-widget-dica {
+    font-size: 11px;
+    color: var(--text2);
+    margin-bottom: 4px;
+}
+.tag-widget-caixa {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    min-height: 40px;
+}
+.tag-widget-caixa:focus-within {
+    border-color: var(--gold);
+}
+.tag-widget-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.tag-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 6px 4px 10px;
+    background: var(--bolha-neutra);
+    border-radius: 999px;
+    font-size: 12px;
+    color: var(--text);
+    white-space: nowrap;
+}
+.tag-chip-remover {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text2);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+}
+.tag-chip-remover:hover {
+    background: var(--border);
+    color: var(--text);
+}
+/* Miniatura de print com "×" de remover que só aparece no hover
+   (pedido 2026-07-27) — ver `_thumb_com_remover` em diario_app_classico.py.
+   O × fica fora do fluxo (position:absolute) pra não empurrar a imagem, e a
+   área de clique é generosa o bastante pra acertar sem precisar de precisão. */
+.diario-thumb-wrap {
+    position: relative;
+    display: inline-block;
+    line-height: 0;
+}
+.diario-thumb-x {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    line-height: 18px;
+    text-align: center;
+    font-size: 14px;
+    font-weight: 700;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--red);
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .12s ease;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, .35);
+}
+.diario-thumb-wrap:hover .diario-thumb-x,
+.diario-thumb-x:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+.diario-thumb-x:hover {
+    background: var(--red);
+    color: var(--bg);
+}
+
+/* No Dash 4.x o `dcc.Input` renderiza um wrapper
+   (`<div class="...tag-widget-input"><input class="dash-input-element">`),
+   então a regra precisa valer nos DOIS níveis: o wrapper faz o layout dentro
+   da caixa de chips, e o input de dentro precisa perder as bordas/fundo
+   próprios pra parecer parte da caixa, não um segundo campo dentro dela.
+   Ver `_campo_tag_widget` e `assets/tag_input.js` (bug real 2026-07-27). */
+.tag-widget-input {
+    flex: 1 1 120px;
+    min-width: 100px;
+    border: none;
+    outline: none;
+    background: transparent;
+    font-size: 13px;
+    color: var(--text);
+    padding: 4px 2px;
+}
+.tag-widget-input .dash-input-element {
+    width: 100%;
+    border: none;
+    outline: none;
+    background: transparent;
+    font-size: 13px;
+    font-family: inherit;
+    color: var(--text);
+    padding: 0;
+    box-shadow: none;
+}
+.tag-widget-sugestoes:empty {
+    display: none;
+}
+.tag-widget-rodape {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 6px;
+}
+.tag-widget-contador {
+    font-size: 11px;
+    color: var(--text2);
+}
+.tag-widget-limpar {
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-size: 11px;
+    color: var(--text2);
+    cursor: pointer;
+}
+.tag-widget-limpar:hover {
+    border-color: var(--gold);
+    color: var(--gold);
+}
+
+/* Pedido real 2026-07-22: "deixe a informação 'ABERTA' piscando" — ver
+   diario_app_classico.py::_bloco_posicao_live. */
+@keyframes diario-piscar {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+.diario-status-piscante {
+    animation: diario-piscar 1.4s ease-in-out infinite;
 }

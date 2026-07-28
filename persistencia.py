@@ -7,6 +7,8 @@
 # =============================================================================
 
 import os
+import json
+import re
 import time
 import pandas as pd
 from pathlib import Path
@@ -107,9 +109,86 @@ def _salvar_parquet_atomico(caminho: Path, df: pd.DataFrame):
     vence" continua sendo o comportamento, só que sem nunca expor um
     arquivo quebrado no meio do caminho.
     """
+    _limpar_temporarios_orfaos(caminho.parent)
     caminho_tmp = caminho.with_name(f"{caminho.stem}.tmp{os.getpid()}{caminho.suffix}")
     df.to_parquet(caminho_tmp, index=False)
     os.replace(caminho_tmp, caminho)
+
+
+_TEMPORARIOS_JA_LIMPOS = False
+
+
+def _limpar_temporarios_orfaos(pasta: Path):
+    """Remove `*.tmp<pid>.parquet` deixados para trás por um processo que
+    morreu ENTRE o `to_parquet` e o `os.replace` — nesse intervalo o
+    temporário existe e nada o apaga.
+
+    Achado real 2026-07-28: 7 órfãos somando 17 MB acumulados em
+    `data/base_processada/`, a maioria de dashboards encerrados à força
+    durante a sessão de correções. Não quebram nada, mas crescem para sempre.
+
+    Só apaga o que comprovadamente NÃO tem dono: o PID embutido no nome não
+    corresponde a nenhum processo vivo. Idade não serve de critério sozinha —
+    uma gravação concorrente legítima e demorada (`run_backtest --features`
+    sobre a base inteira) teria seu temporário apagado no meio do caminho,
+    trocando um desperdício de disco por corrupção de dado.
+
+    Roda uma vez por processo (a primeira gravação) — é varredura de
+    diretório, não faz sentido repetir a cada save.
+    """
+    global _TEMPORARIOS_JA_LIMPOS
+    if _TEMPORARIOS_JA_LIMPOS:
+        return
+    _TEMPORARIOS_JA_LIMPOS = True
+    try:
+        for tmp in pasta.glob("*.tmp*.parquet"):
+            achado = re.search(r"\.tmp(\d+)\.parquet$", tmp.name)
+            if not achado:
+                continue
+            pid = int(achado.group(1))
+            if pid == os.getpid() or _processo_vivo(pid):
+                continue
+            try:
+                tmp.unlink()
+            except OSError:
+                pass  # em uso por outro processo — deixa pro próximo ciclo
+    except OSError:
+        pass  # pasta inacessível: limpeza é oportunista, nunca impede a escrita
+
+
+def _processo_vivo(pid: int) -> bool:
+    """Existe um processo com este PID?
+
+    Em caso de dúvida devolve True: o custo de manter um órfão é disco, o de
+    apagar um temporário vivo é dado corrompido.
+
+    `os.kill(pid, 0)` — o truque POSIX de sempre — NÃO serve no Windows: pra
+    PID inexistente ele levanta `OSError [WinError 87] Parâmetro incorreto`, e
+    não `ProcessLookupError`. Tratar isso como "não sei" faria a limpeza nunca
+    apagar nada aqui (este projeto roda em Windows). Daí o caminho via
+    `OpenProcess` da API do Windows.
+    """
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ERRO_ACESSO_NEGADO = 5      # existe, mas sem permissão de consultar
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if handle:
+            k32.CloseHandle(handle)
+            return True
+        return k32.GetLastError() == ERRO_ACESSO_NEGADO
+    try:
+        os.kill(pid, 0)          # sinal 0 = só testa a existência
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True              # existe, mas é de outro usuário
+    except OSError:
+        return True
+    return True
 
 
 def salvar_candles(ativo: str, df: pd.DataFrame):
@@ -286,25 +365,134 @@ def carregar_reconciliacao() -> pd.DataFrame | None:
     return pd.read_parquet(caminho)
 
 
-def _caminho_aderencia_sr() -> Path:
-    return cfg.PASTA_BASE_PROCESSADA / "diario_aderencia_sr.parquet"
+def _caminho_aderencia_tracados() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_aderencia_tracados.parquet"
 
 
-def salvar_aderencia_sr(df: pd.DataFrame):
+def salvar_aderencia_tracados(df: pd.DataFrame):
     """
-    Salva a tabela de aderência S/R (nível marcado à mão × snapshot do
-    motor) — tabela separada da principal, mesmo motivo de
-    `salvar_reconciliacao`: recomputável a qualquer momento, não histórico
-    imutável do próprio trade.
-    """
+    Salva a tabela de aderência aos traçados (nível marcado à mão × traçados
+    ativos no snapshot do motor) — tabela separada da principal, mesmo
+    motivo de `salvar_reconciliacao`: recomputável a qualquer momento, não
+    histórico imutável do próprio trade. Substitui `salvar_aderencia_sr`
+    (2026-07-21, Fase 3.2 — motor automático de S/R desativado)."""
     cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(_caminho_aderencia_sr(), index=False)
-    print(f"[persistencia] aderência S/R: {len(df)} linhas salvas em {_caminho_aderencia_sr()}")
+    df.to_parquet(_caminho_aderencia_tracados(), index=False)
+    print(f"[persistencia] aderência aos traçados: {len(df)} linhas salvas em {_caminho_aderencia_tracados()}")
 
 
-def carregar_aderencia_sr() -> pd.DataFrame | None:
-    """Carrega a tabela de aderência S/R salva. Retorna None se ainda não existir."""
-    caminho = _caminho_aderencia_sr()
+def carregar_aderencia_tracados() -> pd.DataFrame | None:
+    """Carrega a tabela de aderência aos traçados salva. Retorna None se
+    ainda não existir."""
+    caminho = _caminho_aderencia_tracados()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def _caminho_log_recalibracao() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "aprendizagem_log_recalibracao.parquet"
+
+
+def salvar_log_recalibracao(entrada: dict):
+    """Acrescenta 1 registro ao log de recalibração do Modo Aprendizagem
+    (`aprendizagem.rodar_recalibracao`) — APPEND-ONLY, nunca sobrescreve:
+    diferente de `salvar_aderencia_tracados`/`salvar_reconciliacao`
+    (caches recomputáveis, sempre a versão mais recente vence), este é uma
+    trilha de AUDITORIA — cada rodada precisa continuar visível depois,
+    mesmo que a próxima rodada mude de opinião."""
+    caminho = _caminho_log_recalibracao()
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    linha = pd.DataFrame([{
+        'timestamp': entrada.get('timestamp'),
+        'modo_aprendizagem_ativo': entrada.get('modo_aprendizagem_ativo'),
+        'status': entrada.get('status'),
+        'n_amostras': entrada.get('n_amostras'),
+        'por_postura_json': json.dumps(entrada.get('por_postura', {}), ensure_ascii=False),
+        'sugestoes_json': json.dumps(entrada.get('sugestoes', []), ensure_ascii=False),
+    }])
+    if caminho.exists():
+        existente = pd.read_parquet(caminho)
+        linha = pd.concat([existente, linha], ignore_index=True)
+    _salvar_parquet_atomico(caminho, linha)
+    print(f"[persistencia] log de recalibração: +1 linha ({len(linha)} total) em {caminho}")
+
+
+def carregar_log_recalibracao() -> pd.DataFrame | None:
+    """Carrega o log de recalibração (histórico completo, todas as
+    rodadas). Retorna None se `rodar_recalibracao` nunca rodou ainda."""
+    caminho = _caminho_log_recalibracao()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# SUGESTÕES ESTRUTURAIS (Modo Aprendizagem, Fase 3.4, 2026-07-21) — qualquer
+# achado que NÃO seja "mover um número dentro de um limite" (ver
+# cfg.AJUSTE_FINO_ALLOWLIST) vira uma entrada aqui, pra eu (Claude Code)
+# implementar manualmente numa sessão futura — nunca virou código sozinho.
+# Mesma trava+escrita atômica de `tracados` (tabela pequena, CRUD real —
+# criar/listar/mudar status —, não um cache recomputável nem um log
+# append-only puro).
+# -----------------------------------------------------------------------------
+
+def _caminho_sugestoes_estruturais() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "aprendizagem_sugestoes_estruturais.parquet"
+
+
+def _caminho_sugestoes_estruturais_lock() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / '.sugestoes_estruturais.lock'
+
+
+@contextmanager
+def lock_sugestoes_estruturais():
+    """Mesmo mecanismo de `lock_tracados()` — colisão real é rara (uma
+    sugestão nova por vez, criada por mim durante uma sessão, ou o status
+    mudado manualmente por Jesué)."""
+    caminho = _caminho_sugestoes_estruturais_lock()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+
+    if caminho.exists():
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+        except FileNotFoundError:
+            idade = 0
+        if idade > _LOCK_STALE_SEGUNDOS:
+            try:
+                caminho.unlink()
+            except FileNotFoundError:
+                pass
+
+    try:
+        fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        try:
+            caminho.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def salvar_sugestoes_estruturais(df: pd.DataFrame):
+    """Salva a tabela de sugestões estruturais inteira — escrita atômica
+    (mesmo motivo de `salvar_tracados`: nunca expor um arquivo parcial a
+    um leitor concorrente, ex. o painel de Configurações lendo enquanto
+    uma sugestão nova é adicionada)."""
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    _salvar_parquet_atomico(_caminho_sugestoes_estruturais(), df)
+
+
+def carregar_sugestoes_estruturais() -> pd.DataFrame | None:
+    """Carrega a tabela de sugestões estruturais. Retorna None se nenhuma
+    foi registrada ainda."""
+    caminho = _caminho_sugestoes_estruturais()
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)
@@ -559,6 +747,36 @@ def salvar_tickets_finalizados(df: pd.DataFrame):
 
 def carregar_tickets_finalizados() -> pd.DataFrame | None:
     caminho = _caminho_tickets_finalizados()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# TICKETS IGNORADOS — operações reais do MT5 que o usuário decidiu que NÃO
+# entram no Diário (2026-07-27). Diferente de `tickets_finalizados`: lá o
+# ticket virou um trade; aqui ele nunca vai virar, por decisão explícita.
+#
+# Por que precisa existir: a reconciliação lê o MT5 e reporta como pendente
+# toda operação real sem trade correspondente. Se o usuário conscientemente
+# não quer aquela operação no Diário (ex: o relatório de performance da
+# corretora, filtrado por carteira, não a considera parte da estratégia), sem
+# esta lista ela reaparece como PENDENTE a cada ciclo, pra sempre — e a única
+# forma de calar era registrá-la, ou seja, aceitar o que se queria recusar.
+# Ver `diario_trade.ignorar_pendencia`/`_tickets_ignorados`.
+# -----------------------------------------------------------------------------
+
+def _caminho_tickets_ignorados() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "tickets_ignorados.parquet"
+
+
+def salvar_tickets_ignorados(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    _salvar_parquet_atomico(_caminho_tickets_ignorados(), df)
+
+
+def carregar_tickets_ignorados() -> pd.DataFrame | None:
+    caminho = _caminho_tickets_ignorados()
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)

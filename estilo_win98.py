@@ -347,14 +347,21 @@ def win98_taskbar(tray_children=None) -> html.Div:
 # `[j for j in JANELAS if j['implementada']]` em vez de um slice hardcoded).
 JANELAS = [
     {'id': 'win-quantlab',     'titulo': 'Quant Lab',     'icone': '/assets/icons/my-computer.png', 'start_closed': False, 'implementada': True},
-    {'id': 'win-price-action', 'titulo': 'Price Action',  'icone': '/assets/icons/find-file.png',   'start_closed': False, 'implementada': True},
-    {'id': 'win-big-players',  'titulo': 'Big Players',   'icone': '/assets/icons/favorites.png',   'start_closed': False, 'implementada': True},
-    {'id': 'win-tracados',     'titulo': 'Traçados',      'icone': '/assets/icons/grafico.png',     'start_closed': True,  'implementada': True},
+    # Rastreador logo depois do Quant Lab (Hero+Market View) — mesma ordem
+    # visual de dashboard.py (Modo Aprendizagem.txt, 2026-07-20). Deixa de
+    # começar fechada: ganhou os 4 níveis (antes só MME21 único), merece
+    # mais destaque que um placeholder oculto.
+    {'id': 'win-rastreador',   'titulo': 'Rastreador de Tendência', 'icone': '/assets/icons/rastreador.png', 'start_closed': False, 'implementada': True},
+    # 'win-price-action' foi removida daqui — fundida dentro de
+    # 'win-tracados' (Modo Aprendizagem.txt, 2026-07-20; ver
+    # dashboard_98.py). Título da janela mudou pra "Price Action" (é isso
+    # que ela representa agora), id continua 'win-tracados' por
+    # compatibilidade com os stores/callbacks já existentes.
+    {'id': 'win-tracados',     'titulo': 'Price Action',  'icone': '/assets/icons/grafico.png',     'start_closed': False, 'implementada': True},
     {'id': 'win-diario',       'titulo': 'Diário',        'icone': '/assets/icons/notepad.png',     'start_closed': True,  'implementada': True},
     {'id': 'win-posicao',      'titulo': 'Posição',       'icone': '/assets/icons/network.png',     'start_closed': True,  'implementada': True},
-    {'id': 'win-rastreador',   'titulo': 'Rastreador de Tendência', 'icone': '/assets/icons/rastreador.png', 'start_closed': True, 'implementada': True},
     {'id': 'win-backtesting',  'titulo': 'Backtesting',   'icone': '/assets/icons/calculator.png',  'start_closed': True,  'implementada': False},
-    {'id': 'win-config',       'titulo': 'Configurações', 'icone': '/assets/icons/settings.png',    'start_closed': True,  'implementada': False},
+    {'id': 'win-config',       'titulo': 'Configurações', 'icone': '/assets/icons/settings.png',    'start_closed': True,  'implementada': True},
 ]
 
 

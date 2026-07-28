@@ -641,3 +641,56 @@ html, body, #react-entry-point {
     transform-origin: 0 0;
     will-change: transform;
 }
+
+/* Pedido real 2026-07-22: "deixe a informação 'ABERTA' piscando" — ver
+   diario_app_98.py::_bloco_posicao_live_98. */
+@keyframes diario-piscar {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+.diario-status-piscante {
+    animation: diario-piscar 1.4s ease-in-out infinite;
+}
+
+/* "×" de remover print numa miniatura, visível só no hover (pedido
+   2026-07-27) — ver diario_app_98.py::_thumb_com_remover_98 e o gêmeo em
+   assets/style.css. Aqui com a cara do '98: quadrado, borda dura, sem
+   arredondamento nem transição. */
+.diario-thumb-wrap {
+    position: relative;
+    display: inline-block;
+    line-height: 0;
+}
+.diario-thumb-x {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    line-height: 16px;
+    text-align: center;
+    font-size: 12px;
+    font-weight: 700;
+    font-family: 'MS Sans Serif', Tahoma, sans-serif;
+    background: #C0C0C0;
+    color: #800000;
+    border-top: 1px solid #FFFFFF;
+    border-left: 1px solid #FFFFFF;
+    border-right: 1px solid #000000;
+    border-bottom: 1px solid #000000;
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+}
+.diario-thumb-wrap:hover .diario-thumb-x,
+.diario-thumb-x:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+}
+.diario-thumb-x:active {
+    border-top: 1px solid #000000;
+    border-left: 1px solid #000000;
+    border-right: 1px solid #FFFFFF;
+    border-bottom: 1px solid #FFFFFF;
+}

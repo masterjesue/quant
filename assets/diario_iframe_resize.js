@@ -54,20 +54,45 @@
     // lado FILHO acima): se em algum momento voltarem a chegar mensagens de
     // altura crescendo sem parar, para de aplicar em vez de deixar a
     // página crescer pra sempre e travar a aba.
-    var ALTURA_MAXIMA = 20000;
-    var mensagensRecentes = 0;
-    var janelaContagem = null;
+    //
+    // BUG REAL (achado 2026-07-22, "Finalizar"/"Editar" sem nenhum efeito
+    // de clique — nem o feedback visual do próprio botão): a versão
+    // anterior contava mensagens numa janela de 2s que se REARMAVA a cada
+    // mensagem nova (mesmo as ignoradas) — em uso normal (Histórico com
+    // 160+ trades, popup abrindo, sync de 6s da aba Posição), várias
+    // mensagens legítimas de altura podiam chegar em sequência rápida sem
+    // nunca ficar 2s em silêncio, prendendo o disjuntor ligado PRA SEMPRE
+    // depois de disparado uma vez — o iframe parava de crescer, e
+    // qualquer botão renderizado abaixo da altura congelada ficava fora
+    // da área clicável do <iframe> (cortado por `overflow:hidden` no
+    // lado FILHO), sem nenhum jeito de se recuperar sozinho na mesma
+    // sessão. Corrigido: em vez de contar mensagens, só considera "loop de
+    // verdade" quando a altura vem SEMPRE aumentando, sem NUNCA estabilizar,
+    // por muitos ciclos seguidos — qualquer atualização legítima
+    // (conteúdo crescendo até um tamanho final) para de aumentar em poucos
+    // ciclos e nunca dispara isso, não importa a frequência das mensagens.
+    var ALTURA_MAXIMA = 50000;  // bem mais generoso — Histórico com centenas de trades cresce de verdade
+    var ultimaAlturaAplicada = 0;
+    var aumentosConsecutivosSemEstabilizar = 0;
     window.addEventListener('message', function (evento) {
       if (!evento.data || evento.data.tipo !== MENSAGEM) return;
-      clearTimeout(janelaContagem);
-      janelaContagem = setTimeout(function () { mensagensRecentes = 0; }, 2000);
-      mensagensRecentes += 1;
-      if (mensagensRecentes > 30 || evento.data.altura > ALTURA_MAXIMA) {
-        console.warn('diario_iframe_resize: muitas mensagens de altura ou altura implausível — ignorando (possível loop).', evento.data);
+      var altura = evento.data.altura;
+      if (altura > ALTURA_MAXIMA) {
+        console.warn('diario_iframe_resize: altura implausível — ignorando (possível loop).', altura);
         return;
       }
+      if (altura > ultimaAlturaAplicada) {
+        aumentosConsecutivosSemEstabilizar += 1;
+      } else {
+        aumentosConsecutivosSemEstabilizar = 0;
+      }
+      if (aumentosConsecutivosSemEstabilizar > 200) {
+        console.warn('diario_iframe_resize: altura cresceu sem parar por muitos ciclos seguidos — ignorando (possível loop).', altura);
+        return;
+      }
+      ultimaAlturaAplicada = altura;
       var iframe = document.querySelector('#painel-diario iframe');
-      if (iframe) iframe.style.height = evento.data.altura + 'px';
+      if (iframe) iframe.style.height = altura + 'px';
     });
   }
 })();

@@ -67,9 +67,29 @@
   // temporariamente a captura de mouse dos iframes enquanto QUALQUER
   // arraste estiver ativo, deixando o `mousemove` atravessar até o
   // `window` do pai normalmente; volta ao normal no mouseup.
+  var interactingTimeout = null;
   function setInteracting(ligado) {
     document.documentElement.classList.toggle('win98-interacting', ligado);
+    clearTimeout(interactingTimeout);
+    if (ligado) {
+      // Rede de segurança (bug real 2026-07-21, achado numa varredura de
+      // testes): os handlers de mousedown/mouseup de arraste/resize abaixo
+      // usam variáveis `dragging` locais por janela/alça — se o `mouseup`
+      // nunca chegar ao `window` (solto fora da viewport do browser, ou
+      // qualquer outro caso em que o evento não propaga), `win98-
+      // interacting` ficava preso pra sempre e TODOS os iframes (Diário e
+      // Posição, nas duas janelas) perdiam clique de mouse real
+      // indefinidamente (`element.click()` via JS continuava funcionando,
+      // o que mascarou o problema em teste automatizado — só clique real
+      // de mouse é afetado por `pointer-events`). Força destravar depois
+      // de alguns segundos em vez de depender só do `mouseup` chegar.
+      interactingTimeout = setTimeout(function () { setInteracting(false); }, 4000);
+    }
   }
+  // Foco do browser perdido no meio de um arraste (troca de app/janela com
+  // o botão ainda pressionado) — o `mouseup` nunca vai chegar nesse caso,
+  // não precisa esperar o timeout acima pra destravar.
+  window.addEventListener('blur', function () { setInteracting(false); });
 
   function placeInitial(win, index) {
     var saved = layout[win.dataset.window];

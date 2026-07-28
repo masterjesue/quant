@@ -707,6 +707,30 @@ def _peso_toque(n_ordem: int, volume_relativo: float | None, forte: bool = True)
     return peso
 
 
+def _origem_pivo(idx: int, serie: np.ndarray, preco_alvo: float, max_back: int = N_CONFIRM_PIVOS) -> int:
+    """Acha o candle de ORIGEM (extremo real) a partir do índice de
+    CONFIRMAÇÃO onde `detectar_pivos` marca o pivô (idx = i_origem + ct,
+    preço do extremo copiado pra frente em preco_topo/preco_fundo) — busca
+    retroativa limitada comparando `serie[j] == preco_alvo`. Extraído aqui
+    (2026-07-21) do que já existia como `_origem_pivo_espelho` (closure
+    dentro de `calcular_zonas_sr`) pra também ser usado por
+    `analisar_linha_generica`, que fazia essa leitura ERRADA (comparava
+    tolerância contra `lows[idx]`/`highs[idx]` — o candle de CONFIRMAÇÃO —
+    em vez do extremo real; e lia rejeição/agressão/pureza do candle
+    errado). Bug real reportado pelo Jesué: um traçado seu contava
+    "toques" com preços 130+ pontos longe da linha desenhada porque o
+    candle de confirmação, não o de origem, estava sendo comparado."""
+    achou = idx
+    for back in range(0, max_back + 1):
+        j = idx - back
+        if j < 0:
+            break
+        if serie[j] == preco_alvo:
+            achou = j
+            break
+    return achou
+
+
 class _SemDeepcopy:
     """Contêiner opaco pro `copy.deepcopy`: embrulha uma estrutura grande de
     dicts/listas (detalhe de toque por cluster/zona-espelho) sem impedir a
@@ -973,15 +997,29 @@ def _compor_rejeicao_score(rejeicao_media, agressao_media, impulso_medio,
 
 
 def montar_acao(combustivel: float, aproximacao: float, rejeicao: float,
-                 eh_resistencia: bool, zona_min: float, zona_max: float) -> dict:
+                 eh_resistencia: bool, zona_min: float, zona_max: float,
+                 atr_atual: float = None) -> dict:
     """Camada de saída — 'ação' (seção 6.3 da spec): postura SEMPRE via regra
-    explícita combinando os 3 blocos (nunca texto livre), magnitude esperada
-    derivada do combustível (zona fresh = mais percurso potencial), e nível
+    explícita (nunca texto livre), magnitude esperada + alvo/stop em pontos
+    derivados do combustível (zona fresh = mais percurso potencial), e nível
     de invalidação (só preenchido quando a postura favorece entrada) —
     reaproveita a mesma definição de zona usada pelo rompimento estrutural,
-    não inventa um conceito novo."""
-    media = (combustivel + aproximacao + rejeicao) / 3.0
-    piso = min(combustivel, aproximacao, rejeicao)
+    não inventa um conceito novo.
+
+    2026-07-21 — correção estrutural pedida pelo Jesué (ver backtest real
+    em memory project_modo_aprendizagem.md, WDO 5098,50/13h): a postura
+    (EVITAR/FAVORECE) usa só APROXIMAÇÃO+REJEIÇÃO agora — sinais
+    DIRECIONAIS de verdade (qualidade da perna até o toque + qualidade da
+    reação nele). Combustível SAIU daqui — ele é magnitude ("quanto ainda
+    pode andar"), não direção, e antes travava a tag em EVITAR pra
+    qualquer nível muito tocado historicamente, mesmo com reação recente
+    ótima. Combustível continua a única fonte de `magnitude_esperada` e
+    agora também de `alvo_pontos`/`stop_pontos` (pedido novo: "traga a
+    pontuação de alvo e stop sugerida pela análise de combustível") —
+    calculados sempre que `atr_atual` é informado, independente da
+    postura (é informação de tamanho de movimento, não de entrar ou não)."""
+    media = (aproximacao + rejeicao) / 2.0
+    piso = min(aproximacao, rejeicao)
     if media >= cfg.LIMIAR_POSTURA_FAVORECE and piso >= cfg.LIMIAR_POSTURA_AGUARDAR:
         postura = 'favorece_entrada'
     elif media >= cfg.LIMIAR_POSTURA_AGUARDAR:
@@ -1002,11 +1040,23 @@ def montar_acao(combustivel: float, aproximacao: float, rejeicao: float,
     if postura == 'favorece_entrada':
         invalidacao = float(zona_max) if eh_resistencia else float(zona_min)
 
-    return {'postura': postura, 'magnitude_esperada': magnitude, 'invalidacao': invalidacao}
+    alvo_pontos = stop_pontos = None
+    if atr_atual is not None and not np.isnan(atr_atual) and atr_atual > 0:
+        fator_alvo = (cfg.FATOR_ALVO_COMBUSTIVEL_MIN + (combustivel / 100.0) *
+                      (cfg.FATOR_ALVO_COMBUSTIVEL_MAX - cfg.FATOR_ALVO_COMBUSTIVEL_MIN))
+        alvo_pontos = round(float(atr_atual) * fator_alvo, 1)
+        dist_borda = abs(float(zona_max) - float(zona_min)) / 2.0  # zona já é linha±tolerância
+        stop_pontos = round(dist_borda + float(atr_atual) * cfg.BUFFER_STOP_ALEM_ZONA_ATR, 1)
+
+    return {
+        'postura': postura, 'magnitude_esperada': magnitude, 'invalidacao': invalidacao,
+        'alvo_pontos': alvo_pontos, 'stop_pontos': stop_pontos,
+    }
 
 
 def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
-                             toques_min_forte: int = None) -> dict:
+                             toques_min_forte: int = None,
+                             tolerancia_atr: float = None) -> dict:
     """
     Leitura quantitativa (toques/força/probabilidade) de uma linha
     qualquer — mesma linguagem do motor de S/R estático
@@ -1021,6 +1071,13 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
     cada candle (broadcast de um escalar pro caso de S/R horizontal, série
     de EMA, ou interpolação linear de uma trendline de 2 pontos).
 
+    `tolerancia_atr` (2026-07-21): banda de tolerância (em múltiplos de ATR)
+    pra considerar um pivô como "toque" da linha — default `None` usa
+    `cfg.TOLERANCIA_LINHA_GENERICA_ATR` (a MME21 é uma linha rápida, precisa
+    de folga maior). Traçados manuais passam `cfg.TOLERANCIA_TRACADO_MANUAL_
+    ATR` (bem mais apertada — ver comentário da constante: um traçado é um
+    preço EXATO escolhido pelo Jesué, não uma zona).
+
     Só analisa os últimos `janela` candles (regra do Jesué pra MME21: "se
     foi respeitada nos últimos 20 candles"). Reaproveita as colunas já
     computadas pelo pipeline de features em lote (pivôs simples/fortes,
@@ -1028,6 +1085,7 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
     fluxo_disponivel) — roda direto sobre o DataFrame já carregado em
     memória, sem re-rodar o backtest nem recalcular pivôs.
     """
+    tol_mult = tolerancia_atr if tolerancia_atr is not None else cfg.TOLERANCIA_LINHA_GENERICA_ATR
     n = len(df)
     if n == 0:
         return {'tipo': 'indefinido', 'toques': 0, 'forca_toques': 0.0,
@@ -1071,8 +1129,18 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
     e_fundo = (tipo == 'suporte')  # suporte é testado por fundos (bounce de baixo pra cima)
 
     # --- toques: pivôs confirmados (fractal, já computados por detectar_pivos)
-    # dentro da janela, próximos da linha NAQUELE candle — não de um valor fixo ---
+    # dentro da janela, próximos da linha NAQUELE candle — não de um valor
+    # fixo. Compara contra preco_fundo/preco_topo (extremo REAL do pivô),
+    # NUNCA lows[i]/highs[i] (candle de CONFIRMAÇÃO, onde detectar_pivos
+    # marca o pivô — pode estar vários candles e dezenas/centenas de pontos
+    # longe do extremo real). Bug real corrigido 2026-07-21 — ver
+    # _origem_pivo. ---
+    preco_topo_arr = df['preco_topo'].values if 'preco_topo' in df.columns else np.full(n, np.nan)
+    preco_fundo_arr = df['preco_fundo'].values if 'preco_fundo' in df.columns else np.full(n, np.nan)
+    serie_extremo = lows if e_fundo else highs
+
     idxs_touch = []
+    origens_touch = []
     for i in range(ini, n):
         pivo_aqui = fundo_simples[i] if e_fundo else topo_simples[i]
         if not pivo_aqui:
@@ -1080,41 +1148,48 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         atr_i = atrs[i]
         if np.isnan(atr_i) or atr_i <= 0:
             continue
-        preco_pivo = lows[i] if e_fundo else highs[i]
-        if abs(preco_pivo - linha[i]) <= atr_i * cfg.TOLERANCIA_LINHA_GENERICA_ATR:
+        preco_pivo = preco_fundo_arr[i] if e_fundo else preco_topo_arr[i]
+        if np.isnan(preco_pivo):
+            continue
+        if abs(preco_pivo - linha[i]) <= atr_i * tol_mult:
             idxs_touch.append(i)
+            origens_touch.append(_origem_pivo(i, serie_extremo, preco_pivo))
 
     N_IMP = cfg.N_CANDLES_IMPULSO
     pesos, rejeicoes, agressoes, impulsos = [], [], [], []
     profundidades, purezas, retracoes_lst, aproximacoes = [], [], [], []
     detalhes_toques = []
-    for ordem_n, idx in enumerate(idxs_touch, start=1):
-        rej = sombra_inf[idx] if e_fundo else sombra_sup[idx]
-        vol_i = vol_total_arr[idx] if tem_fluxo_arr[idx] else np.nan
-        vol_rel = (vol_i / vol_media20[idx]) if (not np.isnan(vol_i) and vol_media20[idx] > 0) else None
+    for ordem_n, (idx, oi) in enumerate(zip(idxs_touch, origens_touch), start=1):
+        # Métricas de forma/fluxo (rejeição, agressão, pureza, aproximação,
+        # impulso) sempre lidas no candle de ORIGEM (oi) — é onde o extremo
+        # de fato ocorreu. `forte_toque` continua em `idx` (confirmação) —
+        # é onde detectar_pivos grava topo_forte/fundo_forte.
+        rej = sombra_inf[oi] if e_fundo else sombra_sup[oi]
+        vol_i = vol_total_arr[oi] if tem_fluxo_arr[oi] else np.nan
+        vol_rel = (vol_i / vol_media20[oi]) if (not np.isnan(vol_i) and vol_media20[oi] > 0) else None
         forte_toque = bool(fundo_forte_arr[idx] if e_fundo else topo_forte_arr[idx])
         peso = _peso_toque(ordem_n, vol_rel, forte_toque)
 
-        if tem_fluxo_arr[idx] and vol_total_arr[idx] > 0:
-            delta_norm = delta_arr[idx] / vol_total_arr[idx]
+        if tem_fluxo_arr[oi] and vol_total_arr[oi] > 0:
+            delta_norm = delta_arr[oi] / vol_total_arr[oi]
             agr = float(np.clip(delta_norm if e_fundo else -delta_norm, -1, 1))
         else:
             agr = 0.0
 
-        idx_alvo = min(idx + N_IMP, n - 1)
-        atr_idx = atrs[idx] if (not np.isnan(atrs[idx]) and atrs[idx] > 0) else np.nan
-        imp = (abs(closes[idx_alvo] - closes[idx]) / (atr_idx * N_IMP)) if not np.isnan(atr_idx) else np.nan
+        idx_alvo = min(oi + N_IMP, n - 1)
+        atr_oi = atrs[oi] if (not np.isnan(atrs[oi]) and atrs[oi] > 0) else np.nan
+        imp = (abs(closes[idx_alvo] - closes[oi]) / (atr_oi * N_IMP)) if not np.isnan(atr_oi) else np.nan
 
         # "Zona" de uma linha genérica é a banda de tolerância em torno do
         # valor da linha NAQUELE candle (mesma banda usada pra detectar o
         # toque acima) — reaproveita os mesmos helpers do S/R automático.
-        preco_extremo = lows[idx] if e_fundo else highs[idx]
-        tol_idx = atr_idx * cfg.TOLERANCIA_LINHA_GENERICA_ATR if not np.isnan(atr_idx) else 0.0
+        preco_extremo = lows[oi] if e_fundo else highs[oi]
+        tol_idx = atr_oi * tol_mult if not np.isnan(atr_oi) else 0.0
         z_min_idx, z_max_idx = linha[idx] - tol_idx, linha[idx] + tol_idx
         profundidade = _profundidade_mitigacao(preco_extremo, z_min_idx, z_max_idx, e_fundo) if tol_idx > 0 else 0.0
-        pureza = _pureza_corpo(idx, opens, closes, highs, lows)
-        retr = _retracoes_na_saida(idx, highs, lows, z_min_idx, z_max_idx, N_IMP) if tol_idx > 0 else 0
-        aprox = _analisar_aproximacao(idx, highs, lows, opens, closes, atrs, fundo_simples, topo_simples, e_fundo)
+        pureza = _pureza_corpo(oi, opens, closes, highs, lows)
+        retr = _retracoes_na_saida(oi, highs, lows, z_min_idx, z_max_idx, N_IMP) if tol_idx > 0 else 0
+        aprox = _analisar_aproximacao(oi, highs, lows, opens, closes, atrs, fundo_simples, topo_simples, e_fundo)
 
         pesos.append(peso)
         rejeicoes.append(rej)
@@ -1125,7 +1200,7 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         retracoes_lst.append(retr)
         aproximacoes.append(aprox['score'])
         detalhes_toques.append({
-            'idx': int(idx),
+            'idx': int(idx), 'idx_origem': int(oi),
             'timestamp': _ts_iso(df['datetime'].values[idx]),
             'preco': float(preco_extremo),
             'tipo_pivo': 'forte' if forte_toque else 'simples',
@@ -1200,7 +1275,7 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         idx_o = candidato_formacao['idx_origem']
         atr_o = atrs[idx_o]
         if not np.isnan(atr_o) and atr_o > 0 and \
-                abs(candidato_formacao['preco'] - linha[idx_o]) <= atr_o * cfg.TOLERANCIA_LINHA_GENERICA_ATR:
+                abs(candidato_formacao['preco'] - linha[idx_o]) <= atr_o * tol_mult:
             pivo_em_formacao = {
                 'tipo_pivo': 'fundo' if e_fundo else 'topo',
                 'idx_origem': int(idx_o),
@@ -1216,8 +1291,10 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
     # — ver calcular_prob_niveis_sr). Uma linha genérica não tem um "candle
     # de origem" natural como um pivô automático (o traçado é desenhado à
     # mão) — usa o 1º toque registrado como proxy de origem, e "idade" como
-    # candles desde esse 1º toque (0 = ainda sem toque, tratado como fresh). ---
-    idx_origem_proxy = idxs_touch[0] if toques else None
+    # candles desde esse 1º toque (0 = ainda sem toque, tratado como fresh).
+    # Usa `origens_touch[0]` (candle de ORIGEM real), não `idxs_touch[0]`
+    # (confirmação) — mesma correção 2026-07-21 de cima. ---
+    idx_origem_proxy = origens_touch[0] if toques else None
     forca_origem_linha = _forca_origem(idx_origem_proxy, highs, lows, atrs) if idx_origem_proxy is not None \
         else {'intensidade_origem': 0.5, 'base_limpa': 0.5}
     idade_linha = (n - 1 - idx_origem_proxy) if idx_origem_proxy is not None else 0
@@ -1231,8 +1308,9 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         np.array([rejeicao_media]), np.array([agressao_media]), np.array([impulso_medio]),
         np.array([pureza_corpo_media]), np.array([retracoes_media]))[0])
 
+    # score/prob_bounce = só DIREÇÃO (aproximação + rejeição) — combustível
+    # SAIU daqui 2026-07-21 (ver montar_acao): é magnitude, não direção.
     score = 50.0
-    score += (combustivel - 50) / 50 * cfg.AMPLITUDE_BLOCO_COMBUSTIVEL
     score += (aproximacao - 50) / 50 * cfg.AMPLITUDE_BLOCO_APROXIMACAO
     score += (rejeicao - 50) / 50 * cfg.AMPLITUDE_BLOCO_REJEICAO
     score += 10.0 if (toques and forte) else (-5.0 if toques else 0.0)
@@ -1240,10 +1318,16 @@ def analisar_linha_generica(df: pd.DataFrame, linha, janela: int,
         score -= 15.0
     prob_bounce = float(np.clip(score, cfg.SCORE_PROB_MIN, cfg.SCORE_PROB_MAX))
 
-    tol_atual = atrs[-1] * cfg.TOLERANCIA_LINHA_GENERICA_ATR if not np.isnan(atrs[-1]) else 0.0
+    # Último ATR VÁLIDO, não necessariamente atrs[-1] — o candle mais recente
+    # (ainda incompleto/recém-mesclado) às vezes chega sem ATR recalculado
+    # ainda, o que zerava a zona/alvo/stop sem necessidade.
+    atrs_validos = atrs[~np.isnan(atrs)]
+    atr_atual_val = float(atrs_validos[-1]) if len(atrs_validos) else np.nan
+    tol_atual = atr_atual_val * tol_mult if not np.isnan(atr_atual_val) else 0.0
     eh_resistencia_linha = not e_fundo
     acao = montar_acao(combustivel, aproximacao, rejeicao, eh_resistencia_linha,
-                        linha_atual - tol_atual, linha_atual + tol_atual)
+                        linha_atual - tol_atual, linha_atual + tol_atual,
+                        atr_atual=atr_atual_val if not np.isnan(atr_atual_val) else None)
 
     return {
         'tipo': tipo,
@@ -1616,15 +1700,7 @@ def calcular_zonas_sr(df: pd.DataFrame) -> pd.DataFrame:
     def _origem_pivo_espelho(idx, tipo):
         serie = highs if tipo == 'topo' else lows
         preco_alvo = t_preco_full[idx] if tipo == 'topo' else f_preco_full[idx]
-        achou = idx
-        for back in range(0, N_CONFIRM_PIVOS + 1):
-            j = idx - back
-            if j < 0:
-                break
-            if serie[j] == preco_alvo:
-                achou = j
-                break
-        return achou
+        return _origem_pivo(idx, serie, preco_alvo)
 
     for z in novas_zonas:
         tipo_espelho = 'fundo' if tipo_atual[z['origem_k']] == 'resistencia' else 'topo'
@@ -1950,6 +2026,7 @@ def calcular_prob_niveis_sr(df: pd.DataFrame) -> pd.DataFrame:
     N = cfg.N_NIVEIS_SR
     lados = ('acima', 'abaixo')
 
+    atrs = pd.to_numeric(df['atr'], errors='coerce').values if 'atr' in df.columns else np.full(n, np.nan)
     tendencia = df['estado_tendencia'].values if 'estado_tendencia' in df.columns else np.full(n, 'indefinido', dtype=object)
     fase = df['fase_tendencia'].values if 'fase_tendencia' in df.columns else np.full(n, 'indefinido', dtype=object)
     saude = df['saude_tendencia'].values if 'saude_tendencia' in df.columns else np.full(n, 'indefinido', dtype=object)
@@ -2067,9 +2144,10 @@ def calcular_prob_niveis_sr(df: pd.DataFrame) -> pd.DataFrame:
             df[f'{pref}_aproximacao_score'] = np.where(valido, np.round(aproximacao, 1), np.nan)
             df[f'{pref}_rejeicao_score'] = np.where(valido, np.round(rejeicao, 1), np.nan)
 
-            # --- Combinação final + ajustes que não pertencem a nenhum bloco específico ---
+            # --- Combinação final + ajustes que não pertencem a nenhum bloco
+            # específico. Só DIREÇÃO (aproximação+rejeição) — combustível
+            # saiu daqui 2026-07-21, é magnitude (ver montar_acao). ---
             score = np.full(n, 50.0)
-            score += (combustivel - 50) / 50 * cfg.AMPLITUDE_BLOCO_COMBUSTIVEL
             score += (aproximacao - 50) / 50 * cfg.AMPLITUDE_BLOCO_APROXIMACAO
             score += (rejeicao - 50) / 50 * cfg.AMPLITUDE_BLOCO_REJEICAO
 
@@ -2102,8 +2180,10 @@ def calcular_prob_niveis_sr(df: pd.DataFrame) -> pd.DataFrame:
             invalidacoes = np.full(n, np.nan)
             idx_validos = np.where(valido)[0]
             for i in idx_validos:
+                atr_i_val = float(atrs[i]) if not np.isnan(atrs[i]) else None
                 acao = montar_acao(float(combustivel[i]), float(aproximacao[i]), float(rejeicao[i]),
-                                    eh_resistencia, float(zona_min[i]), float(zona_max[i]))
+                                    eh_resistencia, float(zona_min[i]), float(zona_max[i]),
+                                    atr_atual=atr_i_val)
                 posturas[i] = acao['postura']
                 magnitudes[i] = acao['magnitude_esperada']
                 invalidacoes[i] = acao['invalidacao'] if acao['invalidacao'] is not None else np.nan
@@ -2254,19 +2334,60 @@ def calcular_todos_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFr
     if verbose:
         print(f"[features] Calculando features para {n} candles...")
 
+    if not cfg.AUTO_DETECCAO_SR_ATIVA:
+        # `df` pode vir de um parquet salvo ANTES do detector ser desligado
+        # (ver AUTO_DETECCAO_SR_ATIVA) — sem isso, colunas sr_*/
+        # pivo_imediato_* antigas ficariam zumbis (nunca recalculadas, mas
+        # também nunca removidas, já que as etapas seguintes só ADICIONAM
+        # coluna, nunca limpam o que já estava lá). Remove explicitamente
+        # pra "detector desligado" ser um estado limpo e inequívoco, não
+        # "esqueceu de atualizar".
+        colunas_zumbi = [c for c in df.columns
+                         if c.startswith('sr_') or c == 'pivo_imediato_abaixo_ja_mapeado'
+                         or c == 'pivo_imediato_acima_ja_mapeado']
+        if colunas_zumbi:
+            df = df.drop(columns=colunas_zumbi)
+
     etapas = [
         ("Anatomia de candle",          calcular_anatomia),
         ("ATR e tamanho relativo",       calcular_atr),
         ("Pivôs estruturais",           detectar_pivos),
         ("Tendência e fase",            calcular_tendencia),
-        ("S/R por clustering",          calcular_sr),
-        ("Zonas S/R e bipolaridade",    calcular_zonas_sr),
-        ("Pivô imediato (tático)",      calcular_pivo_imediato),
+    ]
+    # Detector automático de ZONAS de S/R (Modo Aprendizagem.txt,
+    # 2026-07-20) — gateado por flag, não removido: Jesué decidiu que o
+    # motor não deve mais SUGERIR zonas de S/R sozinho (análise agora parte
+    # só dos traçados que ele desenha, ver metricas.analisar_tracados), mas
+    # mantém a possibilidade de religar pra comparação/depuração. Nenhuma
+    # dessas 3 funções tem outro call site no repo além desta lista —
+    # desativar aqui é suficiente. `calcular_prob_niveis_sr` continua por
+    # último (depende de build-up/temporal/fluxo já calculados), por isso
+    # só entra no fim da lista, não aqui.
+    if cfg.AUTO_DETECCAO_SR_ATIVA:
+        etapas += [
+            ("S/R por clustering",          calcular_sr),
+            ("Zonas S/R e bipolaridade",    calcular_zonas_sr),
+        ]
+    # `calcular_pivo_imediato` fica FORA do gate: apesar do nome parecido,
+    # seu cálculo central (último topo/fundo CONFIRMADO ainda do lado certo
+    # do preço) usa só `detectar_pivos` (mantido acima) — só a flag
+    # secundária `_ja_mapeado` lê as zonas do detector automático, e já é
+    # null-safe (`df.get(...)` -> None -> pulada) quando essas colunas não
+    # existem. Fica DEPOIS do bloco condicional acima de propósito: se
+    # `AUTO_DETECCAO_SR_ATIVA` algum dia voltar a True, `_ja_mapeado`
+    # precisa achar as colunas de zona já calculadas (mesma ordem de
+    # sempre). É sinal tático independente (Mentor IA e o card "TOPO/FUNDO
+    # EM FORMAÇÃO" dependem dele) — desligar junto com o detector de zonas
+    # seria mostrar MENOS informação sem necessidade (Modo Aprendizagem.txt,
+    # 2026-07-20: "não quero que o sistema mostre menos informações").
+    etapas.append(("Pivô imediato (tático)", calcular_pivo_imediato))
+    etapas += [
         ("Build-up e double pressure",  calcular_buildup_e_double_pressure),
         ("Temporal",                    calcular_temporal),
         ("Fluxo agregado",              calcular_fluxo_agregado),
-        ("Score de probabilidade S/R",  calcular_prob_niveis_sr),
     ]
+    if cfg.AUTO_DETECCAO_SR_ATIVA:
+        etapas.append(("Score de probabilidade S/R", calcular_prob_niveis_sr))
 
     _attrs_zonas_sr = {}
     for nome, func in etapas:

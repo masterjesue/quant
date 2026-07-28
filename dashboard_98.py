@@ -26,13 +26,28 @@ import pandas as pd
 import numpy as np
 import threading
 import json
+import logging
 from datetime import datetime
 
+# Ver dashboard.py pro raciocínio completo (logger NOMEADO, não
+# `logging.basicConfig` — evita poluir o arquivo com o log de rotina do
+# Werkzeug/Flask). Mesmo arquivo do dashboard.py de propósito — um lugar
+# só pra checar, cada processo só escreve em falha (raro).
+log_sync_posicoes = logging.getLogger('sync_posicoes')
+log_sync_posicoes.setLevel(logging.ERROR)
+log_sync_posicoes.propagate = False
+if not log_sync_posicoes.handlers:
+    _handler_sync = logging.FileHandler(str(Path(__file__).parent / 'log_sync_posicoes.log'), encoding='utf-8')
+    _handler_sync.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    log_sync_posicoes.addHandler(_handler_sync)
+
 import config_backtest as cfg
+import config_operacional
 import persistencia
 import run_backtest
 import mt5_loader
 import diario_trade
+import aprendizagem
 import tracados
 import indice_medo_ganancia
 import correlacao_ativos
@@ -415,7 +430,8 @@ def secao(titulo: str, cor_titulo: str = None) -> html.Div:
 
 from metricas import (
     extrair_metricas, candles_para_grafico, niveis_sr_para_grafico,
-    mme21_para_grafico, mme21_ponto_live, analisar_mme21, analisar_tracados,
+    mme21_para_grafico, mme21_ponto_live, analisar_tracados,
+    analisar_rastreador_tendencia,
 )
 
 
@@ -453,7 +469,7 @@ _EXPLICACAO_GAUGES = {
 }
 # Centro (px) de cada gauge na fileira — 130px + win98_sunken(padding=4px)
 # de cada lado = 138px efetivo, gap 8px, passo 146px.
-_POSICAO_TAIL_GAUGE = {'forca': 69, 'contexto': 215, 'medo_ganancia': 361, 'correlacao': 507}
+_POSICAO_TAIL_GAUGE = {'forca': 69, 'contexto': 215, 'medo_ganancia': 361, 'correlacao': 507, 'big_players': 653}
 
 
 def _balao_explicacao_gauge(gauge_selecionado: str) -> html.Div:
@@ -493,8 +509,53 @@ def _balao_explicacao_gauge(gauge_selecionado: str) -> html.Div:
     })
 
 
+def _balao_big_players_98(resumo: dict | None) -> html.Div:
+    """Ver dashboard.py::_balao_big_players pro mesmo raciocínio — único
+    balão dinâmico entre os gauges (Fase 4, 2026-07-21)."""
+    left_px = _POSICAO_TAIL_GAUGE.get('big_players', 653)
+    seta = [
+        html.Div(style={
+            'position': 'absolute', 'top': '-8px', 'left': f'{left_px}px', 'transform': 'translateX(-50%)',
+            'width': '0', 'height': '0', 'borderLeft': '8px solid transparent',
+            'borderRight': '8px solid transparent', 'borderBottom': f"8px solid {C['shadow_dk']}",
+        }),
+        html.Div(style={
+            'position': 'absolute', 'top': '-6px', 'left': f'{left_px}px', 'transform': 'translateX(-50%)',
+            'width': '0', 'height': '0', 'borderLeft': '7px solid transparent',
+            'borderRight': '7px solid transparent', 'borderBottom': f"7px solid {C['tooltip']}",
+        }),
+    ]
+    titulo = html.Div('Big Players — resumo institucional', style={
+        'fontFamily': FONTS['display'], 'fontSize': '12px', 'fontWeight': 'bold',
+        'color': C['tooltip_text'], 'marginBottom': '8px',
+    })
+    if not resumo or not resumo.get('tem_dado'):
+        corpo = [html.Div(
+            resumo.get('mensagem', 'Sem dado suficiente para esta análise.') if resumo else 'Sem dado suficiente para esta análise.',
+            style={'fontSize': '11px', 'fontFamily': FONTS['body'], 'color': C['tooltip_text'], 'lineHeight': '1.5'},
+        )]
+    else:
+        def _linha(rotulo, texto, cor=None):
+            return html.Div([
+                html.Span(f'{rotulo}: ', style={'fontWeight': 'bold'}),
+                html.Span(texto),
+            ], style={'fontSize': '11px', 'fontFamily': FONTS['body'], 'lineHeight': '1.5',
+                       'marginBottom': '6px', 'color': cor or C['tooltip_text']})
+        corpo = [
+            _linha('Lado dominante', f"{resumo['conclusao_lado']} ({resumo['detalhe_lado']})"),
+            _linha('Absorção', resumo['absorcao_texto']),
+            _linha('Volume', resumo['volume_texto']),
+            _linha('O que fazer', resumo['acao_texto'], cor=C.get(resumo['cor_acao'])),
+        ]
+    return html.Div([*seta, titulo, *corpo], style={
+        'position': 'relative', 'marginTop': '24px', 'padding': '14px 18px',
+        'background': C['tooltip'], 'border': f"1px solid {C['shadow_dk']}",
+    })
+
+
 def construir_hero(m_win: dict, m_wdo: dict, ativo: str, indice_mg: dict | None = None,
-                    correlacao: dict | None = None, cotacoes_correlacionadas: list | None = None) -> html.Div:
+                    correlacao: dict | None = None, cotacoes_correlacionadas: list | None = None,
+                    big_players: dict | None = None) -> html.Div:
     """Seção hero: velocímetros de força e contexto do ativo selecionado,
     mais o Índice de Medo e Ganância e o alinhamento DI1FUT×WINFUT×WDOFUT
     (ambos independem do ativo selecionado — ver `indice_medo_ganancia.py`
@@ -561,6 +622,19 @@ def construir_hero(m_win: dict, m_wdo: dict, ativo: str, indice_mg: dict | None 
             config={'displayModeBar': False, 'staticPlot': True, 'responsive': True},
             style={'width': '130px'}), className='gauge-clicavel', **{'data-gauge': 'correlacao'},
             style={**win98_sunken(padding='4px'), 'cursor': 'pointer'}))
+        # Big Players (Fase 4, 2026-07-21) — ver dashboard.py::construir_hero
+        # pro mesmo raciocínio (condensado num único velocímetro, ao lado dos
+        # outros gauges). Inserido AQUI (antes do painel CORRELACIONADOS) pra
+        # ficar visualmente junto dos outros velocímetros.
+        if big_players is not None and big_players.get('tem_dado'):
+            cor_bp = big_players['cor_lado']
+            cor_bp = C['amber'] if cor_bp == 'yellow' else C.get(cor_bp, C['amber'])
+            gauges.append(html.Div(dcc.Graph(
+                id='gauge-big-players',
+                figure=gauge_cockpit(big_players['pct_c'] / 100.0, 'BIG PLAYERS', big_players['lado_dominante'], cor_bp),
+                config={'displayModeBar': False, 'staticPlot': True, 'responsive': True},
+                style={'width': '130px'}), className='gauge-clicavel', **{'data-gauge': 'big_players'},
+                style={**win98_sunken(padding='4px'), 'cursor': 'pointer'}))
         legendas.append(html.Div(
             f"DI1FUT×WDOFUT: {correlacao['corr_di_wdo']:+.2f} · DI1FUT×WINFUT: {correlacao['corr_di_win']:+.2f} "
             f"(Pearson, últimos {correlacao['janela_dias']} pregões) — tese: DI acompanha o WDO e é inverso "
@@ -721,32 +795,9 @@ def construir_market_view(m: dict) -> html.Div:
 
     card_qm = _card_mv('Quem Manda', numero_qm, conclusao_qm, detalhe_qm, cor_qm)
 
-    # --- CARD 2: TENDÊNCIA
-    tend   = m.get('tendencia') or '—'
-    fase   = m.get('fase') or '—'
-    saude  = m.get('saude') or '—'
-    cor_tend = C['green'] if tend == 'alta' else (C['red'] if tend == 'baixa' else C['amber'])
-
-    mapa_conclusao_tend = {
-        ('alta',  'inicio',   'forte'):  'Alta nascente — impulso acelerando',
-        ('alta',  'inicio',   'normal'): 'Alta em início — momentum positivo',
-        ('alta',  'meio',     'forte'):  'Alta saudável — pullbacks rasos',
-        ('alta',  'meio',     'normal'): 'Alta em andamento — saúde normal',
-        ('alta',  'exaustao', 'fraca'):  'Alta em exaustão — cuidado com reversão',
-        ('baixa', 'inicio',   'forte'):  'Baixa nascente — impulso vendedor forte',
-        ('baixa', 'inicio',   'normal'): 'Baixa em início — momentum vendedor',
-        ('baixa', 'meio',     'forte'):  'Baixa saudável — resistências cedem',
-        ('baixa', 'meio',     'normal'): 'Baixa em andamento — saúde normal',
-        ('baixa', 'exaustao', 'fraca'):  'Baixa em exaustão — possível absorção',
-        ('lateral', 'indefinido', 'indefinido'): 'Mercado lateral — operar nas bordas',
-    }
-    conclusao_tend = mapa_conclusao_tend.get(
-        (tend, fase, saude),
-        f'{tend.upper()} · {fase} · {saude}'
-    )
-    detalhe_tend = f'Fase: {fase} · Saúde: {saude} · últimos 500 candles'
-
-    card_tend = _card_mv('Tendência', tend.upper(), conclusao_tend, detalhe_tend, cor_tend)
+    # Card "Tendência" removido do Market View (Modo Aprendizagem.txt,
+    # 2026-07-20) — ver dashboard.py::construir_market_view pro mesmo
+    # raciocínio; a leitura agora mora no Rastreador de Tendência.
 
     # --- CARD 3: VOLATILIDADE
     amp_rel = m.get('amp_dia_atr', np.nan)
@@ -841,7 +892,7 @@ def construir_market_view(m: dict) -> html.Div:
 
     # Sem secao('MARKET VIEW') aqui — renderizado dentro da janela Quant Lab
     # (ver 'market-view-conteudo' em app.layout), sem título próprio.
-    return html.Div([card_qm, card_tend, card_vol, card_bu, card_dp, card_jan],
+    return html.Div([card_qm, card_vol, card_bu, card_dp, card_jan],
                      style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'})
 
 
@@ -949,6 +1000,12 @@ def _acao_html(nivel: dict, eh_resistencia: bool) -> html.Div:
         partes.append(html.Span(f'magnitude {mag}', style={
             'fontSize': '10px', 'color': C['text2'], 'marginRight': '8px',
         }))
+    alvo = acao.get('alvo_pontos')
+    stop = acao.get('stop_pontos')
+    if alvo is not None and stop is not None:
+        partes.append(html.Span(f'alvo ~{alvo:,.0f}pts · stop ~{stop:,.0f}pts', style={
+            'fontSize': '10px', 'color': C['text2'], 'marginRight': '8px', 'fontFamily': FONTS['mono'],
+        }))
     inval = acao.get('invalidacao')
     if inval is not None and not pd.isna(inval):
         direcao_txt = 'acima de' if eh_resistencia else 'abaixo de'
@@ -960,19 +1017,10 @@ def _acao_html(nivel: dict, eh_resistencia: bool) -> html.Div:
 
 def construir_price_action(df: pd.DataFrame, m: dict, expandidos: dict = None) -> html.Div:
     """
-    Seção Price Action — sem gráfico de candles (Jesué já tem o seu no ProfitPRO).
-    Mostra os N_NIVEIS_SR (default 3) níveis de S/R de cada lado — ordenados
-    por RELEVÂNCIA (nível forte + toques + recência do último toque, não
-    mais só proximidade — ver _rankear_niveis_sr em features.py, mudado em
-    2026-07-08 depois de um caso real onde o nível mais próximo era uma
-    zona genérica sem repetição real, enquanto um suporte bem mais forte
-    ficava mais abaixo no ranking só por estar mais longe).
-
-    Abaixo dos 3 níveis rankeados, se houver, mostra também o "pivô
-    imediato" (último fundo/topo confirmado, ainda sem reteste — ver
-    calcular_pivo_imediato em features.py): referência tática de curtíssimo
-    prazo que só some quando NÃO está redundante com um dos níveis já
-    rankeados acima.
+    Ver dashboard.py::construir_price_action pro mesmo raciocínio — bloco
+    de preço atual + pivô imediato/em formação (sinais táticos
+    independentes do detector automático de zonas, desativado). Fundido
+    dentro da janela 'win-tracados' (agora titulada "Price Action").
     """
     expandidos = expandidos or {}
     preco = m.get('preco', np.nan)
@@ -982,161 +1030,6 @@ def construir_price_action(df: pd.DataFrame, m: dict, expandidos: dict = None) -
     fase   = m.get('fase') or '—'
     saude  = m.get('saude') or '—'
     candle = str(m.get('tipo_candle', '—')).replace('_', ' ').title()
-
-    def _nan(v): return v is None or (isinstance(v, float) and np.isnan(v))
-
-    def _proximidade(dist_atr):
-        if _nan(dist_atr): return 'distância não calculada'
-        if dist_atr <= 0.3: return 'muito próximo'
-        if dist_atr <= 1.0: return f'{dist_atr:.1f} ATR de distância'
-        return f'{dist_atr:.1f} ATR — longe'
-
-    _STATUS_LABEL = {
-        'aguardando_pullback': ('AGUARDANDO PULLBACK', C['yellow']),
-        'aguardando_throwback': ('AGUARDANDO THROWBACK', C['yellow']),
-        'rompida': ('ROMPIDA', C['text2']),
-        'invalidada': ('INVALIDADA', C['text2']),
-    }
-
-    def _card_nivel_sr(nivel: dict, eh_resistencia: bool) -> html.Div:
-        """Um card por nível rankeado — rank, preço, zona, toques/idade, badges, leitura com %."""
-        cor = C['red'] if eh_resistencia else C['green']
-        destaque = nivel.get('forte', False)
-        prob = nivel.get('prob_bounce', np.nan)
-        toques = nivel.get('toques', 0)
-        idade = nivel.get('idade', 0)
-        zona_min, zona_max = nivel.get('zona_min'), nivel.get('zona_max')
-        zona_txt = f'{_fmt(zona_min,0)}–{_fmt(zona_max,0)}' if not (_nan(zona_min) or _nan(zona_max)) else '—'
-
-        badges = []
-        if destaque:
-            badges.append(html.Span('REGIÃO FORTE', style={
-                'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(C['gold']),
-                'background': C['gold'], 'borderRadius': '0',
-                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
-            }))
-        if nivel.get('violado'):
-            badges.append(html.Span('VIOLADO', style={
-                'fontSize': '9px', 'fontWeight': '700', 'color': C['text'],
-                'background': C['red'], 'borderRadius': '0',
-                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
-            }))
-        status = nivel.get('status', 'ativa')
-        if status in _STATUS_LABEL:
-            label, cor_status = _STATUS_LABEL[status]
-            badges.append(html.Span(label, style={
-                'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(cor_status),
-                'background': cor_status, 'borderRadius': '0',
-                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
-            }))
-        if not _nan(nivel.get('zona_espelho_id')):
-            badges.append(html.Span('ZONA ESPELHO', style={
-                'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(C['blue']),
-                'background': C['blue'], 'borderRadius': '0',
-                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
-            }))
-        # Reversão de papel (bipolaridade) — diferente do badge acima: aquele
-        # marca a zona ANTIGA (que rompeu e gerou um espelho); este marca a
-        # zona NOVA (o espelho em si), que sem isso nunca contava a própria
-        # origem (achado real 2026-07-13, ver metricas._info_bipolar).
-        bip = nivel.get('bipolar')
-        narrativa_bipolar = None
-        if bip and bip.get('papel_no_cruzamento') == 'espelho':
-            badges.append(html.Span('REVERSÃO DE PAPEL', style={
-                'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(C['blue']),
-                'background': C['blue'], 'borderRadius': '0',
-                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
-            }))
-            papel_antigo = 'suporte' if eh_resistencia else 'resistência'
-            papel_novo = 'resistência' if eh_resistencia else 'suporte'
-            narrativa_bipolar = (
-                f'Nasceu de um(a) {papel_antigo} rompido(a) em {_fmt_ts(bip["timestamp_rompimento"])} '
-                f'— reteste confirmado às {_fmt_ts(bip["timestamp_reteste"])}, hoje opera como {papel_novo}.'
-            )
-        # Sinal intradiário — escopo do próprio pregão, independente do status
-        # estrutural acima (ver comentário em features.py::calcular_zonas_sr).
-        romp_hoje = nivel.get('rompimento_hoje', 'nenhum')
-        if romp_hoje == 'rompeu_hoje':
-            badges.append(html.Span('ROMPEU HOJE', style={
-                'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(C['yellow']),
-                'background': C['yellow'], 'borderRadius': '0',
-                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
-            }))
-        elif romp_hoje == 'pullback_confirmado_hoje':
-            badges.append(html.Span('PULLBACK CONFIRMADO HOJE', style={
-                'fontSize': '9px', 'fontWeight': '700', 'color': texto_sobre(C['green']),
-                'background': C['green'], 'borderRadius': '0',
-                'padding': '2px 6px', 'marginRight': '6px', 'letterSpacing': '0.05em',
-            }))
-
-        borda_cor = C['gold'] if destaque else cor
-
-        lado = 'acima' if eh_resistencia else 'abaixo'
-        chave = f'{lado}_{nivel["rank"]}'
-        expandido = bool(expandidos.get(chave, False))
-        regime = nivel.get('regime')
-        corpo_timeline = []
-        if regime and (regime['regime_atual']['detalhes'] or (regime['regime_antigo'] and regime['regime_antigo']['detalhes'])):
-            total = regime['regime_atual']['toques'] + (regime['regime_antigo']['toques'] if regime['regime_antigo'] else 0)
-            corpo_timeline.append(html.Button(
-                f"{'▾' if expandido else '▸'} Ver histórico de toques ({total})",
-                id={'type': 'timeline-toggle-98', 'index': chave}, n_clicks=0,
-                style={'background': 'transparent', 'border': 'none', 'color': C['text2'],
-                       'fontSize': '11px', 'cursor': 'pointer', 'padding': '4px 0', 'textAlign': 'left'},
-            ))
-            if expandido:
-                if regime['regime_atual']['detalhes']:
-                    corpo_timeline.append(html.Div('REGIME ATUAL', style={
-                        'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
-                        'letterSpacing': '0.06em', 'marginTop': '6px',
-                    }))
-                    corpo_timeline += [_linha_toque_html_98(d) for d in regime['regime_atual']['detalhes']]
-                if regime['regime_antigo'] and regime['regime_antigo']['detalhes']:
-                    corpo_timeline.append(html.Div('REGIME ANTERIOR', style={
-                        'fontSize': '9px', 'fontWeight': '700', 'color': C['text2'],
-                        'letterSpacing': '0.06em', 'marginTop': '8px',
-                    }))
-                    corpo_timeline += [_linha_toque_html_98(d) for d in regime['regime_antigo']['detalhes']]
-
-        corpo = html.Div([
-            html.Div([
-                html.Span(f'#{nivel["rank"]} ', style={
-                    'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['mono'],
-                }),
-                html.Span(_fmt(nivel['preco'], 0), style={
-                    'fontSize': '20px', 'fontWeight': '700',
-                    'fontFamily': FONTS['mono'], 'color': cor,
-                }),
-                html.Span(f'  zona {zona_txt}', style={
-                    'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display'],
-                }),
-            ], style={'marginBottom': '4px'}),
-            html.Div(badges, style={'marginBottom': '6px'}) if badges else html.Div(),
-            html.Div(
-                f'{toques} toque{"s" if toques != 1 else ""} · idade {idade} candles · '
-                f'{_proximidade(nivel.get("dist_atr"))}',
-                style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['display'], 'marginBottom': '6px'}
-            ),
-            html.Div(
-                f'Probabilidade: {prob:.0f}% bounce · {100-prob:.0f}% rompimento' if not _nan(prob) else 'Probabilidade: —',
-                style={'fontSize': '12px', 'fontWeight': '600', 'color': cor,
-                       'fontFamily': FONTS['display'], 'marginBottom': '6px'}
-            ),
-            _bloco_scores_html(nivel),
-            html.Div(narrativa_bipolar, style={
-                'fontSize': '11px', 'color': C['blue'], 'fontFamily': FONTS['body'],
-                'lineHeight': '1.4', 'marginBottom': '6px',
-            }) if narrativa_bipolar else html.Div(),
-            html.Div(_leitura_nivel(nivel, eh_resistencia), style={
-                'fontSize': '12px', 'color': C['text'],
-                'fontFamily': FONTS['body'], 'lineHeight': '1.5',
-                'borderLeft': f'3px solid {cor}', 'paddingLeft': '10px',
-                'marginBottom': '6px',
-            }),
-            _acao_html(nivel, eh_resistencia),
-            html.Div(corpo_timeline, style={'marginTop': '8px'}) if corpo_timeline else html.Div(),
-        ])
-        return win98_groupbox(None, corpo, cor_led=borda_cor, estilo_extra={'marginBottom': '10px'})
 
     def _card_pivo_imediato(pivo: dict, eh_resistencia: bool) -> html.Div:
         """Linha discreta (moldura afundada, sem groupbox) pro pivô imediato — ver docstring da função pai."""
@@ -1226,28 +1119,11 @@ def construir_price_action(df: pd.DataFrame, m: dict, expandidos: dict = None) -
         'display': 'flex', 'gap': '24px', 'marginBottom': '12px',
     })
 
-    niveis_acima = m.get('niveis_sr_acima', [])
-    niveis_abaixo = m.get('niveis_sr_abaixo', [])
-
-    if niveis_acima:
-        cards_resistencia = [
-            html.Div('RESISTÊNCIAS MAIS PRÓXIMAS', style={
-                'fontSize': '10px', 'color': C['red'], 'fontFamily': FONTS['display'],
-                'letterSpacing': '0.08em', 'marginBottom': '8px',
-            }),
-        ] + [_card_nivel_sr(n, eh_resistencia=True) for n in niveis_acima]
-    else:
-        cards_resistencia = [html.Div('Sem resistência identificada.', style={'color': C['text2'], 'fontSize': '12px'})]
-
-    if niveis_abaixo:
-        cards_suporte = [
-            html.Div('SUPORTES MAIS PRÓXIMOS', style={
-                'fontSize': '10px', 'color': C['green'], 'fontFamily': FONTS['display'],
-                'letterSpacing': '0.08em', 'marginBottom': '8px',
-            }),
-        ] + [_card_nivel_sr(n, eh_resistencia=False) for n in niveis_abaixo]
-    else:
-        cards_suporte = [html.Div('Sem suporte identificado.', style={'color': C['text2'], 'fontSize': '12px'})]
+    # Zonas de S/R AUTOMÁTICAS removidas (Modo Aprendizagem.txt, 2026-07-20)
+    # — ver dashboard.py::construir_price_action pro mesmo raciocínio.
+    # Sobram só os 2 sinais táticos independentes do detector de zonas.
+    cards_resistencia = []
+    cards_suporte = []
 
     pivo_acima = m.get('pivo_imediato_acima')
     if pivo_acima:
@@ -1263,8 +1139,15 @@ def construir_price_action(df: pd.DataFrame, m: dict, expandidos: dict = None) -
     if pivo_formacao_abaixo:
         cards_suporte.append(_card_pivo_em_formacao(pivo_formacao_abaixo, eh_resistencia=False))
 
-    # Sem secao('PRICE ACTION') aqui — o título já vem da titlebar da janela
-    # (win98_window('win-price-action', 'Price Action', ...) no app.layout).
+    if not cards_resistencia:
+        cards_resistencia = [html.Div('Nenhum pivô tático acima do preço no momento.',
+                                       style={'color': C['text2'], 'fontSize': '12px'})]
+    if not cards_suporte:
+        cards_suporte = [html.Div('Nenhum pivô tático abaixo do preço no momento.',
+                                   style={'color': C['text2'], 'fontSize': '12px'})]
+
+    # Sem secao/título aqui — o título já vem da titlebar da janela
+    # (win98_window('win-tracados', 'Price Action', ...) no app.layout).
     return html.Div([
         bloco_preco,
         html.Div([
@@ -1278,54 +1161,28 @@ def construir_price_action(df: pd.DataFrame, m: dict, expandidos: dict = None) -
     ])
 
 
-def construir_big_players(df: pd.DataFrame) -> html.Div:
-    """
-    Big Players Footprints — análise interpretada do que está por trás do gráfico.
-    Não mostra tape bruto — mostra conclusões acionáveis sobre comportamento institucional.
-    Baseado nos dados de fluxo (delta, vol_comprador, vol_vendedor) já calculados.
-    """
+def analisar_big_players_resumo(df: pd.DataFrame) -> dict:
+    """Ver dashboard.py::analisar_big_players_resumo pro mesmo raciocínio
+    (Fase 4, Modo Aprendizagem, 2026-07-21) — condensa a antiga seção
+    própria (janela `win-big-players`, removida) num único velocímetro no
+    hero. Retorna dict (não HTML) — cores aqui já são `C['x']` resolvido
+    (mesma convenção já usada nesta função antes, sem `PALETA_GAUGE`)."""
     if df is None or df.empty:
-        return html.Div('Sem dados.', style={'color': C['text2']})
+        return {'tem_dado': False, 'mensagem': 'Sem dados.'}
 
-    # Trabalha com os últimos 500 candles (snapshot de análise)
-    snap = df.tail(500).copy().reset_index(drop=True)
-    hoje = snap[snap['datetime'].dt.date == pd.Timestamp.now().date()]
+    # Trabalha com os últimos N candles (snapshot de análise, 5 pregões)
+    snap = df.tail(cfg.JANELA_SNAPSHOT_CURTO_PRAZO).copy().reset_index(drop=True)
     tem_fluxo = (snap['fluxo_disponivel'] == True) if 'fluxo_disponivel' in snap.columns else pd.Series([False]*len(snap))
     snap_fluxo = snap[tem_fluxo].reset_index(drop=True)
 
-    def _card_bp(titulo, valor, conclusao, detalhe, cor):
-        corpo = html.Div([
-            html.Div(valor, style={
-                'fontSize': '16px', 'fontWeight': '700',
-                'fontFamily': FONTS['mono'], 'color': cor, 'lineHeight': '1.2',
-            }),
-            html.Div(conclusao, style={
-                'fontSize': '12px', 'color': C['text'],
-                'fontFamily': FONTS['display'], 'marginTop': '4px',
-            }),
-            html.Div(detalhe, style={
-                'fontSize': '10px', 'color': C['text2'],
-                'fontFamily': FONTS['display'], 'marginTop': '2px',
-            }),
-        ])
-        return win98_groupbox(titulo, corpo, cor_led=cor,
-                               estilo_extra={'flex': '1', 'minWidth': '200px'})
-
     if snap_fluxo.empty:
-        # Sem dado de tick — análise só por anatomia de candle
-        # Sem secao('BIG PLAYERS FOOTPRINTS') aqui — o título já vem da
-        # titlebar da janela (win98_window('win-big-players', 'Big Players', ...)).
-        return html.Div([
-            html.Span('📊 ', style={'fontSize': '16px'}),
-            html.Span(
-                'Fluxo de tick não disponível neste período. '
-                'A análise de big players requer dado de tick — disponível apenas '
-                'para os contratos mais recentes. '
-                'Análise de anatomia de candle disponível no Price Action.',
-                style={'fontSize': '12px', 'color': C['text2'],
-                       'fontFamily': FONTS['body']}
+        return {
+            'tem_dado': False,
+            'mensagem': (
+                'Fluxo de tick não disponível neste período. A análise de big players '
+                'requer dado de tick — disponível apenas para os contratos mais recentes.'
             ),
-        ], style=win98_sunken(padding='14px', extra={'display': 'flex', 'alignItems': 'flex-start'}))
+        }
 
     # -------------------------------------------------------------------------
     # ANÁLISE 1 — LADO DOMINANTE (últimos 20 candles com fluxo)
@@ -1356,20 +1213,18 @@ def construir_big_players(df: pd.DataFrame) -> html.Div:
     if pct_c > 60:
         lado_dominante = f'Compradores {pct_c}%'
         conclusao_lado = 'Agressão compradora dominante — demanda real acima da oferta'
-        cor_lado = C['green']
+        cor_lado = 'green'
     elif pct_v > 60:
         lado_dominante = f'Vendedores {pct_v}%'
         conclusao_lado = 'Agressão vendedora dominante — pressão de venda real'
-        cor_lado = C['red']
+        cor_lado = 'red'
     else:
         lado_dominante = f'C {pct_c}% · V {pct_v}%'
         conclusao_lado = 'Mercado equilibrado — sem dominância clara de um lado'
-        cor_lado = C['amber']
+        cor_lado = 'amber'
 
     detalhe_lado = (f'Delta acum: {int(delta_acum):+,} · {len(ultimos_fluxo)} candles com tick · '
                     f'{pct_diverg}% de divergência candle/delta')
-
-    card_lado = _card_bp('Lado Dominante', lado_dominante, conclusao_lado, detalhe_lado, cor_lado)
 
     # -------------------------------------------------------------------------
     # ANÁLISE 2 — ABSORÇÃO (sinal de big player comprando/vendendo contra o movimento)
@@ -1381,22 +1236,11 @@ def construir_big_players(df: pd.DataFrame) -> html.Div:
     total_candles_f  = len(ultimos_fluxo)
 
     if absorcao_compra > total_candles_f * 0.3:
-        abs_valor = f'{absorcao_compra} candles'
-        abs_conclusao = 'Absorção compradora detectada — big player comprando na queda'
-        abs_detalhe = 'Candles de baixa com delta positivo indicam demanda institucional oculta'
-        abs_cor = C['green']
+        absorcao_texto = f'Absorção compradora detectada ({absorcao_compra} candles) — big player comprando na queda'
     elif absorcao_venda > total_candles_f * 0.3:
-        abs_valor = f'{absorcao_venda} candles'
-        abs_conclusao = 'Absorção vendedora detectada — distribuição em alta'
-        abs_detalhe = 'Candles de alta com delta negativo indicam oferta institucional oculta'
-        abs_cor = C['red']
+        absorcao_texto = f'Absorção vendedora detectada ({absorcao_venda} candles) — distribuição em alta'
     else:
-        abs_valor = 'Não detectada'
-        abs_conclusao = 'Sem sinal claro de absorção institucional'
-        abs_detalhe = f'Absorção compra: {absorcao_compra} · venda: {absorcao_venda} candles'
-        abs_cor = C['text2']
-
-    card_abs = _card_bp('Absorção Institucional', abs_valor, abs_conclusao, abs_detalhe, abs_cor)
+        absorcao_texto = f'Sem sinal claro de absorção institucional (compra: {absorcao_compra} · venda: {absorcao_venda} candles)'
 
     # -------------------------------------------------------------------------
     # ANÁLISE 3 — CANDLES DE MAIOR VOLUME (possíveis negócios grandes)
@@ -1419,21 +1263,13 @@ def construir_big_players(df: pd.DataFrame) -> html.Div:
             delta_ol = int(pd.to_numeric(ultimo_outlier.get('delta', 0), errors='coerce') or 0)
             dt_ol    = pd.to_datetime(ultimo_outlier.get('datetime', '')).strftime('%H:%M') if pd.notna(ultimo_outlier.get('datetime')) else '—'
             lado_ol  = 'comprador' if delta_ol > 0 else 'vendedor'
-            cor_ol   = C['green'] if delta_ol > 0 else C['red']
 
-            vol_valor = f'{int(len(outliers))} evento(s)'
-            vol_conclusao = f'Volume anômalo detectado às {dt_ol} em {_fmt(preco_ol, 0)}'
-            vol_detalhe = (f'Delta {delta_ol:+,} — lado {lado_ol} dominou · '
-                           f'{int(mascara.sum())} eventos acima de 2σ')
+            volume_texto = (f'Volume anômalo detectado às {dt_ol} em {_fmt(preco_ol, 0)} — delta {delta_ol:+,} '
+                            f'(lado {lado_ol} dominou), {int(mascara.sum())} eventos acima de 2σ')
         else:
-            vol_valor = 'Sem anomalia'
-            vol_conclusao = 'Volume distribuído normalmente — sem eventos institucionais óbvios'
-            vol_detalhe = f'Média: {int(media_vol):,} · threshold 2σ: {int(media_vol + 2*std_vol):,}'
-            cor_ol = C['text2']
-
-        card_vol_bp = _card_bp('Volume Anômalo', vol_valor, vol_conclusao, vol_detalhe, cor_ol)
+            volume_texto = f'Volume distribuído normalmente — sem eventos institucionais óbvios (média {int(media_vol):,})'
     else:
-        card_vol_bp = _card_bp('Volume Anômalo', '—', 'Sem dado de tick suficiente', '', C['text2'])
+        volume_texto = 'Sem dado de tick suficiente para detectar anomalias de volume'
 
     # -------------------------------------------------------------------------
     # ANÁLISE 4 — O QUE FAZER COM ESSA INFORMAÇÃO
@@ -1441,34 +1277,102 @@ def construir_big_players(df: pd.DataFrame) -> html.Div:
     # Leitura consolidada acionável
     if pct_c > 60 and absorcao_compra > total_candles_f * 0.2:
         acao = 'Compradores dominam e absorvem a venda — cenário favorável para longs em S'
-        cor_acao = C['green']
+        cor_acao = 'green'
     elif pct_v > 60 and absorcao_venda > total_candles_f * 0.2:
         acao = 'Vendedores dominam e distribuem em alta — cenário favorável para shorts em R'
-        cor_acao = C['red']
+        cor_acao = 'red'
     elif n_diverg > total_candles_f * 0.4:
         acao = f'Alta divergência candle/delta ({pct_diverg}%) — mercado em transição, aguardar definição'
-        cor_acao = C['amber']
+        cor_acao = 'amber'
     else:
         acao = 'Fluxo sem sinal direcional claro — aguardar setup com confluência de S/R e tendência'
-        cor_acao = C['text2']
+        cor_acao = 'text2'
 
-    card_acao = win98_groupbox(
-        'O QUE FAZER COM ISSO',
-        html.Div(acao, style={
-            'fontSize': '14px', 'color': cor_acao,
-            'fontFamily': FONTS['body'], 'lineHeight': '1.6',
-            'fontWeight': '500',
-        }),
-        cor_led=C['gold'], estilo_extra={'marginTop': '12px'},
-    )
+    return {
+        'tem_dado': True,
+        'pct_c': pct_c, 'pct_v': pct_v,
+        'lado_dominante': lado_dominante, 'conclusao_lado': conclusao_lado, 'cor_lado': cor_lado,
+        'detalhe_lado': detalhe_lado,
+        'absorcao_texto': absorcao_texto,
+        'volume_texto': volume_texto,
+        'acao_texto': acao, 'cor_acao': cor_acao,
+    }
 
-    # Sem secao('BIG PLAYERS FOOTPRINTS') aqui — o título já vem da titlebar
-    # da janela (win98_window('win-big-players', 'Big Players', ...)).
-    return html.Div([
-        html.Div([card_lado, card_abs, card_vol_bp],
-                 style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
-        card_acao,
-    ])
+
+def _texto_status_modo_aprendizagem_98(ativo: bool) -> html.Div:
+    """Ver dashboard.py::_texto_status_modo_aprendizagem — mesmo texto,
+    função à parte pra reaproveitar na carga inicial e no callback."""
+    if ativo:
+        texto = ('Modo Aprendizagem LIGADO — o sistema cruza seu operacional real '
+                  '(Diário) com a análise dos traçados. Ajustes finos são aplicados '
+                  'automaticamente; ajustes estruturais viram sugestão pra implementar depois.')
+        cor = C['gold']
+    else:
+        texto = ('Modo Padrão — o sistema só observa e registra a comparação, '
+                  'sem aplicar nenhum ajuste automático.')
+        cor = C['text2']
+    return html.Div(texto, style={
+        'fontSize': '11px', 'color': cor, 'fontFamily': FONTS['body'],
+        'lineHeight': '1.4', 'marginTop': '8px', 'maxWidth': '320px',
+    })
+
+
+def _texto_log_recalibracao_98() -> html.Div:
+    """Ver dashboard.py::_texto_log_recalibracao pro mesmo raciocínio."""
+    log = persistencia.carregar_log_recalibracao()
+    if log is None or log.empty:
+        return html.Div('Nenhuma recalibração rodou ainda.', style={
+            'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['body'],
+        })
+    ultima = log.iloc[-1]
+    if ultima['status'] == 'dados_insuficientes':
+        texto = (f"Última rodada ({ultima['timestamp'][:16].replace('T', ' ')}): "
+                  f"dados insuficientes ainda ({int(ultima['n_amostras'])} amostras).")
+        return html.Div(texto, style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['body'], 'lineHeight': '1.4'})
+    sugestoes = json.loads(ultima['sugestoes_json']) if ultima.get('sugestoes_json') else []
+    partes = [html.Div(
+        f"Última rodada ({ultima['timestamp'][:16].replace('T', ' ')}): "
+        f"{int(ultima['n_amostras'])} amostras analisadas.",
+        style={'fontSize': '11px', 'color': C['text'], 'fontFamily': FONTS['body'], 'marginBottom': '6px'},
+    )]
+    if not sugestoes:
+        partes.append(html.Div('Nenhuma inversão de postura detectada.', style={
+            'fontSize': '11px', 'color': C['green'], 'fontFamily': FONTS['body'],
+        }))
+    else:
+        for s in sugestoes:
+            partes.append(html.Div(f"⚠ {s['detalhe']}", style={
+                'fontSize': '11px', 'color': C['gold'], 'fontFamily': FONTS['body'],
+                'lineHeight': '1.4', 'marginBottom': '4px',
+            }))
+    return html.Div(partes)
+
+
+def _painel_sugestoes_estruturais_98() -> html.Div:
+    """Ver dashboard.py::_painel_sugestoes_estruturais pro mesmo
+    raciocínio — painel só de leitura."""
+    df = aprendizagem.listar_sugestoes_estruturais(status='pendente')
+    if df.empty:
+        return html.Div('Nenhuma sugestão estrutural pendente.', style={
+            'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['body'],
+        })
+    cards = []
+    for _, row in df.iterrows():
+        cards.append(html.Div([
+            html.Div(row['titulo'], style={
+                'fontSize': '12px', 'fontWeight': '700', 'color': C['text'],
+                'fontFamily': FONTS['display'], 'marginBottom': '4px',
+            }),
+            html.Div(row['detalhe'], style={
+                'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['body'], 'lineHeight': '1.4',
+            }),
+            html.Div(f"registrada em {pd.Timestamp(row['criado_em']).strftime('%Y-%m-%d %H:%M')} · origem: {row['origem']}", style={
+                'fontSize': '9px', 'color': C['text2'], 'fontFamily': FONTS['mono'], 'marginTop': '6px',
+            }),
+        ], style={
+            'borderLeft': f'3px solid {C["gold"]}', 'paddingLeft': '8px', 'marginBottom': '12px',
+        }))
+    return html.Div(cards)
 
 
 # =============================================================================
@@ -1641,32 +1545,17 @@ app.layout = html.Div([
         ]),
     ),
 
-    # =========================================================================
-    # JANELA — Price Action
-    # =========================================================================
-    win98_window(
-        'win-price-action', 'Price Action', icone='/assets/icons/find-file.png',
-        width='32%', min_width='400px',
-        default_top_pct=3, default_left_pct=35,
-        estilo_extra={'height': 'calc(100vh - 70px)'}, resizable=True,
-        children=html.Div(id='price-action-conteudo'),
-    ),
+    # Janela "Price Action" própria removida (Modo Aprendizagem.txt,
+    # 2026-07-20) — fundida dentro de "win-tracados" abaixo (mesmo raciocínio
+    # de dashboard.py::construir_price_action): o motor não sugere mais S/R
+    # sozinho, então o que sobra de Price Action (bloco de preço + pivô
+    # imediato/em formação) mora junto do gráfico editável de Traçados, não
+    # numa janela própria. `price-action-conteudo` (o id do container) foi
+    # movido pra dentro de win-tracados, não removido.
 
-    # =========================================================================
-    # JANELA — Big Players
-    # Ocupava só metade de cima da coluna direita (a outra metade era o
-    # Gráfico, logo abaixo) — desde que "Traçados" (grande, fechada por
-    # padrão) substituiu o Gráfico na grade sempre-aberta (2026-07-12), Big
-    # Players preenche a coluna inteira, mesma altura de Quant Lab/Price
-    # Action (grade volta a ficar simétrica em 3 colunas).
-    # =========================================================================
-    win98_window(
-        'win-big-players', 'Big Players', icone='/assets/icons/favorites.png',
-        width='31%', min_width='420px',
-        default_top_pct=3, default_left_pct=68,
-        estilo_extra={'height': 'calc(100vh - 70px)'}, resizable=True,
-        children=html.Div(id='big-players-conteudo'),
-    ),
+    # Janela própria "Big Players" removida (Fase 4, Modo Aprendizagem,
+    # 2026-07-21) — condensada num único velocímetro no hero, ao lado de
+    # Correlacionados (ver construir_hero/analisar_big_players_resumo).
 
     # =========================================================================
     # JANELA — Traçados (substituiu "Gráfico" em 2026-07-12 — mesmo
@@ -1684,9 +1573,12 @@ app.layout = html.Div([
     # suporta o shape de trendline, só falta a ferramenta de desenho.
     # =========================================================================
     win98_window(
-        'win-tracados', 'Traçados', icone='/assets/icons/grafico.png',
+        # Início aberta (era `start_closed=True`) — passou a ser a janela
+        # de Price Action também (Modo Aprendizagem.txt, 2026-07-20), não
+        # mais só uma ferramenta de desenho opcional.
+        'win-tracados', 'Price Action', icone='/assets/icons/grafico.png',
         width='62%', min_width='760px',
-        default_top_pct=6, default_left_pct=18, start_closed=True,
+        default_top_pct=6, default_left_pct=18, start_closed=False,
         estilo_extra={'height': '80vh'}, resizable=True,
         menubar=[
             html.Button('🖱 Cursor', id='btn-tracado-cursor-98',
@@ -1701,8 +1593,20 @@ app.layout = html.Div([
                         className='tracado-tool-btn-98'),
             html.Button('△ Figura', disabled=True, title='Em breve',
                         className='tracado-tool-btn-98'),
+            # Criar linha digitando o preço direto (Modo Aprendizagem.txt,
+            # 2026-07-20) — ver criar_tracado_por_preco_callback_98.
+            dcc.Input(
+                id='tracado-criar-preco-98', type='number', placeholder='Preço...',
+                step='any', style={**win98_field(), 'width': '90px', 'marginLeft': '6px'},
+            ),
+            html.Button('+ Criar', id='btn-tracado-criar-preco-98',
+                        className='tracado-tool-btn-98'),
+            html.Span(id='tracado-criar-preco-status-98', style={
+                'fontSize': '10px', 'color': C['text2'], 'marginLeft': '6px', 'alignSelf': 'center',
+            }),
         ],
         children=html.Div([
+            html.Div(id='price-action-conteudo', style={'marginBottom': '10px'}),
             html.Div([
                 html.Div(id='lw-chart-tracados', style={'width': '100%', 'height': '100%'}),
                 _botao_reset_zoom('btn-reset-zoom-tracados'),
@@ -1796,6 +1700,52 @@ app.layout = html.Div([
     ),
 
     # =========================================================================
+    # JANELA — Configurações (Fase 3.1, 2026-07-21) — antes só um registro
+    # placeholder (`implementada=False` em estilo_win98.py), sem conteúdo
+    # nem ícone/atalho de menu. Primeiro uso real: switch de Modo
+    # Aprendizagem, mesmo `config_operacional.py` server-side do dashboard
+    # clássico (ver dashboard.py::alternar_modo_aprendizagem) — switch
+    # NUNCA recriado via `children` pelo callback (só `className`), mesma
+    # lição de .tracado-tool-btn/.diario-estrela sobre n_clicks resetando.
+    # =========================================================================
+    win98_window(
+        'win-config', 'Configurações', icone='/assets/icons/settings.png',
+        width='380px', min_width='320px',
+        default_top_pct=15, default_left_pct=55, start_closed=True,
+        children=[
+            win98_groupbox('Modo Aprendizagem', [
+                html.Div([
+                    html.Span('Padrão', style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display']}),
+                    html.Div(
+                        html.Div(className='modo-aprendizagem-toggle-knob'),
+                        id='switch-modo-aprendizagem-98', n_clicks=0,
+                        className='modo-aprendizagem-toggle' + (
+                            ' modo-aprendizagem-toggle--ativo' if config_operacional.modo_aprendizagem_ativo() else ''),
+                        title='Ligar/desligar Modo Aprendizagem',
+                    ),
+                    html.Span('Aprendizagem', style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['display']}),
+                ], style={'display': 'flex', 'alignItems': 'center', 'gap': '10px'}),
+                html.Div(
+                    id='modo-aprendizagem-status-98',
+                    children=_texto_status_modo_aprendizagem_98(config_operacional.modo_aprendizagem_ativo()),
+                ),
+            ], estilo_extra={'margin': '10px'}),
+            # Recalibração (Fase 3.3, 2026-07-21) — ver dashboard.py pro
+            # mesmo raciocínio (botão manual, nunca escreve constante).
+            win98_groupbox('Recalibração (ajuste fino)', [
+                html.Button('Rodar recalibração', id='btn-rodar-recalibracao-98', n_clicks=0,
+                            className='win98-btn', style={**win98_button(), 'marginBottom': '10px'}),
+                html.Div(id='recalibracao-resultado-98', children=_texto_log_recalibracao_98()),
+            ], estilo_extra={'margin': '10px'}),
+            # Sugestões estruturais (Fase 3.4) — ver dashboard.py pro
+            # mesmo raciocínio (painel só de leitura, sem botão).
+            win98_groupbox('Sugestões Estruturais Pendentes', [
+                html.Div(id='sugestoes-estruturais-conteudo-98', children=_painel_sugestoes_estruturais_98()),
+            ], estilo_extra={'margin': '10px'}),
+        ],
+    ),
+
+    # =========================================================================
     # JANELA — Rastreador de Tendência (leitura quantitativa da MME21, nos
     # mesmos moldes do Price Action — ver construir_rastreador_tendencia e
     # analisar_mme21 em metricas.py). Jesué não opera a MME21 como
@@ -1805,8 +1755,8 @@ app.layout = html.Div([
     # =========================================================================
     win98_window(
         'win-rastreador', 'Rastreador de Tendência', icone='/assets/icons/rastreador.png',
-        width='360px', min_width='320px',
-        default_top_pct=10, default_left_pct=55, start_closed=True,
+        width='620px', min_width='400px',
+        default_top_pct=10, default_left_pct=55, start_closed=False,
         resizable=True,
         children=html.Div(id='rastreador-conteudo'),
     ),
@@ -1978,12 +1928,13 @@ app.clientside_callback(
 # "o clique registrou" enquanto o conteúdo recarrega, sem esperar o
 # round-trip do callback principal. Ver assets_98/style.css. Dispara só em
 # store-ativo (nunca no tick de 1s), então não pisca a cada segundo.
-# 4 ids de conteúdo (hero/market-view ficam na mesma janela Quant Lab desde
-# a fusão; price-action e big-players são janelas próprias).
+# 3 ids de conteúdo (hero/market-view ficam na mesma janela Quant Lab desde
+# a fusão; price-action é janela própria — big-players deixou de ser
+# janela própria na Fase 4, condensada no hero).
 app.clientside_callback(
     """
     function(ativo) {
-        ['hero-conteudo', 'market-view-conteudo', 'price-action-conteudo', 'big-players-conteudo']
+        ['hero-conteudo', 'market-view-conteudo', 'price-action-conteudo']
             .forEach(function (id) {
                 var el = document.getElementById(id);
                 if (el) {
@@ -2210,13 +2161,20 @@ def atualizar_estilo_ativo_selecionado(ativo):
 @app.callback(
     Output('balao-gauge-explicacao', 'children'),
     Input('store-gauge-selecionado', 'data'),
+    State('store-ativo', 'data'),
 )
-def renderizar_balao_gauge(gauge_selecionado):
+def renderizar_balao_gauge(gauge_selecionado, ativo):
     """Dispara só quando o clique client-side (assets_98/hero_gauges.js)
     muda `store-gauge-selecionado` — nunca no tick de 1s (ver comentário em
     construir_hero/_balao_explicacao_gauge sobre por quê o balão mora fora
-    de hero-conteudo)."""
-    return _balao_explicacao_gauge(gauge_selecionado or 'forca')
+    de hero-conteudo). 'big_players' (Fase 4, 2026-07-21) é dinâmico — ver
+    dashboard.py::renderizar_balao_gauge pro mesmo raciocínio."""
+    gauge_selecionado = gauge_selecionado or 'forca'
+    if gauge_selecionado == 'big_players':
+        df_ativo = estado['bases'].get(ativo or 'WIN')
+        resumo = analisar_big_players_resumo(df_ativo)
+        return _balao_big_players_98(resumo)
+    return _balao_explicacao_gauge(gauge_selecionado)
 
 
 @app.callback(
@@ -2294,7 +2252,15 @@ def _sincronizar_posicoes_background():
             df_pos = mt5_loader.buscar_posicoes_abertas() if MT5_OK else None
         except Exception:
             df_pos = None
-        resultado = diario_trade.sincronizar_posicoes_abertas(df_pos)
+        try:
+            resultado = diario_trade.sincronizar_posicoes_abertas(df_pos)
+        except Exception:
+            # Ver dashboard.py::_sincronizar_posicoes_background pro
+            # raciocínio completo (bug real 2026-07-21: exceção aqui
+            # congelava posicoes_abertas.parquet num snapshot velho, sem
+            # aviso nenhum).
+            log_sync_posicoes.exception('Falha em sincronizar_posicoes_abertas')
+            resultado = None
         if resultado is not None:
             with lock:
                 estado['posicoes_abertas'] = resultado
@@ -2399,6 +2365,32 @@ def criar_tracado_98(payload, ativo):
     ativo_real = ativo
     tracados.criar_tracado(ativo_real, 'horizontal', payload['preco'])
     return '', tracados.listar_tracados(ativo_real).to_dict('records')
+
+
+@app.callback(
+    Output('scroll-dummy', 'children', allow_duplicate=True),
+    Output('store-tracados-servidor-98', 'data', allow_duplicate=True),
+    Output('tracado-criar-preco-98', 'value'),
+    Output('tracado-criar-preco-status-98', 'children'),
+    Input('btn-tracado-criar-preco-98', 'n_clicks'),
+    State('tracado-criar-preco-98', 'value'),
+    State('store-ativo', 'data'),
+    prevent_initial_call=True,
+)
+def criar_tracado_por_preco_callback_98(_n_clicks, preco, ativo):
+    """Ver dashboard.py::criar_tracado_por_preco_callback pro mesmo
+    raciocínio — criar traçado digitando o preço direto, sem precisar
+    clicar no gráfico (Modo Aprendizagem.txt, 2026-07-20)."""
+    if not ativo:
+        return no_update, no_update, no_update, no_update
+    if preco is None or (isinstance(preco, str) and not preco.strip()):
+        return no_update, no_update, no_update, '⚠ Informe um preço.'
+    try:
+        preco_float = float(str(preco).replace(',', '.'))
+    except ValueError:
+        return no_update, no_update, no_update, '⚠ Preço inválido.'
+    tracados.criar_tracado(ativo, 'horizontal', preco_float)
+    return '', tracados.listar_tracados(ativo).to_dict('records'), None, f'✔ Linha criada em {preco_float:,.0f}.'
 
 
 @app.callback(
@@ -2611,7 +2603,6 @@ def atualizar_mme21_serie_completo(n_slow, ativo):
     Output('hero-conteudo', 'children'),
     Output('market-view-conteudo', 'children'),
     Output('price-action-conteudo', 'children'),
-    Output('big-players-conteudo', 'children'),
     Output('status-conexao', 'children'),
     Output('status-contrato', 'children'),
     Output('status-atualizacao', 'children'),
@@ -2693,14 +2684,14 @@ def atualizar_dashboard(n_intervals, ativo, candle_atual, timeline_expandida):
             'Base de dados não encontrada. Acesse CONFIGURAÇÕES para fazer o setup inicial.',
             style={'color': C['text2'], 'fontFamily': FONTS['body'], 'padding': '20px'}
         )
-        return (placeholder, placeholder, placeholder, placeholder,
+        return (placeholder, placeholder, placeholder,
                 status, contrato_str, upd_str, cal_str, cal_style, None,
                 {'ativo': ativo, 'niveis': []}, {'ativo': ativo, 'ponto': None}, placeholder)
 
-    hero         = construir_hero(m_win, m_wdo, ativo, indice_mg, correlacao, cotacoes_correlacionadas)
+    big_players  = analisar_big_players_resumo(df_ativo)
+    hero         = construir_hero(m_win, m_wdo, ativo, indice_mg, correlacao, cotacoes_correlacionadas, big_players)
     market_view  = construir_market_view(m)
     price_action = construir_price_action(df_ativo, m, timeline_expandida or {})
-    big_players  = construir_big_players(df_ativo)
     # Marcado com o `ativo` que gerou esses níveis — o clientside_callback
     # de desenho (assets_98/lwchart.js::desenharNiveisSR) descarta a
     # resposta se esse rótulo não bater com o `store-ativo` atual do
@@ -2728,28 +2719,94 @@ def atualizar_dashboard(n_intervals, ativo, candle_atual, timeline_expandida):
 
     # MME21 — mesmo cuidado de tag de `ativo` do restante (ver niveis_sr acima).
     mme21_live = {'ativo': ativo, 'ponto': mme21_ponto_live(df_ativo, preco_live)}
-    mme21_analise = analisar_mme21(df_ativo, tendencia=m.get('tendencia'))
-    rastreador = construir_rastreador_tendencia(mme21_analise)
+    rastreador_analises = analisar_rastreador_tendencia(df_ativo)
+    rastreador = construir_rastreador_tendencia(rastreador_analises)
 
-    return (hero, market_view, price_action, big_players,
+    return (hero, market_view, price_action,
             status, contrato_str, upd_str, cal_str, cal_style, candle_live, niveis_sr,
             mme21_live, rastreador)
 
 
-def construir_rastreador_tendencia(analise: dict) -> html.Div:
-    """Leitura quantitativa da MME21 — mesma linguagem do Price Action
-    (badges de força, % de probabilidade, leitura textual), mas pra uma
-    média móvel em vez de um nível de S/R estático. Jesué não opera a
-    MME21 como estratégia principal — só em dias de tendência sem entrada
-    no price action puro — por isso a regra de nunca operar em lateral
-    domina a seção inteira quando `operavel` é False (ver analisar_mme21
-    em metricas.py)."""
-    if not analise or analise.get('linha_atual') is None:
+_ROTULOS_RASTREADOR_98 = {
+    'maior': 'Tendência Maior (5 pregões)',
+    'media': 'Tendência Média (2 pregões)',
+    'menor': 'Tendência Menor (1 pregão)',
+    'micro': 'Tendência Micro',
+    'atual': 'Tendência Atual (21 candles)',
+}
+
+
+_COR_TENDENCIA_TIER_98 = {'alta': 'green', 'baixa': 'red', 'lateral': 'text2'}
+_LABEL_TENDENCIA_TIER_98 = {'alta': '▲ ALTA', 'baixa': '▼ BAIXA', 'lateral': '— LATERAL'}
+
+
+def construir_rastreador_tendencia(analises: dict) -> html.Div:
+    """Ver dashboard.py::construir_rastreador_tendencia pro raciocínio
+    completo — MME21 é 1 bloco ÚNICO (`_card_mme21_98`), ao lado de 5
+    cards leves de tendência por escala (`_card_tier_tendencia_98`, só o
+    rótulo alta/baixa/lateral). Corrige achado real 2026-07-21: a versão
+    anterior repetia a análise de TOQUES da MME21 em cada tier (janela=
+    565/226/113...), o que não faz sentido pra uma média rápida.
+    `analises` vem no formato `{'tiers': {...}, 'mme21': {...}}`."""
+    if not analises:
         return html.Div('Sem dado suficiente pra calcular a MME21 ainda.',
                          style={'color': C['text2'], 'fontFamily': FONTS['body'], 'padding': '20px'})
+    tiers = analises.get('tiers') or {}
+    mme21 = analises.get('mme21')
+    cards = [
+        _card_tier_tendencia_98(_ROTULOS_RASTREADOR_98[nivel], tiers[nivel])
+        for nivel in ('maior', 'media', 'menor', 'micro', 'atual')
+        if nivel in tiers
+    ]
+    return html.Div([
+        html.Div(cards, style={
+            'display': 'grid', 'gridTemplateColumns': 'repeat(auto-fit, minmax(150px, 1fr))', 'gap': '8px',
+            'marginBottom': '10px',
+        }),
+        _card_mme21_98(mme21),
+    ])
+
+
+def _card_tier_tendencia_98(rotulo: str, tier: dict) -> html.Div:
+    """1 card leve de tendência — ver dashboard.py::_card_tier_tendencia."""
+    _rotulo_nivel = html.Div(rotulo, style={
+        'fontSize': '10px', 'color': C['gold'], 'fontFamily': FONTS['display'],
+        'fontWeight': '600', 'textTransform': 'uppercase', 'letterSpacing': '0.05em',
+        'marginBottom': '6px',
+    })
+    tend = (tier or {}).get('tendencia')
+    if not tend:
+        corpo = html.Div('Sem dado ainda.', style={'color': C['text2'], 'fontFamily': FONTS['body'], 'fontSize': '11px'})
+    else:
+        corpo = html.Div(_LABEL_TENDENCIA_TIER_98.get(tend, tend.upper()), style={
+            'fontSize': '14px', 'fontWeight': '700', 'color': C[_COR_TENDENCIA_TIER_98.get(tend, 'text2')],
+            'letterSpacing': '0.04em',
+        })
+    return html.Div([_rotulo_nivel, corpo], style=win98_sunken(padding='12px'))
+
+
+def _card_mme21_98(analise: dict) -> html.Div:
+    """Card ÚNICO da MME21 — ver dashboard.py::_card_mme21."""
+    _rotulo = html.Div('MME21 (EMA 21)', style={
+        'fontSize': '10px', 'color': C['gold'], 'fontFamily': FONTS['display'],
+        'fontWeight': '600', 'textTransform': 'uppercase', 'letterSpacing': '0.05em',
+        'marginBottom': '6px',
+    })
+
+    if not analise or analise.get('linha_atual') is None:
+        return html.Div([_rotulo, html.Div(
+            'Sem dado suficiente pra calcular a MME21 ainda.',
+            style={'color': C['text2'], 'fontFamily': FONTS['body']},
+        )], style=win98_sunken(padding='12px'))
+
+    numero = html.Div(_fmt(analise['linha_atual'], 0), style={
+        'fontSize': '24px', 'fontWeight': '700', 'fontFamily': FONTS['mono'], 'color': C['text'],
+        'marginBottom': '8px',
+    })
 
     if not analise.get('operavel', True):
         return html.Div([
+            _rotulo, numero,
             html.Div('⚠ MERCADO LATERAL', style={
                 'fontSize': '14px', 'fontWeight': '700', 'color': texto_sobre(C['yellow']),
                 'background': C['yellow'], 'padding': '6px 10px', 'marginBottom': '10px',
@@ -2757,10 +2814,7 @@ def construir_rastreador_tendencia(analise: dict) -> html.Div:
             }),
             html.Div(analise.get('mensagem') or 'MME21 não deve ser operada em mercado lateral.', style={
                 'fontSize': '12px', 'color': C['text'], 'fontFamily': FONTS['body'],
-                'lineHeight': '1.5', 'marginBottom': '12px',
-            }),
-            html.Div(f"MME21 atual: {_fmt(analise['linha_atual'], 0)}", style={
-                'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['mono'],
+                'lineHeight': '1.5',
             }),
         ], style=win98_sunken(padding='12px'))
 
@@ -2802,19 +2856,11 @@ def construir_rastreador_tendencia(analise: dict) -> html.Div:
                    f'acompanhar antes de considerar como referência operacional.')
 
     return html.Div([
-        html.Div([
-            html.Div('MME21 (EMA 21)', style={
-                'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['display'],
-                'letterSpacing': '0.08em', 'marginBottom': '4px',
-            }),
-            html.Div(_fmt(analise['linha_atual'], 0), style={
-                'fontSize': '24px', 'fontWeight': '700', 'fontFamily': FONTS['mono'], 'color': cor,
-            }),
-            html.Div(tipo.upper(), style={
-                'fontSize': '11px', 'color': cor, 'fontFamily': FONTS['display'],
-                'fontWeight': '700', 'letterSpacing': '0.05em', 'marginTop': '2px',
-            }),
-        ], style={'marginBottom': '10px'}),
+        _rotulo, numero,
+        html.Div(tipo.upper(), style={
+            'fontSize': '11px', 'color': cor, 'fontFamily': FONTS['display'],
+            'fontWeight': '700', 'letterSpacing': '0.05em', 'marginBottom': '8px',
+        }),
         html.Div(badges, style={'marginBottom': '8px'}) if badges else html.Div(),
         html.Div(f'{toques} toque{"s" if toques != 1 else ""} nos últimos {janela} candles', style={
             'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['display'], 'marginBottom': '6px',
@@ -3172,6 +3218,38 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
     novo_historico = (historico_atual or []) + [msg_usuario, msg_ia]
 
     return novo_historico, status_str, '', None, ''
+
+
+# Modo Aprendizagem (Fase 3.1, 2026-07-21) — ver dashboard.py::
+# alternar_modo_aprendizagem pro mesmo raciocínio (round-trip de servidor
+# de verdade, Output só em `className`/status separado, nunca `children`
+# do switch em si).
+@app.callback(
+    Output('switch-modo-aprendizagem-98', 'className'),
+    Output('modo-aprendizagem-status-98', 'children'),
+    Input('switch-modo-aprendizagem-98', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def alternar_modo_aprendizagem_98(n_clicks):
+    atual = config_operacional.modo_aprendizagem_ativo()
+    config_operacional.definir_modo_aprendizagem(not atual)
+    ativo_final = config_operacional.modo_aprendizagem_ativo()
+    classe = 'modo-aprendizagem-toggle' + (' modo-aprendizagem-toggle--ativo' if ativo_final else '')
+    return classe, _texto_status_modo_aprendizagem_98(ativo_final)
+
+
+@app.callback(
+    Output('recalibracao-resultado-98', 'children'),
+    Input('btn-rodar-recalibracao-98', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def rodar_recalibracao_callback_98(n_clicks):
+    """Ver dashboard.py::rodar_recalibracao_callback pro mesmo raciocínio."""
+    try:
+        aprendizagem.rodar_recalibracao()
+    except Exception as e:
+        return html.Div(f'⚠ Erro ao recalibrar: {str(e)[:150]}', style={'fontSize': '11px', 'color': C['red']})
+    return _texto_log_recalibracao_98()
 
 
 # =============================================================================

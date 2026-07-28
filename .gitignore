@@ -12,6 +12,11 @@ data/
 # Logs
 log.txt
 _log_*.txt
+*.log
+# Saída dos processos quando iniciados em background (nohup ... > _restart_*)
+_restart_*.txt
+# Scripts/arquivos de rascunho de diagnóstico, nunca parte do app
+scratch_*.txt
 
 # Configurações locais do Claude Code (permissões específicas da máquina)
 .claude/settings.local.json

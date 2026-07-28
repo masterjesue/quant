@@ -1,0 +1,121 @@
+<!doctype html>
+<!--
+  Teste do assets/tag_input.js contra a forma REAL do DOM que o Dash 4.x
+  produz pro `dcc.Input` (wrapper + input interno).
+
+  Por que este arquivo existe: em 2026-07-27 eu "validei" o widget de tags
+  setando `.value` no elemento `.tag-widget-input` — que no Dash 4.x é uma
+  DIV, não um input. Isso CRIOU a propriedade e fez o teste passar enquanto o
+  widget seguia quebrado pro usuário. O teste era inválido, não o código.
+  Aqui o texto é escrito no <input> DE VERDADE, como o navegador faria.
+
+  Rodar: abrir este arquivo no navegador (nao precisa de servidor).
+-->
+<meta charset="utf-8">
+<title>teste tag_input.js</title>
+<style>
+  body { font-family: system-ui, sans-serif; padding: 20px; }
+  #saida { white-space: pre; font-family: monospace; margin-top: 16px; }
+  .ok { color: #128A55; } .falha { color: #B33A3A; font-weight: 700; }
+</style>
+
+<h3>tag_input.js — forma de DOM do Dash 4.x</h3>
+
+<!-- Réplica exata do que _campo_tag_widget + dcc.Input produzem -->
+<div class="tag-widget"
+     data-store-id='{"type": "ea-tags-emocionais", "index": 1}'
+     data-opcoes='[{"label": "Calma", "value": "calma"}]'>
+  <div class="tag-widget-dica">Digite e pressione Enter</div>
+  <div class="tag-widget-caixa">
+    <div class="tag-widget-chips"></div>
+    <div class="dash-input-container dash-input tag-widget-input">
+      <input class="dash-input-element" type="text" placeholder="Nova tag...">
+    </div>
+  </div>
+  <div class="tag-widget-rodape">
+    <span class="tag-widget-contador">0 tag(s)</span>
+    <button type="button" class="tag-widget-limpar">Remover todas</button>
+  </div>
+</div>
+
+<div id="saida"></div>
+
+<script>
+  // `set_props` é do Dash; aqui só registra o que o JS tentou gravar no Store.
+  window.__gravado = null;
+  window.dash_clientside = {
+    set_props: function (id, props) { window.__gravado = { id: id, props: props }; }
+  };
+</script>
+<script src="../assets/tag_input.js"></script>
+<script>
+(function () {
+  var falhas = [];
+  var linhas = [];
+  function checar(nome, ok, detalhe) {
+    linhas.push((ok ? '  PASS  ' : '  FALHA ') + nome + (ok ? '' : '  ' + (detalhe || '')));
+    if (!ok) falhas.push(nome);
+  }
+
+  var widget = document.querySelector('.tag-widget');
+  var campo = widget.querySelector('input');          // o input REAL
+  var chips = function () {
+    return Array.prototype.map.call(widget.querySelectorAll('.tag-chip'),
+      function (c) { return c.getAttribute('data-valor'); });
+  };
+  var contador = function () { return widget.querySelector('.tag-widget-contador').textContent; };
+
+  function digitar(texto, tecla) {
+    campo.focus();
+    campo.value = texto;   // legítimo: `campo` é um <input> de verdade
+    campo.dispatchEvent(new KeyboardEvent('keydown',
+      { key: tecla, bubbles: true, cancelable: true }));
+  }
+
+  // 1 — Enter cria a tag mesmo com o input aninhado no wrapper do Dash 4.x
+  digitar('tranquilidade', 'Enter');
+  checar('Enter cria chip com o input dentro do wrapper',
+         chips().length === 1 && chips()[0] === 'tranquilidade',
+         'chips=' + JSON.stringify(chips()));
+  checar('campo limpa apos confirmar', campo.value === '', 'value=' + JSON.stringify(campo.value));
+  checar('contador atualiza', contador() === '1 tag(s)', contador());
+  checar('Store recebeu a lista',
+         window.__gravado && JSON.stringify(window.__gravado.props.data) === '["tranquilidade"]',
+         JSON.stringify(window.__gravado));
+
+  // 2 — vírgula também confirma
+  digitar('foco', ',');
+  checar('virgula cria chip', chips().length === 2, JSON.stringify(chips()));
+
+  // 3 — casa com o vocabulário oficial (label/value cadastrados)
+  digitar('Calma', 'Enter');
+  checar('usa o value oficial quando o texto bate com uma opcao',
+         chips().indexOf('calma') !== -1, JSON.stringify(chips()));
+
+  // 4 — não duplica
+  var antes = chips().length;
+  digitar('foco', 'Enter');
+  checar('nao duplica tag existente', chips().length === antes, JSON.stringify(chips()));
+
+  // 5 — Backspace no campo vazio remove a última
+  var n = chips().length;
+  digitar('', 'Backspace');
+  checar('backspace remove a ultima', chips().length === n - 1, JSON.stringify(chips()));
+
+  // 6 — × do chip remove
+  n = chips().length;
+  widget.querySelector('.tag-chip .tag-chip-remover').click();
+  checar('X do chip remove', chips().length === n - 1, JSON.stringify(chips()));
+
+  // 7 — "Remover todas"
+  widget.querySelector('.tag-widget-limpar').click();
+  checar('remover todas limpa', chips().length === 0 && contador() === '0 tag(s)',
+         JSON.stringify(chips()) + ' ' + contador());
+
+  document.getElementById('saida').innerHTML =
+    linhas.join('\n') + '\n\n' +
+    (falhas.length
+      ? '<span class="falha">' + falhas.length + ' FALHA(S)</span>'
+      : '<span class="ok">TODOS OS TESTES PASSARAM</span>');
+})();
+</script>

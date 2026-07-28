@@ -14,9 +14,10 @@ import config_backtest as cfg
 import features
 
 
-def extrair_metricas(df: pd.DataFrame, n_snapshot: int = 500) -> dict:
+def extrair_metricas(df: pd.DataFrame, n_snapshot: int = cfg.JANELA_SNAPSHOT_CURTO_PRAZO) -> dict:
     """
-    Extrai métricas do snapshot atual (últimos 500 candles).
+    Extrai métricas do snapshot atual (últimos `n_snapshot` candles — 5
+    pregões, ver `cfg.JANELA_SNAPSHOT_CURTO_PRAZO`).
 
     JANELAS EXPLÍCITAS — cada métrica usa a mesma janela ou declara a sua:
       - Fluxo (delta, razão de agressão): últimos 20 candles COM fluxo disponível
@@ -267,36 +268,54 @@ def _json_safe(v):
     return v
 
 
-def montar_snapshot_diario(m: dict) -> dict | None:
-    """
-    Recorte JSON-safe de `extrair_metricas()` para gravar junto de um trade
-    do Diário — captura o que o motor via no instante do save, sem I/O novo
-    (reaproveita o dict `m` já calculado a cada tick de 1s). Escopo: só
-    CAPTURA (direção quant→diário). Comparar isso contra `nivel_sr_referencia`
-    marcado à mão é um passo futuro registrado no plano do módulo Diário, não
-    implementado aqui.
+def _tracado_snapshot(t: dict) -> dict:
+    """Recorte JSON-safe de 1 traçado já analisado (`analisar_tracados`),
+    pro snapshot do Diário — blocos de força COMPLETOS (não só prob_bounce
+    — pedido explícito do Jesué, Fase 3.2 do Modo Aprendizagem: "o quant
+    tem que detalhar mais"), pra `avaliar_aderencia_tracados` comparar
+    depois contra `nivel_sr_referencia`."""
+    acao = t.get('acao') or {}
+    return {
+        'id_tracado': t.get('id_tracado'), 'preco': t.get('linha_atual'),
+        'tipo': t.get('tipo'), 'toques': t.get('toques'), 'forte': t.get('forte'),
+        'violado': t.get('violado'), 'prob_bounce': t.get('prob_bounce'),
+        'combustivel_score': t.get('combustivel_score'),
+        'aproximacao_score': t.get('aproximacao_score'),
+        'rejeicao_score': t.get('rejeicao_score'),
+        'postura': acao.get('postura'), 'magnitude_esperada': acao.get('magnitude_esperada'),
+        'alvo_pontos': acao.get('alvo_pontos'), 'stop_pontos': acao.get('stop_pontos'),
+    }
 
-    Recorte deliberado, não o dict inteiro: fora ficam o bloco de fluxo/tape
-    (sensível ao segundo exato, sem relação com comparar níveis S/R) e os
-    aliases legados de rank 1 (`sr_acima`/`sr_abaixo`, redundantes com
-    `niveis_sr_*[0]`).
+
+def montar_snapshot_diario(m: dict, tracados_analisados: list = None) -> dict | None:
+    """
+    Recorte JSON-safe de `extrair_metricas()` (+ traçados analisados) para
+    gravar junto de um trade do Diário — captura o que o motor via no
+    instante do save, sem I/O novo (reaproveita `m` já calculado + os
+    traçados que o CHAMADOR já tem em mãos naquele momento). Escopo: só
+    CAPTURA (direção quant→diário) — comparar isso contra
+    `nivel_sr_referencia` marcado à mão é `diario_trade.
+    avaliar_aderencia_tracados`, chamado à parte, sob demanda.
+
+    `tracados_analisados` (2026-07-21, Fase 3.2): lista vinda de
+    `metricas.analisar_tracados(df_ativo, tracados.listar_tracados(ativo))`
+    — substitui os antigos `niveis_sr_acima`/`niveis_sr_abaixo` (motor
+    automático desativado, Modo Aprendizagem.txt — ficariam sempre vazios).
+    Snapshots salvos ANTES desta mudança não têm a chave `tracados` —
+    `avaliar_aderencia_tracados` já trata isso como "não elegível pra
+    comparação", mesmo raciocínio de sempre pra dado migrado/antigo.
+
+    Recorte deliberado, não o dict inteiro: fora fica o bloco de fluxo/tape
+    (sensível ao segundo exato, sem relação com comparar níveis S/R).
     """
     if not m:
         return None
-
-    def _nivel(n: dict) -> dict:
-        return {campo: n.get(campo) for campo in (
-            'rank', 'preco', 'toques', 'idade', 'violado', 'forte',
-            'dist_atr', 'zona_min', 'zona_max', 'status',
-            'prob_bounce', 'rompimento_hoje',
-        )}
 
     snapshot = {
         'preco': m.get('preco'), 'atr': m.get('atr'), 'amp_dia_atr': m.get('amp_dia_atr'),
         'tendencia': m.get('tendencia'), 'fase': m.get('fase'), 'saude': m.get('saude'),
         'tipo_candle': m.get('tipo_candle'),
-        'niveis_sr_acima': [_nivel(n) for n in m.get('niveis_sr_acima', [])],
-        'niveis_sr_abaixo': [_nivel(n) for n in m.get('niveis_sr_abaixo', [])],
+        'tracados': [_tracado_snapshot(t) for t in (tracados_analisados or [])],
         'pivo_imediato_acima': m.get('pivo_imediato_acima'),
         'pivo_imediato_abaixo': m.get('pivo_imediato_abaixo'),
         'buildup_ativo': m.get('buildup_ativo'), 'buildup_duracao': m.get('buildup_duracao'),
@@ -658,6 +677,95 @@ def analisar_mme21(df: pd.DataFrame, tendencia: str = None) -> dict:
     return analise
 
 
+def _classificar_tendencia_serie(valores: np.ndarray, atrs: np.ndarray, janela: int) -> str:
+    """Classifica 'alta'/'baixa'/'lateral' pelo deslocamento LÍQUIDO da
+    série (MME21) do início ao fim da janela, normalizado pelo ATR médio do
+    período — mesma doutrina de limiar-em-múltiplos-de-ATR do resto do
+    motor (`cfg.LIMIAR_TENDENCIA_RASTREADOR_ATR`), nunca z-score. Usada por
+    `analisar_rastreador_tendencia` pra dar a CADA tier sua própria leitura
+    (ver comentário de `cfg.LIMIAR_TENDENCIA_RASTREADOR_ATR` — corrige o
+    bug real de 2026-07-20 onde um único booleano global decidia por
+    todos os 5 cards)."""
+    n = len(valores)
+    janela = min(janela, n)
+    if janela < 2:
+        return 'lateral'
+    ini = n - janela
+    delta = float(valores[-1] - valores[ini])
+    atr_medio = float(np.nanmean(atrs[ini:])) if len(atrs[ini:]) else np.nan
+    if np.isnan(atr_medio) or atr_medio <= 0:
+        return 'lateral'
+    desloc_atr = delta / atr_medio
+    if desloc_atr >= cfg.LIMIAR_TENDENCIA_RASTREADOR_ATR:
+        return 'alta'
+    if desloc_atr <= -cfg.LIMIAR_TENDENCIA_RASTREADOR_ATR:
+        return 'baixa'
+    return 'lateral'
+
+
+def analisar_rastreador_tendencia(df: pd.DataFrame) -> dict:
+    """
+    Seção "Rastreador de Tendência" (Modo Aprendizagem.txt, 2026-07-20) —
+    retorna `{'tiers': {nivel: {...}}, 'mme21': {...}}`:
+
+    - `tiers`: 5 leituras de DIREÇÃO por escala (Maior/Média/Menor/Micro,
+      ver `cfg.NIVEIS_RASTREADOR_TENDENCIA`, + "Atual" =
+      `cfg.JANELA_TENDENCIA_ATUAL` candles) — cada uma SÓ
+      `{'linha_atual', 'tendencia' ('alta'/'baixa'/'lateral'), 'janela'}`,
+      via `_classificar_tendencia_serie` (deslocamento líquido da MME21
+      na janela do tier, normalizado por ATR).
+    - `mme21`: 1 leitura ÚNICA de toques/força/probabilidade da MME21 (
+      mesmo motor de sempre, `features.analisar_linha_generica`), na sua
+      própria janela natural `cfg.JANELA_RESPEITO_MME21` — NÃO repetida
+      por tier.
+
+    **Correção de arquitetura 2026-07-21** (achado real do Jesué): a
+    versão anterior rodava o motor de TOQUES da MME21 (toques/força/
+    prob_bounce/leitura) em CADA um dos 5 tiers, produzindo textos como
+    "MME21 testada e respeitada nos últimos 565 candles" — sem sentido
+    pra uma média rápida (equivaleria a dizer que ficou 5 pregões inteiros
+    sem ser cruzada). A spec original já separava os dois conceitos:
+    "Traga a MME21 pra essa seção da MESMA FORMA que já mostra" (1 bloco,
+    doutrina antiga de `analisar_mme21`) + "Tendência Atual" (mais um
+    rótulo de DIREÇÃO, não outra rodada do motor de toques).
+
+    A MME21 é calculada UMA VEZ sobre `df` inteiro (nunca truncado por
+    nível/janela — EMA é recursiva, cold-start dá valor errado) — `tiers`
+    e `mme21` compartilham a mesma série `_serie_mme21(df)`.
+    """
+    if df is None or df.empty:
+        vazio_tier = {'linha_atual': None, 'tendencia': None}
+        vazio_mme21 = {'linha_atual': None, 'operavel': False, 'mensagem': 'Base de dados não encontrada.'}
+        return {
+            'tiers': {nivel: dict(vazio_tier) for nivel in (*cfg.NIVEIS_RASTREADOR_TENDENCIA, 'atual')},
+            'mme21': vazio_mme21,
+        }
+
+    mme = _serie_mme21(df)
+    atrs = pd.to_numeric(df['atr'], errors='coerce').values if 'atr' in df.columns else np.full(len(df), np.nan)
+    linha_atual = float(mme.values[-1])
+    mensagem_lateral = 'Mercado lateral — MME21 não deve ser operada aqui. Aguarde tendência definida.'
+
+    tiers = {}
+    for nivel, janela in {**cfg.NIVEIS_RASTREADOR_TENDENCIA, 'atual': cfg.JANELA_TENDENCIA_ATUAL}.items():
+        tiers[nivel] = {
+            'linha_atual': linha_atual,
+            'tendencia': _classificar_tendencia_serie(mme.values, atrs, janela),
+            'janela': janela,
+        }
+
+    mme21_analise = features.analisar_linha_generica(
+        df, mme.values, janela=cfg.JANELA_RESPEITO_MME21,
+        toques_min_forte=cfg.TOQUES_MINIMOS_MME21_FORTE,
+    )
+    tendencia_mme21 = _classificar_tendencia_serie(mme.values, atrs, cfg.JANELA_RESPEITO_MME21)
+    lateral_mme21 = (tendencia_mme21 == 'lateral')
+    mme21_analise['operavel'] = not lateral_mme21
+    mme21_analise['mensagem'] = mensagem_lateral if lateral_mme21 else None
+
+    return {'tiers': tiers, 'mme21': mme21_analise}
+
+
 def analisar_tracados(df: pd.DataFrame, tracados: pd.DataFrame) -> list:
     """
     Leitura quantitativa (toques/força/probabilidade) de cada traçado
@@ -692,6 +800,7 @@ def analisar_tracados(df: pd.DataFrame, tracados: pd.DataFrame) -> list:
         analise = features.analisar_linha_generica(
             df, linha, janela=len(df),
             toques_min_forte=cfg.TOQUES_MINIMOS_TRACADO_MANUAL_FORTE,
+            tolerancia_atr=cfg.TOLERANCIA_TRACADO_MANUAL_ATR,
         )
         # Cruzamento com o motor automático (bipolaridade real, se o traçado
         # coincidir com uma zona já rompida+retestada) + resumo por regime —

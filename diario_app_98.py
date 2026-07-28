@@ -39,12 +39,13 @@ import base64
 import calendar
 import re
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs
 sys.path.insert(0, str(Path(__file__).parent))
 
 import json
+import logging
 
 import dash
 from dash import ALL, dcc, html, Input, Output, State, callback_context, no_update
@@ -56,12 +57,24 @@ import plotly.graph_objects as go
 import config_backtest as cfg
 import persistencia
 import diario_trade as dt
+import tracados
 import gerenciador_processos as gp
-from metricas import extrair_metricas, montar_snapshot_diario
+from metricas import extrair_metricas, montar_snapshot_diario, analisar_tracados
 from estilo_win98 import C, FONTS, win98_button, win98_field, win98_groupbox, win98_sunken, texto_sobre
 
 PORTA_PROPRIA = 8052
 PORTA_PAI = 8051  # dashboard_98.py
+
+# Ver diario_app_classico.py::_log_diario pro raciocínio (logger próprio, não
+# basicConfig; arquivo separado por processo pra não disputar o mesmo handle).
+_log_diario98 = logging.getLogger('diario_98')
+if not _log_diario98.handlers:
+    _handler_diario98 = logging.FileHandler(
+        Path(__file__).parent / 'log_diario98.log', encoding='utf-8')
+    _handler_diario98.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    _log_diario98.addHandler(_handler_diario98)
+    _log_diario98.setLevel(logging.INFO)
+    _log_diario98.propagate = False
 
 _ABAS_DIARIO98 = [
     ('estatisticas', 'Estatísticas'),
@@ -243,7 +256,7 @@ def _construir_diario98_novo_trade() -> html.Div:
         win98_groupbox('Dados da Operação', html.Div([
             grade(
                 campo('Data', dcc.Input(id='diario98-data', type='date', style={**win98_field(), **largura_total})),
-                campo('Ativo', dcc.Dropdown(id='diario98-ativo', options=_opcoes_diario(cfg.ATIVOS),
+                campo('Ativo', dcc.Dropdown(id='diario98-ativo', options=_opcoes_diario(cfg.ATIVOS_DIARIO),
                                              clearable=False, className='win98-dropdown', style=largura_total)),
                 campo('Janela', dcc.Dropdown(id='diario98-janela',
                                               options=_opcoes_diario(list(cfg.JANELAS_PREGAO.keys())),
@@ -313,7 +326,6 @@ def _construir_diario98_novo_trade() -> html.Div:
                 children=html.Div('Arraste ou clique pra selecionar um arquivo', style={'fontSize': '11px'}),
                 style={**win98_sunken(bg=C['window']), 'padding': '10px', 'textAlign': 'center', 'cursor': 'pointer'},
             ),
-            dcc.Store(id='store-diario98-imagem-colada'),
             html.Div(id='diario98-preview-imagem', style={'marginTop': '8px'}),
         ])),
 
@@ -419,27 +431,59 @@ def _estilo_thumb_imagem_principal_98(selecionada: bool) -> dict:
     }
 
 
-def _campo_imagem_principal_98(id_pos, imagens: list) -> html.Div | None:
+def _campo_imagem_principal_98(id_pos, imagens: list) -> html.Div:
     """Ver diario_app_classico.py::_campo_imagem_principal pro mesmo
-    raciocínio (miniaturas clicáveis maiores, default = última imagem)."""
+    raciocínio (miniaturas clicáveis maiores, default = última imagem, e o
+    bug real 2026-07-22 do Store condicional quebrando "Finalizar" pra
+    qualquer posição sem print)."""
+    # Ver diario_app_classico.py::_campo_imagem_principal — id fixo por fora,
+    # conteúdo reconstruído por `remover_imagem_do_rascunho_98`.
+    return html.Div(_conteudo_imagem_principal_98(id_pos, imagens),
+                    id={'type': 'ea98-campo-imagem-principal', 'index': id_pos})
+
+
+def _conteudo_imagem_principal_98(id_pos, imagens: list) -> list:
+    """Miolo de `_campo_imagem_principal_98` — o `dcc.Store` entra SEMPRE
+    (bug de 2026-07-22), só as miniaturas são condicionais."""
     if not imagens:
-        return None
+        return [dcc.Store(id={'type': 'ea98-imagem-principal', 'index': id_pos}, data=None)]
     selecionada = imagens[-1]
     thumbs = [
-        html.Img(
+        _thumb_com_remover_98(id_pos, nome, html.Img(
             src=f'/diario-imagens/{nome}',
             id={'type': 'ea98-imagem-thumb-escolher', 'index': id_pos, 'nome': nome},
             n_clicks=0,
             style=_estilo_thumb_imagem_principal_98(nome == selecionada),
-        )
+        ))
         for nome in imagens
     ]
-    return html.Div([
+    return [
         html.Div('Imagem principal (clique pra escolher a capa do trade)', style={
             'fontSize': '10px', 'color': C['text2'], 'marginBottom': '4px', 'fontFamily': FONTS['display']}),
         html.Div(thumbs, style={'display': 'flex', 'gap': '8px', 'flexWrap': 'wrap'}),
         dcc.Store(id={'type': 'ea98-imagem-principal', 'index': id_pos}, data=selecionada),
-    ])
+    ]
+
+
+def _thumb_com_remover_98(id_pos, nome: str, miniatura) -> html.Div:
+    """Ver diario_app_classico.py::_thumb_com_remover (pedido 2026-07-27)."""
+    return html.Div([
+        miniatura,
+        html.Button('×', id={'type': 'ea98-imagem-remover', 'index': id_pos, 'nome': nome},
+                    n_clicks=0, className='diario-thumb-x', title='Remover este print do trade'),
+    ], className='diario-thumb-wrap')
+
+
+def _thumbs_galeria_live_98(id_pos, imagens: list) -> list:
+    """Miniaturas da galeria do bloco só-leitura do card no skin '98."""
+    return [
+        _thumb_com_remover_98(id_pos, nome, html.Img(
+            src=f'/diario-imagens/{nome}', style={
+                'width': '70px', 'height': '46px', 'objectFit': 'cover',
+                'border': f'1px solid {C["border"]}', 'display': 'block',
+            }))
+        for nome in imagens
+    ]
 
 
 def _bloco_finalizar_em_andamento_98(pos: dict, imagens: list) -> html.Div:
@@ -491,9 +535,16 @@ def _bloco_finalizar_em_andamento_98(pos: dict, imagens: list) -> html.Div:
         campo('Tags Setup/Erro', dcc.Dropdown(id={'type': 'ea98-tags-erro', 'index': id_pos}, multi=True,
               options=_opcoes_tags_setup_erro(),
               className='win98-dropdown win98-dropdown-tags', style={'width': '240px'})),
-    ] + ([_campo_imagem_principal_98(id_pos, imagens)] if imagens else []) + [
+    ] + [_campo_imagem_principal_98(id_pos, imagens)] + [
         html.Button('Finalizar e gravar no Diário', id={'type': 'ea98-btn-finalizar', 'index': id_pos},
                     n_clicks=0, className='win98-btn', style=win98_button(extra={'marginTop': '8px'})),
+        # Resposta do clique colada no botão — ver diario_app_classico.py
+        # (2026-07-27: o único destino era `ea98-status`, lá em cima junto da
+        # Nota, então um "Ocupado" passava despercebido e o clique parecia
+        # não fazer nada).
+        html.Div(id={'type': 'ea98-status-finalizar', 'index': id_pos}, style={
+            'fontSize': '10px', 'marginTop': '6px', 'minHeight': '14px', 'color': C['text2'],
+        }),
     ])
 
 
@@ -519,12 +570,10 @@ def _bloco_posicao_live_98(pos: dict) -> html.Div:
     ]) if notas else html.Div('Sem notas ainda.', style={'fontSize': '11px', 'color': C['text2']})
 
     imagens = _lista_segura_98(pos.get('imagens_em_andamento'))
-    galeria = html.Div([
-        html.Img(src=f'/diario-imagens/{nome}', style={
-            'width': '64px', 'height': '42px', 'objectFit': 'cover',
-            'border': f"1px solid {C['shadow_dk']}", 'marginRight': '6px', 'marginTop': '6px',
-        }) for nome in imagens
-    ], style={'display': 'flex', 'flexWrap': 'wrap'}) if imagens else None
+    # Container com id fixo mesmo sem imagens — ver diario_app_classico.py.
+    galeria = html.Div(_thumbs_galeria_live_98(pos['id_posicao'], imagens),
+                       id={'type': 'ea98-galeria-live', 'index': pos['id_posicao']},
+                       style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '6px', 'marginTop': '6px'})
 
     par_hedge = bool(pos.get('par_hedge'))
     preco_ref = pos.get('preco_saida') if pendente else pos.get('preco_atual')
@@ -536,18 +585,26 @@ def _bloco_posicao_live_98(pos: dict) -> html.Div:
     pnl_reais = pos.get('pnl_reais_final') if pendente else pos.get('pnl_reais')
     # Achado real 2026-07-15 (ver diario_app_classico.py::_bloco_posicao_live
     # pro mesmo raciocínio completo): "AGUARDANDO CONFIRMAÇÃO" é errado pra
-    # um par de hedge — ali a saída É confirmada (preço real da posição
-    # oposta que fechou o par), só não veio de uma perna OUT no mesmo ticket.
-    if pendente and par_hedge:
+    # um par de hedge cuja saída É confirmada (preço real da posição
+    # oposta que fechou o par). Bug real 2026-07-22: um par de hedge
+    # TAMBÉM pode ter saída estimada agora (perna de saída fechou sozinha
+    # sem confirmação real do MT5 ainda) — ver `detectar_pares_hedge`.
+    # Pedido real 2026-07-22 (ver diario_app_classico.py::_bloco_posicao_live
+    # pro mesmo raciocínio): "ABERTA" pisca, o resto fica estático.
+    status_classe = None
+    if pendente and par_hedge and not pos.get('saida_estimada'):
         status_txt, status_cor = ' ✓ FECHADA (par hedge — pronta pra finalizar)', C['green']
+    elif pendente and par_hedge:
+        status_txt, status_cor = ' ⚠ FECHADA (par hedge) — AGUARDANDO CONFIRMAÇÃO', C['amber']
     elif pendente:
         status_txt, status_cor = ' ⚠ FECHADA — AGUARDANDO CONFIRMAÇÃO', C['amber']
     else:
         status_txt, status_cor = ' ● ABERTA', C['green']
+        status_classe = 'diario-status-piscante'
     detalhe = html.Div([
         html.Span((pos.get('tipo_operacao') or '—').upper(), style={
             'color': cor_direcao, 'fontSize': '10px', 'fontWeight': '700'}),
-        html.Span(status_txt, style={
+        html.Span(status_txt, className=status_classe, style={
             'marginLeft': '6px', 'fontSize': '9px', 'fontWeight': '700', 'color': status_cor}),
         html.Div(
             f"Entrada {_fmt_num_98(pos.get('preco_entrada'))} · {label_ref} {_fmt_num_98(preco_ref)} · "
@@ -705,12 +762,25 @@ def _secao_ordens_pendentes_98(ordens: pd.DataFrame) -> html.Div | None:
     return win98_groupbox('Ordens Pendentes (ainda não executadas)', html.Div(linhas))
 
 
-def _preparar_registros_posicao_98(posicoes: pd.DataFrame) -> tuple[list, dict, dict]:
+def _preparar_registros_posicao_98(posicoes: pd.DataFrame, excluir_id=None) -> tuple[list, dict, dict]:
     """Ver diario_app_classico.py::_preparar_registros_posicao — mesma
     lógica, duplicada (processos independentes). Retorna
-    (pares, por_ativo_abertas, por_ativo_prontas)."""
+    (pares, por_ativo_abertas, por_ativo_prontas). `excluir_id` evita
+    duplicar o mesmo id pattern-matching quando o ticket está aberto no
+    pop-up de edição de pendência do Histórico (ver `abrir_pendencia_
+    editar_98`)."""
     if posicoes is None or posicoes.empty:
         return [], {}, {}
+    if excluir_id is not None:
+        # `excluir_id` pode ser um par de hedge composto "ticket_a-ticket_b"
+        # (ver diario_app_classico.py::_preparar_registros_posicao pro
+        # raciocínio completo) — precisa excluir as 2 pernas, não só o
+        # texto composto (que nunca bate direto contra `id_posicao`).
+        par = _parse_index_par_98(excluir_id)
+        ids_excluir = set(par) if par else {excluir_id}
+        posicoes = posicoes[~posicoes['id_posicao'].isin(ids_excluir)]
+        if posicoes.empty:
+            return [], {}, {}
     pares = dt.detectar_pares_hedge(posicoes)
     tickets_pareados = {p['ticket_a'] for p in pares} | {p['ticket_b'] for p in pares}
     sinteticas = [dt.montar_posicao_sintetica_par(par, posicoes) for par in pares]
@@ -740,6 +810,22 @@ def _secao_status_posicoes_98(posicoes: pd.DataFrame, pares: list) -> html.Div:
          f"mesclado(s) automaticamente em 1 trade líquido cada." if pares
          else "Nenhum par de hedge detectado agora.", C['text2']),
     ]
+    # Ver diario_app_classico.py::_secao_status_posicoes — achado real
+    # 2026-07-21: nunca afirmar "zerado"/contagem sem dizer de quando é o
+    # dado (sync em background pode falhar em silêncio e congelar o
+    # parquet num snapshot velho).
+    if total:
+        atualizado_em = pd.to_datetime(posicoes['atualizado_em']).max()
+        atraso_s = (datetime.now() - atualizado_em.to_pydatetime()).total_seconds()
+        if atraso_s > 15:
+            linhas.append((
+                f"⚠ Sincronização com MT5 pode estar atrasada — dado de "
+                f"{atualizado_em.strftime('%H:%M:%S')} ({atraso_s:.0f}s atrás). "
+                f"Não confie nos números acima sem confirmar no MT5.",
+                C['amber'],
+            ))
+        else:
+            linhas.append((f"Sincronizado às {atualizado_em.strftime('%H:%M:%S')}.", C['text2']))
     residual = dt.calcular_exposicao_residual(posicoes)
     sobras = {contrato: liquido for contrato, liquido in residual.items() if liquido != 0}
     if sobras:
@@ -775,13 +861,18 @@ def _ids_rastreados_98(registros_prontas: list, registros_abertas: list) -> list
 
 
 def _renderizar_posicao_completa_98(posicoes: pd.DataFrame, ordens: pd.DataFrame | None = None,
-                                     ativo_selecionado: str = 'WIN') -> html.Div:
+                                     ativo_selecionado: str = 'WIN', excluir_id=None) -> html.Div:
     """Substitui `_renderizar_em_andamento_98` + `_renderizar_formularios_
     em_andamento_98` — ver diario_app_classico.py::
     _renderizar_posicao_completa pro raciocínio completo (feedback
     2026-07-20: info do trade "desconectada" do formulário + seção não
-    aparecia sozinha quando um trade novo fechava)."""
-    pares, por_ativo_abertas, por_ativo_prontas = _preparar_registros_posicao_98(posicoes)
+    aparecia sozinha quando um trade novo fechava).
+
+    Feedback real 2026-07-22: "trade fechado vai para o histórico, não
+    deve ficar em posição" — a seção "Pronta pra Finalizar" saiu daqui;
+    Posição mostra só posições genuinamente `aberta`, tudo que já fechou
+    mora exclusivamente no Histórico (lista PENDENTE + "Editar")."""
+    pares, por_ativo_abertas, por_ativo_prontas = _preparar_registros_posicao_98(posicoes, excluir_id=excluir_id)
     status = _secao_status_posicoes_98(posicoes, pares)
 
     registros_prontas = _registros_por_ativo_98(por_ativo_prontas, ativo_selecionado)
@@ -795,11 +886,6 @@ def _renderizar_posicao_completa_98(posicoes: pd.DataFrame, ordens: pd.DataFrame
     filhos = [status]
     if secao_ordens:
         filhos.append(secao_ordens)
-    if registros_prontas:
-        blocos_prontas = [_bloco_posicao_completo_98(p, _lista_segura_98(p.get('imagens_em_andamento')))
-                          for p in registros_prontas]
-        filhos.append(win98_groupbox(f'Pronta pra Finalizar — {ativo_selecionado} ({len(registros_prontas)})',
-                                      html.Div(blocos_prontas)))
     if not registros_abertas:
         vazio = html.Div(f'Nenhuma posição {ativo_selecionado} aberta no momento.', style={
             'padding': '16px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '12px',
@@ -825,14 +911,6 @@ def _construir_diario98_em_andamento() -> html.Div:
         dcc.Interval(id='interval-em-andamento98', interval=6_000, n_intervals=0),
         dcc.Store(id='store-em-andamento98-ids-conhecidos', data=[]),
         html.Div(id='em-andamento98-conteudo'),
-        # Reaproveita o MESMO id/JS global de colagem (assets_98/diario_paste.js)
-        # do Novo Trade — seguro porque as abas nunca ficam montadas ao mesmo
-        # tempo (`montar_aba_diario98` troca o conteúdo inteiro).
-        dcc.Store(id='store-diario98-imagem-colada'),
-        # Qual card está "armado" pra receber o próximo Ctrl+V — ver
-        # `assets_98/diario_paste.js` (clicar/focar em qualquer campo do
-        # card já arma sozinho, sem botão).
-        dcc.Store(id='store-diario98-posicao-ativa-print'),
     ])
 
 
@@ -846,11 +924,11 @@ def _td_diario98(conteudo, extra=None) -> html.Td:
     return html.Td(conteudo, style=estilo)
 
 
-# Aderência S/R deixou de ser aba própria (feedback diário.txt, 2026-07-11)
-# — como `avaliar_aderencia_sr()` já é 1 linha por `id_trade`, vira uma
+# Aderência aos Traçados deixou de ser aba própria (feedback diário.txt, 2026-07-11)
+# — como `avaliar_aderencia_tracados()` já é 1 linha por `id_trade`, vira uma
 # coluna extra aqui no Histórico (join direto por id_trade), e um resumo
 # agregado na aba Estatísticas (ver `_bloco_resumo_aderencia_98`).
-_COR_STATUS_ADERENCIA_SR = {
+_COR_STATUS_ADERENCIA_TRACADOS = {
     'visto_preciso': 'green', 'visto_proximo': 'yellow', 'nao_visto': 'red',
 }
 
@@ -901,7 +979,7 @@ def _linha_historico_98(trade: pd.Series, aderencia_por_trade: dict, mapa_nomes_
     classificacao = aderencia_por_trade.get(id_trade) if id_trade is not None else None
     celula_aderencia = (
         _td_diario98(classificacao.replace('_', ' '),
-                     extra={'color': C[_COR_STATUS_ADERENCIA_SR.get(classificacao, 'text2')], 'fontSize': '9px'})
+                     extra={'color': C[_COR_STATUS_ADERENCIA_TRACADOS.get(classificacao, 'text2')], 'fontSize': '9px'})
         if classificacao else _td_diario98('—')
     )
     botao_expandir = (
@@ -930,19 +1008,53 @@ def _linha_historico_98(trade: pd.Series, aderencia_por_trade: dict, mapa_nomes_
     return [linha_resumo, linha_detalhe] if linha_detalhe is not None else [linha_resumo]
 
 
+def _linha_pendencia_98(p: pd.Series) -> html.Tr:
+    """Ver diario_app_classico.py::_linha_pendencia pro raciocínio
+    completo — execução real sem trade correspondente no Diário, badge
+    PENDENTE + botão Editar que abre o pop-up de classificação (ver
+    `dt.listar_pendencias_historico`)."""
+    saldo_est = p.get('saldo_estimado')
+    saldo_txt = f"R$ {saldo_est:+.2f} (estimado)" if pd.notna(saldo_est) else '—'
+    botao_editar = html.Button('Editar', id={'type': 'diario98-btn-editar-pendencia', 'index': p['id_editar']},
+                                n_clicks=0, className='win98-btn', style={
+                                    **win98_button(), 'minHeight': '16px', 'padding': '0 10px', 'fontSize': '10px',
+                                    'background': C['gold'],
+                                })
+    # Feedback 2026-07-27 — ver diario_app_classico.py::_linha_pendencia
+    # pro raciocínio completo (atalho de 1 clique com dados padrão do MT5,
+    # sem abrir o pop-up).
+    botao_finalizar_rapido = html.Button(
+        '✓', id={'type': 'diario98-btn-finalizar-rapido', 'index': p['id_editar']},
+        n_clicks=0, className='win98-btn',
+        title='Gravar no Diário com os dados padrão do MT5, sem editar',
+        style={
+            **win98_button(), 'minHeight': '16px', 'padding': '0 8px', 'fontSize': '10px',
+            'background': C['green'], 'marginLeft': '4px',
+        })
+    return html.Tr([
+        _td_diario98(str(p.get('data') or '—')),
+        _td_diario98(str(p.get('ativo') or '—')),
+        _td_diario98('—'), _td_diario98('—'), _td_diario98('—'), _td_diario98('—'),
+        _td_diario98(saldo_txt, extra={'color': C['text2'], 'fontStyle': 'italic'}),
+        _td_diario98('—'),
+        _td_diario98('PENDENTE', extra={
+            'color': texto_sobre(C['yellow']), 'background': C['yellow'], 'fontWeight': '700',
+            'fontSize': '9px', 'textAlign': 'center',
+        }),
+        _td_diario98(html.Div([botao_editar, botao_finalizar_rapido], style={'display': 'flex'})),
+    ], style={'background': 'rgba(200,169,110,0.12)'})
+
+
 def _construir_diario98_historico() -> html.Div:
     # Feedback 2026-07-17: a seção "Pendente de Classificação" que morava
     # aqui voltou pra aba Posição — ver diario_app_classico.py::
     # _construir_diario_historico pro mesmo raciocínio completo.
     return html.Div([
-        # Feedback 2026-07-20: ver diario_app_classico.py::
-        # _construir_diario_historico pro raciocínio completo (overlay
-        # morava no nível mais alto do layout, "rolar até ele" caía
-        # depois da tabela inteira — agora mora no TOPO do próprio
-        # conteúdo do Histórico).
-        html.Div(id='diario98-overlay-imagem'),
+        # Os 2 overlays subiram pro `app.layout` global (2026-07-27) — ver
+        # diario_app_classico.py::_construir_diario_historico e o comentário
+        # no layout pro raciocínio completo.
         html.Div([
-            dcc.Dropdown(id='diario98-hist-ativo', options=_opcoes_diario(cfg.ATIVOS),
+            dcc.Dropdown(id='diario98-hist-ativo', options=_opcoes_diario(cfg.ATIVOS_DIARIO),
                          placeholder='Ativo', className='win98-dropdown', style={'width': '120px'}),
             dcc.Dropdown(id='diario98-hist-janela', options=_opcoes_janelas_98(),
                          placeholder='Janela', className='win98-dropdown', style={'width': '190px'}),
@@ -1052,14 +1164,14 @@ def _conteudo_detalhe_trade_98(id_trade: int) -> html.Div | None:
     tem_dado_emocional = any(pd.notna(trade.get(c)) for c in
                              ('emo_confianca', 'emo_humor', 'emo_energia', 'emo_atencao', 'emo_presenca', 'sentimento_mercado'))
 
-    aderencia_df = dt.avaliar_aderencia_sr()
+    aderencia_df = dt.avaliar_aderencia_tracados()
     linha_aderencia = aderencia_df[aderencia_df['id_trade'] == id_trade] if not aderencia_df.empty else aderencia_df
     bloco_aderencia = None
     if not linha_aderencia.empty:
         classificacao = linha_aderencia.iloc[0]['classificacao']
         bloco_aderencia = html.Div(
-            f"Aderência S/R: {classificacao.replace('_', ' ')}",
-            style={'color': C[_COR_STATUS_ADERENCIA_SR.get(classificacao, 'text2')],
+            f"Aderência aos Traçados: {classificacao.replace('_', ' ')}",
+            style={'color': C[_COR_STATUS_ADERENCIA_TRACADOS.get(classificacao, 'text2')],
                    'fontWeight': '700', 'fontSize': '11px', 'marginBottom': '6px'})
 
     padroes_df = persistencia.carregar_padroes_comportamentais()
@@ -1369,7 +1481,7 @@ def _resto_periodo_estatisticas_98(stats: dict) -> html.Div:
 
 def _bloco_status_badges_98() -> html.Div:
     """Reconciliação MT5 (agora em background, sem aba própria) e resumo de
-    Aderência S/R (agora enriquece o Histórico, não é mais aba própria) —
+    Aderência aos Traçados (agora enriquece o Histórico, não é mais aba própria) —
     badge discreto de 1-2 linhas, não uma tabela navegável (feedback
     diário.txt, 2026-07-11)."""
     resumo_rec = dt.resumo_reconciliacao()
@@ -1389,15 +1501,15 @@ def _bloco_status_badges_98() -> html.Div:
                 f"{resumo_rec['sem_correspondencia_diario']} sem registro no diário).",
                 style={'color': C['amber']})
 
-    resumo_ader = dt.avaliar_aderencia_sr()
+    resumo_ader = dt.avaliar_aderencia_tracados()
     if resumo_ader.empty:
         badge_ader = html.Span(
-            'Aderência S/R: sem trades avaliáveis ainda (precisa de nível S/R referenciado + snapshot de mercado).',
+            'Aderência aos Traçados: sem trades avaliáveis ainda (precisa de nível S/R referenciado + snapshot de mercado).',
             style={'color': C['text2']})
     else:
         total = len(resumo_ader)
         precisos = int((resumo_ader['classificacao'] == 'visto_preciso').sum())
-        badge_ader = html.Span(f"Aderência S/R: {precisos}/{total} trade(s) vistos com precisão pelo motor "
+        badge_ader = html.Span(f"Aderência aos Traçados: {precisos}/{total} trade(s) vistos com precisão pelo motor "
                                 f"(ver coluna no Histórico).", style={'color': C['text']})
 
     return win98_groupbox('Status', html.Div([
@@ -1476,14 +1588,19 @@ def _construir_diario98_estatisticas(stats_geral: dict, scores: dict) -> html.Di
 # --- Padrões comportamentais ----------------------------------------------------
 # Revenge trading / tilt cascade — ver `diario_trade.detectar_padroes_
 # comportamentais`. Relatório de revisão manual, mesmo espírito da
-# Aderência S/R: Jesué julga, o sistema não ajusta nada sozinho.
+# Aderência aos Traçados: Jesué julga, o sistema não ajusta nada sozinho.
 
 _COR_TIPO_PADRAO = {'revenge_trading': 'red', 'tilt_cascade': 'yellow'}
 
 
-def _tabela_padroes_98(df: pd.DataFrame | None) -> html.Div:
+def _tabela_padroes_98(df: pd.DataFrame | None, ja_rodou: bool = False) -> html.Div:
+    """Ver diario_app_classico.py::_tabela_padroes pro raciocínio de
+    `ja_rodou` (bug real 2026-07-21: "rodou e achou 0" ficava idêntico a
+    "nunca cliquei")."""
     if df is None or df.empty:
-        return html.Div('Nenhum resultado ainda — clique em "Detectar padrões".', style={
+        texto = ('Nenhum padrão comportamental encontrado no histórico atual.' if ja_rodou
+                 else 'Nenhum resultado ainda — clique em "Detectar padrões".')
+        return html.Div(texto, style={
             'padding': '16px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '12px',
         })
     cabecalho = html.Tr([
@@ -1924,6 +2041,8 @@ for _tipo_estrela in (
 
 _registrar_scroll_ate_overlay_98(app, 'diario98-imagem-ampliada', 'diario98-overlay-imagem',
                                   'diario98-overlay-imagem-backdrop-wrap')
+_registrar_scroll_ate_overlay_98(app, 'store-pendencia98-editar', 'diario98-overlay-pendencia',
+                                  'diario98-overlay-pendencia-backdrop-wrap')
 
 _PADRAO_NOME_IMAGEM_DIARIO = re.compile(r'^(\d{4}_[A-Z]+_\d{8}|rascunho_\d+_\d{2})\.png$')
 
@@ -1944,12 +2063,36 @@ app.layout = html.Div([
     dcc.Store(id='store-diario98-aba', data=_ABA_DIARIO98_INICIAL),
     dcc.Store(id='diario98-hist-filtro-data-calendario', data=None),
     dcc.Store(id='diario98-imagem-ampliada', data=None),
+    # `id_posicao` da pendência aberta no pop-up de edição do Histórico —
+    # ver diario_app_classico.py::store-pendencia-editar.
+    dcc.Store(id='store-pendencia98-editar', data=None),
+    # Bug real 2026-07-22 (mesma causa raiz de diario_app_classico.py): esta
+    # Store vivia duplicada dentro de "Novo Trade" e de "Posição"
+    # (`_construir_diario98_em_andamento`) — nenhuma existe quando a aba
+    # atual é Histórico, então "Finalizar" no pop-up de pendência quebrava
+    # com ReferenceError. Movida pra cá (sempre montada).
+    dcc.Store(id='store-diario98-imagem-colada'),
+    # Mesmo bug, mesma causa raiz — ver diario_app_classico.py.
+    dcc.Store(id='store-diario98-posicao-ativa-print'),
+    # Contador de invalidação do Histórico (2026-07-27) — ver
+    # diario_app_classico.py::store-diario-refresh pro raciocínio completo.
+    # Resumo: ação nenhuma escreve direto em `diario98-historico-tabela`
+    # (id que só existe na aba Histórico, e referenciá-lo de fora derruba a
+    # callback inteira em silêncio); todas incrementam este store global e a
+    # tabela é remontada por `atualizar_historico_98`, dona dela.
+    dcc.Store(id='store-diario98-refresh', data=0),
     html.Div([
         html.Button(nome, id=f'btn-diario98-aba-{chave}', n_clicks=0,
                     className='win98-btn',
                     style=win98_button(pressed=(chave == _ABA_DIARIO98_INICIAL)))
         for chave, nome in _ABAS_DIARIO98
     ], style={'display': 'flex', 'gap': '6px', 'marginBottom': '10px', 'flexWrap': 'wrap'}),
+    # Overlays GLOBAIS, acima do conteúdo da aba (2026-07-27) — ver
+    # diario_app_classico.py pro raciocínio completo: eram Output de callbacks
+    # disparadas por Store globais mas só existiam no Histórico, o que derruba
+    # a callback inteira em silêncio se escrita de outra aba.
+    html.Div(id='diario98-overlay-imagem'),
+    html.Div(id='diario98-overlay-pendencia'),
     html.Div(id='diario98-aba-conteudo'),
 ], style={
     # `height: 100vh` + `overflowY: auto` (não mais `minHeight: 100vh` sem
@@ -2350,10 +2493,19 @@ def salvar_novo_trade_98(n_clicks, data_op, ativo, janela, estrategia_tags, sala
     # disco em vez do `estado['bases']` em memória do dashboard principal
     # (diferença de até ~30s, irrelevante pra este propósito). Escopo: só
     # CAPTURA (ver metricas.montar_snapshot_diario) — comparação contra
-    # nivel_sr_referencia fica pra um ciclo futuro.
+    # nivel_sr_referencia é `dt.avaliar_aderencia_tracados`, sob demanda.
+    # Traçados analisados aqui (Fase 3.2, 2026-07-21) — mesmo motor que a
+    # aba Price Action usa.
     df_ativo = persistencia.carregar_candles(ativo)
     m = extrair_metricas(df_ativo) if df_ativo is not None else {}
-    snapshot_mercado = montar_snapshot_diario(m) if m else None
+    tracados_analisados = []
+    if df_ativo is not None:
+        try:
+            tracados_df = tracados.listar_tracados(ativo)
+            tracados_analisados = analisar_tracados(df_ativo, tracados_df)
+        except Exception:
+            tracados_analisados = []
+    snapshot_mercado = montar_snapshot_diario(m, tracados_analisados) if m else None
 
     id_trade = dt.registrar_trade(campos, imagem_bytes=imagem_bytes, snapshot_mercado=snapshot_mercado)
     if id_trade is None:
@@ -2400,6 +2552,55 @@ def limpar_form_diario98(n_clicks):
             None, None)
 
 
+def _montar_tabela_historico_98(ativo, janela, estrategia, data_ini_efetivo, data_fim_efetivo, filtro_cal):
+    """Ver diario_app_classico.py::_montar_tabela_historico pro raciocínio
+    completo — extraído de `atualizar_historico_98` pra ser reaproveitado
+    por `finalizar_em_andamento_98`/`descartar_pendencia_editar_98`/
+    `finalizar_rapido_pendencia_98` (bug real 2026-07-27: tabela do
+    Histórico não refletia finalizar/descartar sem sair e voltar da aba)."""
+    df = dt.listar_trades(ativo=ativo, janela=janela, estrategia_tag=estrategia,
+                           data_ini=data_ini_efetivo, data_fim=data_fim_efetivo, is_simulated=False)
+    df = df.sort_values('data_op', ascending=False).head(200 if filtro_cal else 50)
+
+    # Pendências (fechamentos ao vivo + descobertas históricas) — ver
+    # diario_app_classico.py::atualizar_historico pro mesmo raciocínio.
+    pendencias = dt.listar_pendencias_historico()
+    if not pendencias.empty:
+        if ativo:
+            pendencias = pendencias[pendencias['ativo'] == ativo]
+        if data_ini_efetivo:
+            pendencias = pendencias[pendencias['data'].astype(str) >= str(data_ini_efetivo)]
+        if data_fim_efetivo:
+            pendencias = pendencias[pendencias['data'].astype(str) <= str(data_fim_efetivo)]
+
+    banner = html.Div([
+        html.Span(f'Filtrando pelo dia {filtro_cal} (clique no calendário). ',
+                  style={'fontSize': '11px', 'color': C['text2']}),
+        html.Button('Limpar', id='btn-diario98-hist-limpar-filtro-cal', n_clicks=0,
+                    className='win98-btn', style={**win98_button(), 'minHeight': '18px', 'padding': '0 8px'}),
+    ], style={'display': 'flex', 'alignItems': 'center', 'gap': '6px'}) if filtro_cal else ''
+
+    if df.empty and pendencias.empty:
+        return html.Div('Nenhuma operação encontrada.', style={
+            'padding': '16px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '12px',
+        }), banner
+    aderencia_df = dt.avaliar_aderencia_tracados()
+    aderencia_por_trade = (
+        dict(zip(aderencia_df['id_trade'].astype(int), aderencia_df['classificacao']))
+        if not aderencia_df.empty else {}
+    )
+    mapa_nomes_estrategias = _mapa_nomes_estrategias_98()
+    cabecalho = html.Tr([
+        html.Th(t, style={'textAlign': 'left', 'padding': '4px 8px', 'fontSize': '10px', 'color': C['text2']})
+        for t in ['Data', 'Ativo', 'Janela', 'Estratégia', 'Tipo', 'Pts', 'Saldo', 'Print', 'Aderência aos Traçados', '']
+    ])
+    linhas = [_linha_pendencia_98(p) for _, p in pendencias.iterrows()]
+    for _, row in df.iterrows():
+        linhas.extend(_linha_historico_98(row, aderencia_por_trade, mapa_nomes_estrategias))
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
+                       style={'width': '100%', 'borderCollapse': 'collapse'}), banner
+
+
 @app.callback(
     Output('diario98-historico-tabela', 'children'),
     Output('diario98-hist-banner-filtro-cal', 'children'),
@@ -2409,43 +2610,50 @@ def limpar_form_diario98(n_clicks):
     Input('diario98-hist-data-ini', 'value'),
     Input('diario98-hist-data-fim', 'value'),
     Input('diario98-hist-filtro-data-calendario', 'data'),
+    Input('store-diario98-refresh', 'data'),
 )
-def atualizar_historico_98(ativo, janela, estrategia, data_ini, data_fim, filtro_cal):
+def atualizar_historico_98(ativo, janela, estrategia, data_ini, data_fim, filtro_cal, _refresh):
+    """Única dona de `diario98-historico-tabela` — ver
+    diario_app_classico.py::atualizar_historico. `_refresh` é só o gatilho de
+    invalidação vindo de `store-diario98-refresh`, não entra no corpo."""
     # O clique num dia do calendário (Estatísticas) força um filtro de dia
     # único aqui, sobrepondo o filtro manual de intervalo — `filtro_cal` só
     # é setado por `clicar_dia_calendario_98` e limpo pelo botão do banner.
     data_ini_efetivo = filtro_cal or data_ini
     data_fim_efetivo = filtro_cal or data_fim
-    df = dt.listar_trades(ativo=ativo, janela=janela, estrategia_tag=estrategia,
-                           data_ini=data_ini_efetivo, data_fim=data_fim_efetivo, is_simulated=False)
-    df = df.sort_values('data_op', ascending=False).head(200 if filtro_cal else 50)
+    return _montar_tabela_historico_98(ativo, janela, estrategia, data_ini_efetivo, data_fim_efetivo, filtro_cal)
 
-    banner = html.Div([
-        html.Span(f'Filtrando pelo dia {filtro_cal} (clique no calendário). ',
-                  style={'fontSize': '11px', 'color': C['text2']}),
-        html.Button('Limpar', id='btn-diario98-hist-limpar-filtro-cal', n_clicks=0,
-                    className='win98-btn', style={**win98_button(), 'minHeight': '18px', 'padding': '0 8px'}),
-    ], style={'display': 'flex', 'alignItems': 'center', 'gap': '6px'}) if filtro_cal else ''
 
-    if df.empty:
-        return html.Div('Nenhuma operação encontrada.', style={
-            'padding': '16px', 'color': C['text2'], 'textAlign': 'center', 'fontSize': '12px',
-        }), banner
-    aderencia_df = dt.avaliar_aderencia_sr()
-    aderencia_por_trade = (
-        dict(zip(aderencia_df['id_trade'].astype(int), aderencia_df['classificacao']))
-        if not aderencia_df.empty else {}
-    )
-    mapa_nomes_estrategias = _mapa_nomes_estrategias_98()
-    cabecalho = html.Tr([
-        html.Th(t, style={'textAlign': 'left', 'padding': '4px 8px', 'fontSize': '10px', 'color': C['text2']})
-        for t in ['Data', 'Ativo', 'Janela', 'Estratégia', 'Tipo', 'Pts', 'Saldo', 'Print', 'Aderência S/R', '']
-    ])
-    linhas = []
-    for _, row in df.iterrows():
-        linhas.extend(_linha_historico_98(row, aderencia_por_trade, mapa_nomes_estrategias))
-    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
-                       style={'width': '100%', 'borderCollapse': 'collapse'}), banner
+@app.callback(
+    Output('store-diario98-refresh', 'data', allow_duplicate=True),
+    Input({'type': 'diario98-btn-finalizar-rapido', 'index': ALL}, 'n_clicks'),
+    State('store-diario98-refresh', 'data'),
+    prevent_initial_call=True,
+)
+def finalizar_rapido_pendencia_98(n_clicks_lista, refresh_atual):
+    """Ver diario_app_classico.py::finalizar_rapido_pendencia pro
+    raciocínio completo (inclusive por que a guarda de `n_clicks` abaixo é
+    obrigatória e por que só escreve no store global)."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    componente_id = json.loads(prop_id)
+    id_editar = componente_id['index']
+
+    par = _parse_index_par_98(id_editar)
+    if par:
+        ticket_a, ticket_b = par
+        id_trade = dt.finalizar_par_hedge(ticket_a, ticket_b, {'conta': 'real'})
+    else:
+        mt5_position_id = dt.materializar_pendencia_como_rascunho(id_editar)
+        id_trade = (dt.finalizar_posicao(mt5_position_id, {'conta': 'real'})
+                    if mt5_position_id is not None else None)
+
+    if id_trade is None:
+        _log_diario98.warning('Finalização rápida não gravou nada para id_editar=%s '
+                              '(já finalizado antes ou trava ocupada).', id_editar)
+    return (refresh_atual or 0) + 1
 
 
 @app.callback(
@@ -2530,6 +2738,10 @@ def ampliar_imagem_98(n_clicks_lista, n_clicks_lista_detalhe):
     prevent_initial_call=True,
 )
 def fechar_imagem_ampliada_98(n1, n2):
+    # Ver diario_app_classico.py::fechar_imagem_ampliada (bug real 2026-07-27).
+    ctx = callback_context
+    if not ctx.triggered or not ctx.triggered[0].get('value'):
+        return no_update
     return None
 
 
@@ -2792,6 +3004,131 @@ def clicar_dia_calendario_98(n_clicks_lista):
 
 
 @app.callback(
+    Output('store-pendencia98-editar', 'data'),
+    Input({'type': 'diario98-btn-editar-pendencia', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def abrir_pendencia_editar_98(n_clicks_lista):
+    """Ver diario_app_classico.py::abrir_pendencia_editar — mesmo
+    raciocínio completo, incluindo o bug real 2026-07-22 (Output pra
+    `em-andamento98-conteudo`/`store-em-andamento98-ids-conhecidos`
+    removidos — esses ids só existem quando a sub-aba Posição está
+    montada, inexistente enquanto o botão "Editar" do Histórico é
+    clicado, derrubando a callback inteira com `ReferenceError`)."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    componente_id = json.loads(prop_id)
+    mt5_position_id = componente_id['index']
+    id_pos = dt.materializar_pendencia_como_rascunho(mt5_position_id)
+    return no_update if id_pos is None else id_pos
+
+
+@app.callback(
+    Output('store-pendencia98-editar', 'data', allow_duplicate=True),
+    Input('btn-diario98-fechar-pendencia', 'n_clicks'),
+    Input('diario98-overlay-pendencia-backdrop', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def fechar_pendencia_editar_98(_n1, _n2):
+    """Ver diario_app_classico.py::fechar_pendencia_editar — inclusive pra
+    guarda abaixo (bug real 2026-07-27: a inserção do ✕/backdrop disparava
+    esta callback e zerava `store-pendencia98-editar` na abertura, fazendo
+    o "Finalizar" nunca conseguir fechar o pop-up depois)."""
+    ctx = callback_context
+    if not ctx.triggered or not ctx.triggered[0].get('value'):
+        return no_update
+    return None
+
+
+@app.callback(
+    Output('store-pendencia98-editar', 'data', allow_duplicate=True),
+    Output('diario98-descartar-pendencia-status', 'children'),
+    Output('store-diario98-refresh', 'data', allow_duplicate=True),
+    Input('btn-diario98-descartar-pendencia', 'n_clicks'),
+    State('store-pendencia98-editar', 'data'),
+    State('store-diario98-refresh', 'data'),
+    prevent_initial_call=True,
+)
+def descartar_pendencia_editar_98(n_clicks, id_pos, refresh_atual):
+    """Ver diario_app_classico.py::descartar_pendencia_editar — o reflexo no
+    Histórico é pedido via `store-diario98-refresh` (id global), nunca
+    escrevendo direto na tabela (bug real 2026-07-27).
+
+    A guarda de `n_clicks` abaixo é a mesma correção crítica descrita lá:
+    sem ela, ABRIR o pop-up já apagava o rascunho recém-materializado, e
+    "Finalizar" depois não achava mais a linha."""
+    if not n_clicks:
+        return no_update, no_update, no_update
+    if not id_pos:
+        return no_update, no_update, no_update
+    sucesso = dt.descartar_rascunho_pendencia(id_pos) if not _parse_index_par_98(id_pos) else True
+    if not sucesso:
+        return no_update, (
+            'Não foi possível descartar — o rascunho já tem alguma classificação '
+            'preenchida (nota, tag, resumo etc.) ou não é mais um rascunho pendente. '
+            'Finalize normalmente em vez de descartar.'
+        ), no_update
+    # Ver diario_app_classico.py — sem `ignorar_pendencia` o descarte durava
+    # só até a próxima reconciliação, porque o MT5 continua tendo a operação.
+    dt.ignorar_pendencia(id_pos, motivo='descartado pelo usuário no pop-up de pendência')
+    return None, '', (refresh_atual or 0) + 1
+
+
+@app.callback(
+    Output('diario98-overlay-pendencia', 'children'),
+    Input('store-pendencia98-editar', 'data'),
+)
+def renderizar_overlay_pendencia_98(id_pos):
+    """Ver diario_app_classico.py::renderizar_overlay_pendencia pro mesmo
+    raciocínio (id_pos pode ser ticket avulso ou par de hedge composto)."""
+    if not id_pos:
+        return None
+    posicoes = dt.listar_posicoes_abertas()
+    if posicoes is None or posicoes.empty:
+        return None
+
+    par = _parse_index_par_98(id_pos)
+    if par:
+        pares = dt.detectar_pares_hedge(posicoes)
+        par_match = next((p for p in pares if p['ticket_a'] == par[0] and p['ticket_b'] == par[1]), None)
+        if par_match is None:
+            return None
+        pos = dt.montar_posicao_sintetica_par(par_match, posicoes)
+    else:
+        linha = posicoes[posicoes['id_posicao'] == id_pos]
+        if linha.empty:
+            return None
+        pos = linha.iloc[0].to_dict()
+
+    imagens = _lista_segura_98(pos.get('imagens_em_andamento'))
+    # Ver diario_app_classico.py::renderizar_overlay_pendencia — "Descartar"
+    # só faz sentido pro caso 3 de `materializar_pendencia_como_rascunho`
+    # (ticket avulso vindo da reconciliação histórica, fechada_pendente).
+    # Ver diario_app_classico.py::renderizar_overlay_pendencia — "Descartar"
+    # vale pra qualquer pendência já fechada, inclusive par de hedge, porque
+    # agora também marca o ticket como "não entra no Diário".
+    mostrar_descartar = pos.get('status') == dt.STATUS_POSICAO_FECHADA_PENDENTE
+    botoes = [
+        html.Button('✕ Fechar', id='btn-diario98-fechar-pendencia', n_clicks=0, className='win98-btn', style={
+            **win98_button(), 'flexShrink': '0', 'alignSelf': 'flex-start',
+        }),
+    ]
+    if mostrar_descartar:
+        botoes.append(html.Button('Descartar (não é uma operação real)', id='btn-diario98-descartar-pendencia',
+                                   n_clicks=0, className='win98-btn', style={
+            **win98_button(extra={'color': C['red']}), 'flexShrink': '0', 'alignSelf': 'flex-start', 'marginLeft': '8px',
+        }))
+    conteudo = html.Div([
+        html.Div(botoes, style={'display': 'flex', 'alignItems': 'center'}),
+        html.Div(id='diario98-descartar-pendencia-status', style={'fontSize': '11px', 'color': C['red'], 'marginTop': '4px'}),
+        html.Div(_bloco_posicao_completo_98(pos, imagens), style={'overflowY': 'auto', 'marginTop': '8px'}),
+    ], style={'display': 'flex', 'flexDirection': 'column', 'height': '100%'})
+    return _overlay_98(conteudo, 'diario98-overlay-pendencia-backdrop')
+
+
+@app.callback(
     Output('diario98-padroes-tabela', 'children'),
     Output('diario98-padroes-status', 'children'),
     Input('btn-diario98-padroes', 'n_clicks'),
@@ -2802,7 +3139,7 @@ def detectar_padroes_98(n_clicks):
         resultado = dt.detectar_padroes_comportamentais()
     except Exception as e:
         return no_update, f'⚠ Erro ao detectar: {str(e)[:100]}'
-    return _tabela_padroes_98(resultado), f'Concluído — {len(resultado)} padrões detectados.'
+    return _tabela_padroes_98(resultado, ja_rodou=True), f'Concluído — {len(resultado)} padrões detectados.'
 
 
 @app.callback(
@@ -2812,25 +3149,27 @@ def detectar_padroes_98(n_clicks):
     Input('store-diario98-aba', 'data'),
     Input('store-posicao98-ativo-subaba', 'data'),
     State('store-em-andamento98-ids-conhecidos', 'data'),
+    State('store-pendencia98-editar', 'data'),
 )
-def atualizar_em_andamento_98(n, aba_ativa, ativo_selecionado, ids_conhecidos):
+def atualizar_em_andamento_98(n, aba_ativa, ativo_selecionado, ids_conhecidos, pendencia_aberta):
     """Ver diario_app_classico.py::atualizar_em_andamento pro raciocínio
     completo (junta os dois Outputs antigos num só, guiado pelo interval de
     6s — só reconstrói de verdade quando o CONJUNTO de posições muda,
-    preservando qualquer campo em edição no meio tempo)."""
+    preservando qualquer campo em edição no meio tempo). `excluir_id`
+    (2026-07-21) evita duplicar o ticket aberto no pop-up de pendência."""
     ctx = callback_context
     disparado_por_interval = bool(ctx.triggered) and ctx.triggered[0]['prop_id'] == 'interval-em-andamento98.n_intervals'
     if aba_ativa != 'posicao':
         return no_update, no_update
 
     posicoes = dt.listar_posicoes_abertas()
-    _, por_ativo_abertas, por_ativo_prontas = _preparar_registros_posicao_98(posicoes)
+    _, por_ativo_abertas, por_ativo_prontas = _preparar_registros_posicao_98(posicoes, excluir_id=pendencia_aberta)
     ativo = ativo_selecionado or 'WIN'
     ids_agora = _ids_rastreados_98(_registros_por_ativo_98(por_ativo_prontas, ativo),
                                     _registros_por_ativo_98(por_ativo_abertas, ativo))
     if disparado_por_interval and ids_agora == (ids_conhecidos or []):
         return no_update, no_update
-    return _renderizar_posicao_completa_98(posicoes, dt.listar_ordens_pendentes(), ativo), ids_agora
+    return _renderizar_posicao_completa_98(posicoes, dt.listar_ordens_pendentes(), ativo, excluir_id=pendencia_aberta), ids_agora
 
 
 @app.callback(
@@ -3070,9 +3409,40 @@ def preview_e_anexar_imagem_em_andamento_98(upload_contents, imagem_colada, posi
 
 
 @app.callback(
+    Output({'type': 'ea98-galeria-live', 'index': dash.MATCH}, 'children'),
+    Output({'type': 'ea98-campo-imagem-principal', 'index': dash.MATCH}, 'children'),
     Output({'type': 'ea98-status', 'index': dash.MATCH}, 'children', allow_duplicate=True),
-    Output('em-andamento98-conteudo', 'children', allow_duplicate=True),
-    Output('store-em-andamento98-ids-conhecidos', 'data', allow_duplicate=True),
+    Input({'type': 'ea98-imagem-remover', 'index': dash.MATCH, 'nome': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def remover_imagem_do_rascunho_98(n_clicks_lista):
+    """Ver diario_app_classico.py::remover_imagem_do_rascunho — inclusive pra
+    guarda de `n_clicks` (reconstruir as galerias recria estes botões e
+    redispara a callback)."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update, no_update, no_update
+
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    componente_id = json.loads(prop_id)
+    id_pos, nome = componente_id['index'], componente_id['nome']
+
+    if not dt.remover_imagem_rascunho(_ticket_alvo_98(id_pos), nome):
+        return no_update, no_update, '⚠ Não foi possível remover o print — tente de novo.'
+
+    df = dt.listar_posicoes_abertas()
+    linha = df[df['id_posicao'] == _ticket_alvo_98(id_pos)] if df is not None and not df.empty else None
+    imagens = _lista_segura_98(linha.iloc[0].get('imagens_em_andamento')) if linha is not None and not linha.empty else []
+    return (_thumbs_galeria_live_98(id_pos, imagens),
+            _conteudo_imagem_principal_98(id_pos, imagens),
+            '✔ Print removido.')
+
+
+@app.callback(
+    Output({'type': 'ea98-status', 'index': dash.MATCH}, 'children', allow_duplicate=True),
+    Output({'type': 'ea98-status-finalizar', 'index': dash.MATCH}, 'children'),
+    Output('store-pendencia98-editar', 'data', allow_duplicate=True),
+    Output('store-diario98-refresh', 'data', allow_duplicate=True),
     Input({'type': 'ea98-btn-finalizar', 'index': dash.MATCH}, 'n_clicks'),
     State({'type': 'ea98-nota', 'index': dash.MATCH}, 'value'),
     State({'type': 'ea98-estrategia', 'index': dash.MATCH}, 'value'),
@@ -3095,15 +3465,17 @@ def preview_e_anexar_imagem_em_andamento_98(upload_contents, imagem_colada, posi
     State('store-diario98-posicao-ativa-print', 'data'),
     State({'type': 'ea98-preco-saida-correcao', 'index': dash.MATCH}, 'value'),
     State({'type': 'ea98-datahora-saida-correcao', 'index': dash.MATCH}, 'value'),
-    State('store-posicao98-ativo-subaba', 'data'),
     State({'type': 'ea98-btn-finalizar', 'index': dash.MATCH}, 'id'),
+    State('store-pendencia98-editar', 'data'),
+    State('store-diario98-refresh', 'data'),
     prevent_initial_call=True,
 )
 def finalizar_em_andamento_98(n_clicks, nota, estrategia, sala, alvo, stop, nivel_sr, resumo,
                                emo_confianca, emo_humor, emo_energia, emo_atencao, emo_presenca,
                                tags_emocionais, sentimento_mercado, tags_erro, imagem_principal,
                                upload_contents, imagem_colada, posicao_ativa,
-                               preco_saida_correcao, datahora_saida_correcao, ativo_selecionado, id_componente):
+                               preco_saida_correcao, datahora_saida_correcao, id_componente,
+                               pendencia_aberta, refresh_atual):
     # Feedback 2026-07-17: "não há necessidade de tantos botões... apenas
     # um botão" — ver diario_app_classico.py::finalizar_em_andamento pro
     # raciocínio completo. Este único clique auto-salva nota/classificação/
@@ -3111,16 +3483,25 @@ def finalizar_em_andamento_98(n_clicks, nota, estrategia, sala, alvo, stop, nive
     # chamavam) ANTES de finalizar, então nada se perde por não ter
     # clicado nesses botões (que agora nem existem mais nesta seção).
     #
-    # Feedback 2026-07-17 (2ª rodada): "se eu já preenchi... não faz
-    # sentido aparecer pendência/confirmação no histórico" — o card
-    # "pronto pra finalizar" voltou pra aba Posição, então este callback
-    # re-renderiza `em-andamento98-conteudo` na hora quando finaliza com
-    # sucesso (2º Output, allow_duplicate=True — também atualiza o 3º
-    # Output, `store-em-andamento98-ids-conhecidos`, pro próximo tick do
-    # interval não achar que "nada mudou"), sem esperar o interval de 6s.
+    # Bug real 2026-07-22 (ver diario_app_classico.py::finalizar_em_andamento
+    # pro raciocínio completo): Outputs pra `em-andamento98-conteudo`/
+    # `store-em-andamento98-ids-conhecidos` removidos — só existem quando a
+    # sub-aba Posição está montada, inexistente quando "Finalizar" é
+    # clicado de dentro do pop-up de pendência do Histórico, derrubando a
+    # callback inteira com `ReferenceError`.
+    # Guarda obrigatória — ver diario_app_classico.py::finalizar_em_andamento
+    # (bug real 2026-07-27: a inserção do botão no pop-up dispara a callback,
+    # e sem isto abrir o pop-up já podia gravar o trade sozinho).
+    if not n_clicks:
+        return no_update, no_update, no_update, no_update
+
     id_pos = id_componente['index']
     par = _parse_index_par_98(id_pos)
     ticket_alvo = _ticket_alvo_98(id_pos)
+
+    def responder(msg, fechar=no_update, refresh=no_update):
+        """Mesma mensagem nos 2 destinos — ver diario_app_classico.py."""
+        return msg, msg, fechar, refresh
 
     alvo, stop, nivel_sr = _num(alvo), _num(stop), _num(nivel_sr)
     campos_rascunho = {}
@@ -3162,7 +3543,8 @@ def finalizar_em_andamento_98(n_clicks, nota, estrategia, sala, alvo, stop, nive
     if nota or campos_rascunho or imagem_bytes is not None:
         if not dt.atualizar_rascunho(ticket_alvo, nota_texto=nota or None,
                                       campos=campos_rascunho or None, imagem_bytes=imagem_bytes):
-            return '⚠ Ocupado — tente de novo (nada foi perdido).', no_update, no_update
+            return responder('⚠ Arquivo ocupado — clique de novo em instantes '
+                             '(nada foi perdido).')
 
     # Sem seleção manual de "Imagem principal", a última imagem da galeria
     # vira a capa automaticamente — cobre tanto o print colado NESTE clique
@@ -3205,22 +3587,29 @@ def finalizar_em_andamento_98(n_clicks, nota, estrategia, sala, alvo, stop, nive
         if preco_corrigido is not None:
             datahora_corrigida = pd.to_datetime(datahora_saida_correcao, errors='coerce') if datahora_saida_correcao else None
             if datahora_corrigida is None or pd.isna(datahora_corrigida):
-                return '⚠ Data/Hora de Saída inválida — use o formato AAAA-MM-DD HH:MM.', no_update, no_update
+                return responder('⚠ Data/Hora de Saída inválida — use o formato AAAA-MM-DD HH:MM.')
             if not dt.corrigir_saida_rascunho(id_pos, preco_corrigido, datahora_corrigida):
-                return '⚠ Ocupado — tente de novo.', no_update, no_update
+                return responder('⚠ Arquivo ocupado — clique de novo em instantes.')
         id_trade = dt.finalizar_posicao(id_pos, campos_classificacao, imagem_principal=imagem_principal)
 
     if id_trade is None:
-        return '⚠ Não foi possível finalizar agora — tente novamente.', no_update, no_update
+        # Ver diario_app_classico.py::finalizar_em_andamento — pode ser trava
+        # ocupada OU a trava de idempotência recusando um ticket já gravado.
+        _log_diario98.warning('Finalizar não gravou nada para id_pos=%s '
+                              '(já finalizado antes ou trava ocupada).', id_pos)
+        fechar = None if pendencia_aberta is not None else no_update
+        return responder('⚠ Não foi possível finalizar — talvez já tenha sido gravada antes. '
+                         'Confira a lista do Histórico.', fechar, (refresh_atual or 0) + 1)
 
-    posicoes_atuais = dt.listar_posicoes_abertas()
-    ativo_atual = ativo_selecionado or 'WIN'
-    _, por_ativo_abertas, por_ativo_prontas = _preparar_registros_posicao_98(posicoes_atuais)
-    ids_agora = _ids_rastreados_98(_registros_por_ativo_98(por_ativo_prontas, ativo_atual),
-                                    _registros_por_ativo_98(por_ativo_abertas, ativo_atual))
-    return (f'✔ Finalizado como operação #{id_trade} no Diário.',
-            _renderizar_posicao_completa_98(posicoes_atuais, dt.listar_ordens_pendentes(), ativo_atual),
-            ids_agora)
+    # Fecha o pop-up de pendência do Histórico sozinho, se algum estiver
+    # aberto — ver diario_app_classico.py::finalizar_em_andamento pro
+    # raciocínio completo (fechamento incondicional de propósito, evita
+    # depender de comparar tipos numéricos que podem não bater). O reflexo no
+    # Histórico vai por `store-diario98-refresh` (id global) — bug real
+    # 2026-07-27, ver diario_app_classico.py::finalizar_em_andamento.
+    fechar_popup = None if pendencia_aberta is not None else no_update
+    return responder(f'✔ Finalizado como operação #{id_trade} no Diário.',
+                     fechar_popup, (refresh_atual or 0) + 1)
 
 
 if __name__ == '__main__':

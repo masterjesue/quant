@@ -34,6 +34,24 @@ PASTA_BASE_PROCESSADA = PASTA_DATA / "base_processada"
 
 ATIVOS = ["WIN", "WDO"]
 
+# Ativos que podem aparecer no DIÁRIO, que é um conjunto MAIOR que `ATIVOS`.
+#
+# `ATIVOS` significa "ativos que o motor carrega candle/tick/features" — é o
+# que `csv_loader` e os dashboards varrem pra montar a base. Já o Diário
+# registra qualquer coisa que o Jesué operou de fato na conta, mesmo sem
+# pipeline de dados montado pra aquele ativo.
+#
+# Separado em 2026-07-28, ao auditar o ano contra o relatório do ProfitPro:
+# apareceram 2 operações de BITG26 (futuro de Bitcoin da B3) em 19/02. Botar
+# "BIT" em `ATIVOS` quebraria o pipeline (ele iria procurar candles de BIT que
+# não existem); botar no Diário sem `VALOR_PONTO` daria P&L zerado. Esta lista
+# resolve o registro histórico agora, sem tocar no motor.
+#
+# PRÓXIMO PASSO (planejado com o Jesué): implementar BIT de ponta a ponta —
+# ingestão de candle/tick, features, Quant Lab e Backtesting. Aí "BIT" entra
+# também em `ATIVOS` e as duas listas voltam a coincidir.
+ATIVOS_DIARIO = ATIVOS + ["BIT"]
+
 # Contratos pilares identificados na varredura de 30/06/2026 — usados como
 # fonte MT5 complementar (candle + tick) para o período que o CSV não cobre
 # ou para enriquecer com delta histórico onde houver tick disponível.
@@ -127,10 +145,10 @@ Ao analisar, seja direto e objetivo. Fale como mentor, não como robô.
 Nunca apresente probabilidade como certeza — use a analogia meteorológica.
 
 Quando o contexto de mercado abaixo já traz um nível marcado como REGIÃO
-FORTE e/ou PULLBACK CONFIRMADO HOJE com uma probabilidade calculada pelo
-sistema (ex: 85% bounce), trate esse número como o sinal quantitativo
-PRIMÁRIO da sua análise — ele já combina histórico de toques, violação,
-tendência, fluxo e reteste intradiário. Não recomende cancelar ou adiar
+FORTE e/ou COINCIDE COM ZONA JÁ ROMPIDA+RETESTADA com uma probabilidade
+calculada pelo sistema (ex: 85% bounce), trate esse número como o sinal
+quantitativo PRIMÁRIO da sua análise — ele já combina histórico de toques,
+violação, tendência, fluxo e reteste intradiário. Não recomende cancelar ou adiar
 uma entrada nesse nível usando cautela genérica de mentor ("espere mais
 confirmação") que contradiga esse sinal sem uma razão concreta presente
 nos PRÓPRIOS dados do contexto (ex: delta/razão de agressão desfavorável,
@@ -192,14 +210,36 @@ TICKS_POR_CHAMADA = 100000
 # -----------------------------------------------------------------------------
 
 ATR_PERIODO = 14
-JANELA_PIVOS_TENDENCIA = 500
-JANELA_SNAPSHOT_VIVO = 500
+
+# Consolida o que antes eram 4 literais "500" independentes (metricas.py,
+# dashboard.py/dashboard_98.py::construir_big_players, features.py) — ver
+# Modo Aprendizagem.txt/plano: 1 pregão M5 = 113 candles (número informado
+# por Jesué), base curta = 5 pregões. `JANELA_PIVOS_TENDENCIA`/
+# `JANELA_SNAPSHOT_VIVO` (ambas =500) foram removidas por estarem mortas —
+# nenhum call site real além da própria declaração.
+CANDLES_POR_PREGAO = 113
+JANELA_SNAPSHOT_CURTO_PRAZO = 5 * CANDLES_POR_PREGAO  # 565
+
 AMOSTRA_MINIMA_CONFIAVEL = 20
+
+# -----------------------------------------------------------------------------
+# MODO APRENDIZAGEM (Modo Aprendizagem.txt, 2026-07-20)
+# -----------------------------------------------------------------------------
+# Jesué decidiu que o motor não deve mais SUGERIR zonas de S/R sozinho — a
+# análise agora parte sempre dos traçados que ele desenha manualmente (ver
+# metricas.analisar_tracados/features.analisar_linha_generica, que nunca
+# dependeram do detector automático). Flag reversível (não removemos o
+# código do detector): False = detector desligado (comportamento novo,
+# padrão); True = liga de volta pra comparação/depuração, se necessário.
+AUTO_DETECCAO_SR_ATIVA = False
 
 # -----------------------------------------------------------------------------
 # S/R MULTI-NÍVEL — FASE 1 (zona, decaimento de toques, bipolaridade, score)
 # Baseado em spec_suporte_resistencia_forte.md — ver plano em
 # C:\Users\jesue\.claude\plans\analise-o-bloco-de-glimmering-marble.md
+# (histórico — este bloco de constantes segue usado por
+# analisar_linha_generica/analisar_tracados mesmo com o detector desligado,
+# ver AUTO_DETECCAO_SR_ATIVA acima)
 # -----------------------------------------------------------------------------
 
 # --- Ranking multi-nível e violação (base) ---
@@ -409,13 +449,40 @@ LIMIAR_POSTURA_FRACO = 40            # abaixo de AGUARDAR e acima disso =>
 MAGNITUDE_COMBUSTIVEL_CURTA_MAX = 35     # combustivel_score até aqui => magnitude "curta"
 MAGNITUDE_COMBUSTIVEL_MODERADA_MAX = 65  # até aqui => "moderada"; acima => "longa"
 
-# --- Combinação dos 3 blocos no score final (prob_bounce) — cada bloco
+# --- Combinação dos blocos no score final (prob_bounce) — cada bloco
 #     contribui proporcional ao seu desvio de 50 (neutro), nesta amplitude
 #     máxima de pontos; forte/status/rompimento_hoje continuam como ajustes
-#     à parte, fora dos blocos (ver calcular_prob_niveis_sr) ---
-AMPLITUDE_BLOCO_COMBUSTIVEL = 20.0
+#     à parte, fora dos blocos (ver calcular_prob_niveis_sr).
+#
+#     2026-07-21 — correção estrutural pedida pelo Jesué após backtest real
+#     (WDO 5098,50/13h, ver memory project_modo_aprendizagem.md): combustível
+#     SAIU do cálculo de direção (prob_bounce) e da postura EVITAR/FAVORECE
+#     em `montar_acao` — ele é um conceito de MAGNITUDE ("quanto ainda pode
+#     andar"), não de DIREÇÃO ("vai fazer bounce ou vai romper"). Um nível
+#     tocado dezenas de vezes ao longo de meses (ex.: um GAP testado 41x)
+#     tinha combustível cronicamente baixo e travava a tag em EVITAR mesmo
+#     quando a reação RECENTE era ótima — Jesué foi explícito: "a
+#     informação sobre força/magnitude/volatilidade é pra decidir alvo e
+#     stop, não é indicador de entrar ou não". Só aproximação (qualidade da
+#     perna que leva ao toque) e rejeição (qualidade da reação no toque)
+#     agora compõem prob_bounce/postura — ambos são sinais direcionais de
+#     verdade; combustível ficou só como insumo de magnitude_esperada
+#     (inalterado) e dos pontos de alvo/stop abaixo. ---
+AMPLITUDE_BLOCO_COMBUSTIVEL = 20.0   # não usada mais em prob_bounce/postura —
+                                      # mantida só de referência histórica
 AMPLITUDE_BLOCO_APROXIMACAO = 15.0
 AMPLITUDE_BLOCO_REJEICAO    = 20.0
+
+# --- Alvo/stop sugeridos (pontos), derivados do combustível (2026-07-21,
+#     pedido do Jesué: "na análise de combustível traga a pontuação de alvo
+#     e stop sugerida"). Alvo escala com combustível (zona fresh = mais
+#     percurso potencial); stop é a distância até a borda oposta da zona
+#     (onde a postura se invalida) + uma folga fixa — NÃO escala com
+#     combustível, já que stop é sobre "onde o setup está errado", não
+#     sobre "quanto pode andar". ---
+FATOR_ALVO_COMBUSTIVEL_MIN = 0.8     # combustível=0 => alvo ~0,8×ATR (zona exaurida)
+FATOR_ALVO_COMBUSTIVEL_MAX = 3.0     # combustível=100 => alvo ~3,0×ATR (zona fresh)
+BUFFER_STOP_ALEM_ZONA_ATR  = 0.2     # stop = distância até a borda da zona + 0,2×ATR de folga
 
 # -----------------------------------------------------------------------------
 # ANÁLISE DE LINHA GENÉRICA — MME21 e (mais tarde) traçados manuais
@@ -432,7 +499,20 @@ TOQUES_MINIMOS_MME21_FORTE = 1       # testada E respeitada só 1x já é "forte
                                       # ele opera a MME21 puramente em dias de tendência,
                                       # não exige a mesma repetição de um nível estrutural)
 TOLERANCIA_LINHA_GENERICA_ATR = 0.5  # mesmo multiplicador de TOLERANCIA_CLUSTER_SR_ATR,
-                                      # reaproveitado pra "toque" numa linha qualquer
+                                      # usado pela MME21 (linha rápida, precisa de folga
+                                      # maior — ver TOLERANCIA_TRACADO_MANUAL_ATR abaixo
+                                      # pra linhas desenhadas à mão, que usam tolerância
+                                      # bem mais apertada)
+TOLERANCIA_TRACADO_MANUAL_ATR = 0.15 # 2026-07-21: traçado manual é um preço EXATO que
+                                      # Jesué escolheu — 0,5×ATR (~175pts no WIN) contava
+                                      # fundos formados 130+ pontos longe como "toque",
+                                      # achado real reportado por ele comparando com o
+                                      # gráfico (traçado em 173.870, fundos reais em
+                                      # 173.730/174.010 contando como respeito ao nível).
+                                      # Passado explicitamente por metricas.analisar_
+                                      # tracados via o novo parâmetro `tolerancia_atr` de
+                                      # analisar_linha_generica (default None = usa
+                                      # TOLERANCIA_LINHA_GENERICA_ATR, preserva MME21).
 TOQUES_MINIMOS_TRACADO_MANUAL_FORTE = TOQUES_MINIMOS_NIVEL_FORTE
                                       # 3 — doutrina do S/R ESTÁTICO, não o limiar mais
                                       # permissivo da MME21 (=1): um nível marcado à mão
@@ -472,6 +552,40 @@ TOQUES_FORTES_MINIMOS_TRACADO = 1
                                       # já calibrado empiricamente) não muda.
 
 # -----------------------------------------------------------------------------
+# RASTREADOR DE TENDÊNCIA — 4 níveis (Modo Aprendizagem.txt, 2026-07-20)
+# -----------------------------------------------------------------------------
+# Cada nível roda o MESMO motor de análise de linha genérica
+# (analisar_linha_generica) sobre a MESMA MME21 calculada uma única vez
+# sobre o histórico completo — só a janela de análise (`janela=`) muda por
+# nível. Nunca truncar o DataFrame por nível antes de calcular a MME21: ela
+# é uma média recursiva (EMA via .ewm(adjust=False)), truncar o histórico
+# antes do cálculo faria ela "recomeçar fria" sem o aquecimento anterior,
+# dando um valor errado pros níveis mais curtos.
+NIVEIS_RASTREADOR_TENDENCIA = {
+    "maior": 5 * CANDLES_POR_PREGAO,   # 565 — 5 pregões
+    "media": 2 * CANDLES_POR_PREGAO,   # 226 — 2 pregões
+    "menor": 1 * CANDLES_POR_PREGAO,   # 113 — 1 pregão
+    "micro": CANDLES_POR_PREGAO // 2,  # 56
+}
+JANELA_TENDENCIA_ATUAL = MME21_PERIODO  # 21 — "Tendência Atual" (Jesué, últimos 21 candles)
+
+# Classificação de tendência POR NÍVEL do Rastreador (2026-07-21) — cada
+# tier julga sua PRÓPRIA janela (deslocamento líquido da MME21 nessa janela,
+# normalizado por ATR médio do período — mesma doutrina de limiar-em-
+# múltiplos-de-ATR usada no resto do motor, nunca z-score/estatística
+# abstrata). Substitui o bug real encontrado 2026-07-20: os 5 cards
+# usavam um ÚNICO booleano 'lateral' global (de calcular_tendencia,
+# janela_pivos=6 fixo, sem noção de tier), fazendo o card "Maior" (5
+# pregões) copiar cegamente a leitura de curtíssimo prazo mesmo quando a
+# MME21 mostrava tendência clara dentro da SUA PRÓPRIA janela de 565
+# candles. Validado com dados reais de WDO (script scratchpad/
+# backtest_20jul.py): limiar=3.0 separa bem tendência de consolidação nos
+# 3 pontos testados (08/07, 16/07, 18/07/2026) sem exigir sqrt(janela) —
+# um deslocamento de 3+ ATRs já é visualmente uma tendência pra qualquer
+# trader, independente do tamanho da janela.
+LIMIAR_TENDENCIA_RASTREADOR_ATR = 3.0
+
+# -----------------------------------------------------------------------------
 # JANELAS DO PREGÃO — confirmado por Jesué em 30/06/2026
 # -----------------------------------------------------------------------------
 
@@ -499,9 +613,65 @@ PASTA_DIARIO_IMAGENS = PASTA_BASE_PROCESSADA / "diario_imagens"
 
 # R$ por ponto — usado no preview automático de Saldo Op. no formulário e na
 # reconciliação contra o MT5 (que retorna profit em R$, não em pontos).
-VALOR_PONTO = {"WIN": 0.20, "WDO": 10.0}
+# BIT (futuro de Bitcoin da B3) derivado do próprio relatório do ProfitPro
+# em 2026-07-28: a operação BITG26 de 19/02 fechou -700,00 pontos e
+# -R$7,00 -> 0,01 R$/ponto. Sem esta entrada o P&L de BIT sairia ZERADO
+# (`VALOR_PONTO.get(ativo, 0.0)`), silenciosamente.
+VALOR_PONTO = {"WIN": 0.20, "WDO": 10.0, "BIT": 0.01}
 
 # Teto de largura (px) aplicado a qualquer imagem salva no diário (upload ou
 # colar do clipboard) — sem isso o volume de `diario_imagens/` cresce sem
 # controle a cada print colado em resolução nativa.
 DIARIO_IMAGEM_LARGURA_MAX = 1600
+
+# Paciência da trava de `posicoes_abertas.parquet` para AÇÕES DO USUÁRIO
+# (finalizar, salvar campo, colar print) — ver persistencia.lock_posicoes_abertas.
+#
+# Bug real 2026-07-27: "Finalizar e gravar" respondia "⚠ Ocupado" e o pop-up
+# não fechava. Causa: `sincronizar_posicoes_abertas` segura esta trava
+# ENQUANTO faz I/O no MT5 (`buscar_execucoes_periodo`, IPC reconhecidamente
+# lento/instável neste ambiente), e isso roda a cada 3s em DOIS dashboards ao
+# mesmo tempo. O orçamento anterior (8 × 0,15s = 1,2s) perdia essa disputa com
+# frequência. 40 × 0,1s = até 4s de espera: invisível pra quem clicou (a ação
+# é rara e interativa) e folgado o bastante pra atravessar um ciclo de sync
+# lento. O sync automático NÃO usa estes valores — continua com o default
+# `tentativas=1`, pulando o ciclo em silêncio quando ocupado.
+DIARIO_LOCK_USUARIO_TENTATIVAS = 40
+DIARIO_LOCK_USUARIO_ESPERA_S = 0.1
+
+# -----------------------------------------------------------------------------
+# MODO APRENDIZAGEM — Fase 3.3 (2026-07-21): ajuste fino automático
+# -----------------------------------------------------------------------------
+# Thresholds de `diario_trade.avaliar_aderencia_tracados` (movidos de
+# diario_trade.py pra ficar junto das outras constantes candidatas a ajuste
+# fino) — primeiro palpite, não validado ainda contra casos reais.
+ADERENCIA_SR_ATR_PRECISO = 0.15
+ADERENCIA_SR_ATR_PROXIMO = 0.5
+
+# Allowlist curada das constantes dos "blocos de força" elegíveis a ajuste
+# fino AUTOMÁTICO (ver aprendizagem.py) — cada uma com limite de variação
+# (fração do valor atual, ex.: 0.2 = ±20%) e a amostra mínima exigida antes
+# de considerar qualquer sugestão pra ela. Curada manualmente (não é "todas
+# as constantes numéricas do arquivo") — de propósito, deixa de fora:
+# janelas de candles (mudam o SIGNIFICADO do que é medido, não a força do
+# sinal), limiares de detecção de pivô/rompimento (mudam O QUE conta como
+# evento, não o peso de um evento já detectado), e qualquer constante que já
+# vem de pedido explícito do Jesué com um número específico (ex.:
+# JANELA_RESPEITO_MME21=20, TOLERANCIA_TRACADO_MANUAL_ATR). Só pesos/limiares
+# de composição de score são candidatos — mover esses não muda a doutrina,
+# só afina o quanto cada fator pesa dentro dela.
+#
+# **Nada aqui é escrito automaticamente ainda** (2026-07-21) — a função
+# `aprendizagem.rodar_recalibracao()` só CALCULA e LOGA o que ajustaria,
+# nunca aplica de verdade. Escrever de fato é um passo futuro, só depois de
+# acumular volume real de trades e Jesué revisar as primeiras sugestões —
+# ver comentário no topo de aprendizagem.py.
+AJUSTE_FINO_ALLOWLIST = {
+    "LIMIAR_POSTURA_FAVORECE":  {"limite_variacao": 0.2, "amostra_minima": 50},
+    "LIMIAR_POSTURA_AGUARDAR":  {"limite_variacao": 0.2, "amostra_minima": 50},
+    "LIMIAR_POSTURA_FRACO":     {"limite_variacao": 0.2, "amostra_minima": 50},
+    "AMPLITUDE_BLOCO_APROXIMACAO": {"limite_variacao": 0.2, "amostra_minima": 50},
+    "AMPLITUDE_BLOCO_REJEICAO":    {"limite_variacao": 0.2, "amostra_minima": 50},
+    "FATOR_ALVO_COMBUSTIVEL_MIN":  {"limite_variacao": 0.2, "amostra_minima": 50},
+    "FATOR_ALVO_COMBUSTIVEL_MAX":  {"limite_variacao": 0.2, "amostra_minima": 50},
+}

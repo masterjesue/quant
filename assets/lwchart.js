@@ -5,12 +5,16 @@
 // TradingView: só a biblioteca de desenho, alimentada com os nossos
 // próprios dados (mesmo pipeline MT5/Parquet que já roda o dashboard).
 //
-// Duas instâncias: a mini do Price Action (`lw-chart-price-action`, tema
-// dark do clássico) e a grande da aba "Traçados" (`lw-chart-tracados`) —
-// mesmos dados, tamanhos diferentes, mesma ideia de `assets_98/lwchart.js`
-// (que já tinha 2 instâncias — prévia/cheia — antes desta). `criarChart()`
-// generalizado (aceita `containerId`) só depois de precisar de uma 2ª
-// instância aqui; copiado do molde que assets_98/lwchart.js já usava.
+// 1 instância — `lw-chart-tracados`, o gráfico da seção fundida "Price
+// Action + Traçados" (Modo Aprendizagem.txt, 2026-07-20). Já existiu uma
+// 2ª instância menor e sem ferramenta de desenho (`lw-chart-price-action`,
+// mesmos dados) — removida por ser redundante; `window.SQ_CHART.chart`/
+// `series`/`mmeSeries` (o estado dessa 1ª instância) ficam permanentemente
+// `null` agora, mas todo consumo já era null-safe por padrão de
+// espera-segura (containers do Dash não existem no 1º tick de JS).
+// `criarChart()` continua genérico (aceita `containerId`) — histórico de
+// quando havia 2 instâncias aqui; copiado do molde que
+// assets_98/lwchart.js já usava.
 //
 // Dados chegam via clientside_callback em dashboard.py, lendo
 // store-candles-grafico (Output de atualizar_dashboard, mesmo tick de 1s
@@ -479,14 +483,13 @@
   }
 
   function initCharts() {
-    if (!window.SQ_CHART.series) {
-      var principal = criarChart('lw-chart-price-action');
-      if (principal) {
-        window.SQ_CHART.chart = principal.chart;
-        window.SQ_CHART.series = principal.series;
-        window.SQ_CHART.mmeSeries = principal.mme;
-      }
-    }
+    // `lw-chart-price-action` (chart "principal" duplicado) foi removido
+    // do layout (Modo Aprendizagem.txt, 2026-07-20: Price Action e
+    // Traçados viraram uma seção só, com um gráfico só — o de Traçados,
+    // que já tinha a ferramenta de desenho). `window.SQ_CHART.chart`/
+    // `series`/`mmeSeries` ficam permanentemente `null` agora — todo
+    // consumo já é null-safe (`if (!chart) return`, etc.), não precisa
+    // tentar criar esse chart nunca mais.
     if (!window.SQ_CHART.tracadosSeries) {
       var tracadosChart = criarChart('lw-chart-tracados');
       if (tracadosChart) {
@@ -503,12 +506,11 @@
   }
 
   // Mesmo padrão de espera segura dos outros scripts (window_manager.js,
-  // clippy_agent.js, assets_98/lwchart.js): os containers só existem depois
-  // do 1º render do Dash, e a aba "Traçados" pode nem estar montada ainda
-  // na 1ª chamada — o observer continua vivo até os dois existirem.
+  // clippy_agent.js, assets_98/lwchart.js): o container só existe depois
+  // do 1º render do Dash — o observer continua vivo até existir.
   var observer = new MutationObserver(function () {
     initCharts();
-    if (window.SQ_CHART.series && window.SQ_CHART.tracadosSeries) observer.disconnect();
+    if (window.SQ_CHART.tracadosSeries) observer.disconnect();
   });
   observer.observe(document.body, { childList: true, subtree: true });
   initCharts();
