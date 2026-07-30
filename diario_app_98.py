@@ -1842,9 +1842,10 @@ def _tabela_estrategias_98(df: pd.DataFrame) -> html.Div:
     if df.empty:
         return html.Div('Nenhuma estratégia cadastrada.', style={'color': C['text2'], 'fontSize': '11px', 'padding': '8px'})
     cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '4px 8px', 'fontSize': '10px', 'color': C['text2']})
-                          for t in ['Nome', 'Descrição', 'Checklist', '']])
+                          for t in ['Nome', 'Categoria', 'Descrição', 'Checklist', '']])
     linhas = [html.Tr([
         _td_diario98(linha['nome']),
+        _td_diario98(dt.ROTULO_CATEGORIA_ESTRATEGIA.get(linha.get('categoria'), '—')),
         _td_diario98(linha['descricao'] or '—'),
         _td_diario98(f"{len(_lista_segura_98(linha['checklist']))} item(ns)"),
         _td_diario98(html.Div([
@@ -1906,6 +1907,11 @@ def _construir_diario98_estrategias() -> html.Div:
             campo('Checklist operacional (1 item por linha, opcional)',
                   dcc.Textarea(id='diario98-nova-estrategia-checklist', rows=3,
                                style={**win98_field(), 'height': 'auto', 'resize': 'none'})),
+            campo('Categoria', dcc.Dropdown(
+                id='diario98-nova-estrategia-categoria',
+                options=[{'label': dt.ROTULO_CATEGORIA_ESTRATEGIA[c], 'value': c}
+                         for c in dt.CATEGORIA_ESTRATEGIA_OPCOES],
+                placeholder='(opcional)', className='win98-dropdown', style={'width': '220px'})),
             html.Button('Adicionar Estratégia', id='btn-diario98-add-estrategia', n_clicks=0,
                         className='win98-btn', style=win98_button()),
             html.Button('Cancelar Edição', id='btn-diario98-cancelar-edicao-estrategia', n_clicks=0,
@@ -2382,6 +2388,7 @@ def atualizar_estrategias_98(aba_ativa):
     Output('diario98-nova-estrategia-nome', 'value'),
     Output('diario98-nova-estrategia-desc', 'value'),
     Output('diario98-nova-estrategia-checklist', 'value'),
+    Output('diario98-nova-estrategia-categoria', 'value'),
     Output('store-diario98-estrategia-editando', 'data'),
     Output('btn-diario98-add-estrategia', 'children'),
     Output('btn-diario98-cancelar-edicao-estrategia', 'style'),
@@ -2393,16 +2400,18 @@ def atualizar_estrategias_98(aba_ativa):
     State('diario98-nova-estrategia-nome', 'value'),
     State('diario98-nova-estrategia-desc', 'value'),
     State('diario98-nova-estrategia-checklist', 'value'),
+    State('diario98-nova-estrategia-categoria', 'value'),
     State('store-diario98-estrategia-editando', 'data'),
     prevent_initial_call=True,
 )
-def gerenciar_estrategias_98(n_add, n_desativar, n_editar, n_cancelar, nome, descricao, checklist_texto, editando_id):
+def gerenciar_estrategias_98(n_add, n_desativar, n_editar, n_cancelar, nome, descricao, checklist_texto,
+                             categoria, editando_id):
     """Ver diario_app_classico.py::gerenciar_estrategias pro mesmo
     raciocínio completo (form único servindo criar/editar, feedback
     2026-07-20)."""
     ctx = callback_context
     if not ctx.triggered:
-        return (no_update,) * 9
+        return (no_update,) * 10
     origem = ctx.triggered[0]['prop_id']
     prop_curto = origem.rsplit('.', 1)[0]
     estilo_cancelar_oculto = {**win98_button(), 'marginLeft': '6px', 'display': 'none'}
@@ -2410,44 +2419,47 @@ def gerenciar_estrategias_98(n_add, n_desativar, n_editar, n_cancelar, nome, des
 
     if prop_curto == 'btn-diario98-cancelar-edicao-estrategia':
         if not n_cancelar:
-            return (no_update,) * 9
-        return (no_update, 'Edição cancelada.', '', '', '', None,
+            return (no_update,) * 10
+        return (no_update, 'Edição cancelada.', '', '', '', None, None,
                 'Adicionar Estratégia', estilo_cancelar_oculto, None)
 
     if prop_curto == 'btn-diario98-add-estrategia':
         if not nome or not nome.strip():
-            return (no_update, '⚠ Informe um nome.') + (no_update,) * 7
+            return (no_update, '⚠ Informe um nome.') + (no_update,) * 8
         checklist = [linha.strip() for linha in (checklist_texto or '').split('\n') if linha.strip()]
         if editando_id:
-            dt.editar_estrategia(editando_id, nome=nome.strip(), descricao=descricao or '', checklist=checklist)
+            dt.editar_estrategia(editando_id, nome=nome.strip(), descricao=descricao or '',
+                                  checklist=checklist, categoria=categoria)
             return (_tabela_estrategias_98(dt.listar_estrategias()), f'✔ "{nome.strip()}" atualizada.',
-                    '', '', '', None, 'Adicionar Estratégia', estilo_cancelar_oculto, None)
-        dt.criar_estrategia(nome, descricao or '', checklist)
+                    '', '', '', None, None, 'Adicionar Estratégia', estilo_cancelar_oculto, None)
+        dt.criar_estrategia(nome, descricao or '', checklist, categoria=categoria)
         return (_tabela_estrategias_98(dt.listar_estrategias()), f'✔ "{nome.strip()}" cadastrada.',
-                '', '', '', no_update, no_update, no_update, no_update)
+                '', '', '', None, no_update, no_update, no_update, no_update)
 
     if prop_curto.startswith('{'):
         id_componente = json.loads(prop_curto)
         if id_componente['type'] == 'diario98-estrategia-editar':
             if not any(n_editar or []):
-                return (no_update,) * 9
+                return (no_update,) * 10
             df = dt.listar_estrategias(somente_ativas=False)
             linha = df[df['id'] == id_componente['index']]
             if linha.empty:
-                return (no_update,) * 9
+                return (no_update,) * 10
             linha0 = linha.iloc[0]
             checklist_texto_novo = '\n'.join(_lista_segura_98(linha0['checklist']))
+            categoria_atual = linha0.get('categoria')
+            categoria_atual = None if pd.isna(categoria_atual) else str(categoria_atual)
             aviso = html.Div(f'✏ Editando "{linha0["nome"]}" (ID {linha0["id"]}).',
                               style={'fontSize': '10px', 'color': C['gold'], 'marginBottom': '6px'})
             return (no_update, '', linha0['nome'], linha0['descricao'] or '', checklist_texto_novo,
-                    int(linha0['id']), 'Salvar Alterações', estilo_cancelar_visivel, aviso)
+                    categoria_atual, int(linha0['id']), 'Salvar Alterações', estilo_cancelar_visivel, aviso)
         if id_componente['type'] == 'diario98-estrategia-desativar':
             if not any(n_desativar or []):
-                return (no_update,) * 9
+                return (no_update,) * 10
             dt.desativar_estrategia(id_componente['index'])
             return (_tabela_estrategias_98(dt.listar_estrategias()), '✔ Estratégia desativada.',
-                    no_update, no_update, no_update, no_update, no_update, no_update, no_update)
-    return (no_update,) * 9
+                    no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update)
+    return (no_update,) * 10
 
 
 @app.callback(

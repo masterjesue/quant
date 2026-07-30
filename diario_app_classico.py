@@ -1828,37 +1828,47 @@ def _faixa_score(score: float) -> str:
     return 'baixo'
 
 
-def _tabela_score_confiabilidade(scores: dict, saldos_por_estrategia: dict | None = None) -> html.Div:
-    """Bloco único "Confiabilidade por Estratégia" — fusão do antigo "Score
-    de Confiabilidade" com o breakdown "Por Estratégia" (pedido do Jesué em
-    2026-07-30: "junte o score de confiabilidade e a seção 'Por Estratégia'
-    no mesmo bloco, coloque uma seta no canto da linha para expandir os
-    detalhes").
+# Colunas ordenáveis do bloco Confiabilidade por Estratégia (2026-07-30,
+# "upgrade diario.docx": "adicionar classificação crescente/decrescente por
+# coluna, como no Excel"). Ordem = ordem visual das colunas na tabela.
+_CAMPOS_ORDENAVEIS_CONFIABILIDADE = [
+    ('nome', 'Estratégia'), ('n', 'N'), ('saldo', 'Saldo'),
+    ('taxa_acerto', 'Taxa Acerto'), ('payoff', 'Payoff'),
+    ('profit_factor', 'Profit Factor'), ('score', 'Score'),
+]
 
-    Eram dois painéis lendo VOCABULÁRIOS diferentes — o score varria a lista
-    de bootstrap congelada no código e o breakdown varria o cadastro
-    editável — então mostravam nomes diferentes para os mesmos trades. Ver
-    `dt._tags_para_pontuar` para a correção da causa raiz; aqui o efeito é
-    que a coluna Saldo (que só existia no breakdown) e as métricas de
-    qualidade (que só existiam no score) passam a viver na mesma linha.
 
-    A seta segue a regra recorrente deste código: o botão é ESTÁTICO no
-    layout e a callback só troca o `children` de uma linha irmã — recriar o
-    próprio botão zeraria `n_clicks` no browser e a linha "voltaria sozinha"
-    no clique seguinte."""
-    saldos_por_estrategia = saldos_por_estrategia or {}
+def _valor_ordenacao_confiabilidade(item, saldos_por_estrategia: dict, campo: str):
+    tag, v = item
+    if campo == 'nome':
+        return _mapa_nomes_estrategias().get(tag, tag)
+    if campo == 'saldo':
+        return saldos_por_estrategia.get(tag, {}).get('saldo', 0.0)
+    valor = v.get(campo)
+    return valor if valor is not None else -1
+
+
+def _rotulo_cabecalho_ordenavel(rotulo: str, campo: str, ordenacao: dict | None) -> str:
+    if not ordenacao or ordenacao.get('campo') != campo:
+        return rotulo
+    return rotulo + (' ▼' if ordenacao.get('direcao') == 'desc' else ' ▲')
+
+
+def _linhas_confiabilidade_estrategia(scores: dict, saldos_por_estrategia: dict, ordenacao: dict | None) -> list:
+    """Constrói só as `html.Tr` do corpo (par resumo+detalhe por estratégia)
+    — extraído pra ser reaproveitado tanto na montagem inicial quanto pelo
+    clique de ordenar coluna (`ordenar_confiabilidade_estrategia`), que
+    reescreve SÓ este corpo, nunca o cabeçalho (ver o raciocínio completo em
+    `_tabela_score_confiabilidade`)."""
     nomes = _mapa_nomes_estrategias()
-    # Ordena por saldo (o que mais importa na leitura), setups sem trade no fim.
-    def chave(item):
-        tag, v = item
-        return (v['n'] > 0, saldos_por_estrategia.get(tag, {}).get('saldo', 0.0))
-    linhas_ordenadas = sorted(scores.items(), key=chave, reverse=True)
+    campo = (ordenacao or {}).get('campo') or 'saldo'
+    direcao = (ordenacao or {}).get('direcao') or 'desc'
+    linhas_ordenadas = sorted(
+        scores.items(),
+        key=lambda item: (item[1]['n'] > 0, _valor_ordenacao_confiabilidade(item, saldos_por_estrategia, campo)),
+        reverse=(direcao == 'desc'),
+    )
 
-    cabecalho = html.Tr([
-        html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px',
-                          'color': C['text2'], 'whiteSpace': 'nowrap'})
-        for t in ['', 'Estratégia', 'N', 'Saldo', 'Taxa Acerto', 'Payoff', 'Profit Factor', 'Score']
-    ])
     linhas = []
     for tag, v in linhas_ordenadas:
         if v['n'] == 0:
@@ -1892,10 +1902,60 @@ def _tabela_score_confiabilidade(scores: dict, saldos_por_estrategia: dict | Non
             html.Td(html.Div(id={'type': 'diario-detalhe-estrategia', 'index': tag}),
                     colSpan=8, style={'padding': '0', 'border': 'none'})
         ))
+    return linhas
+
+
+def _tabela_score_confiabilidade(scores: dict, saldos_por_estrategia: dict | None = None,
+                                  ordenacao: dict | None = None) -> html.Div:
+    """Bloco único "Confiabilidade por Estratégia" — fusão do antigo "Score
+    de Confiabilidade" com o breakdown "Por Estratégia" (pedido do Jesué em
+    2026-07-30: "junte o score de confiabilidade e a seção 'Por Estratégia'
+    no mesmo bloco, coloque uma seta no canto da linha para expandir os
+    detalhes"), com colunas ordenáveis (mesmo pedido: "adicionar
+    classificação crescente/decrescente por coluna, como no Excel").
+
+    Eram dois painéis lendo VOCABULÁRIOS diferentes — o score varria a lista
+    de bootstrap congelada no código e o breakdown varria o cadastro
+    editável — então mostravam nomes diferentes para os mesmos trades. Ver
+    `dt._tags_para_pontuar` para a correção da causa raiz; aqui o efeito é
+    que a coluna Saldo (que só existia no breakdown) e as métricas de
+    qualidade (que só existiam no score) passam a viver na mesma linha.
+
+    Duas regras de "nunca recriar o componente que dispara sua própria
+    callback" convivem aqui, cada uma resolvida diferente:
+      - a seta ▶/▼ de expandir: o BOTÃO é estático, só o `children` de uma
+        linha IRMÃ muda (ver `alternar_detalhe_estrategia`).
+      - os cabeçalhos de ordenação: o clique é tratado por
+        `ordenar_confiabilidade_estrategia`, que reescreve APENAS o
+        `<tbody>` (`diario-corpo-confiabilidade-estrategia`) e o TEXTO
+        (não o componente) dos botões de cabeçalho via `Output(...,
+        ALL, 'children')` — muda a seta ▲/▼ do cabeçalho sem nunca
+        recriar o `html.Button` que a callback ouve, o que preservaria
+        `n_clicks` intacto mesmo se dependêssemos dele (aqui nem
+        dependemos: o estado de ordenação mora inteiro em
+        `store-ordenacao-estrategia`)."""
+    saldos_por_estrategia = saldos_por_estrategia or {}
+
+    def cabecalho_ordenavel(rotulo: str, campo: str) -> html.Th:
+        return html.Th(html.Button(
+            _rotulo_cabecalho_ordenavel(rotulo, campo, ordenacao),
+            id={'type': 'diario-btn-sort-estrategia', 'campo': campo}, n_clicks=0, style={
+                'background': 'transparent', 'border': 'none', 'padding': '0',
+                'color': C['text2'], 'fontSize': '11px', 'fontWeight': '700',
+                'cursor': 'pointer', 'whiteSpace': 'nowrap',
+            }), style={'textAlign': 'left', 'padding': '6px 10px'})
+
+    cabecalho = html.Tr(
+        [html.Th('', style={'padding': '6px 10px'})]
+        + [cabecalho_ordenavel(rotulo, campo) for campo, rotulo in _CAMPOS_ORDENAVEIS_CONFIABILIDADE]
+    )
+    linhas = _linhas_confiabilidade_estrategia(scores, saldos_por_estrategia, ordenacao)
     return html.Div([
-        html.Div('Só trades reais (o simulador não entra). A seta abre o detalhe do setup.',
+        html.Div('Só trades reais (o simulador não entra). Clique numa coluna pra ordenar; '
+                 'a seta abre o detalhe do setup.',
                  style={'fontSize': '11px', 'color': C['text2'], 'marginBottom': '8px'}),
-        html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
+        html.Table([html.Thead(cabecalho),
+                    html.Tbody(linhas, id='diario-corpo-confiabilidade-estrategia')],
                    style={'width': '100%', 'borderCollapse': 'collapse'}),
     ])
 
@@ -2179,6 +2239,13 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict) -> html.Div:
         # `stats_geral` é o SEM filtro de período (ver a chamada em
         # `montar_sub_aba_diario`), igual ao `scores` — os dois lados da
         # tabela fundida precisam falar do mesmo recorte.
+        #
+        # `store-ordenacao-estrategia` reseta pro default (None = Saldo
+        # decrescente) toda vez que a aba Estatísticas remonta — mesmo
+        # padrão de outros Stores por-sub-aba deste arquivo (ex:
+        # store-em-andamento-ids-conhecidos), aceitável porque entrar na aba
+        # é ação deliberada e rara, não um evento repetitivo.
+        dcc.Store(id='store-ordenacao-estrategia', data=None),
         _bloco_diario('Confiabilidade por Estratégia',
                       _tabela_score_confiabilidade(scores, stats_geral['por_estrategia'])),
 
@@ -2279,9 +2346,10 @@ def _tabela_estrategias(df: pd.DataFrame) -> html.Div:
     if df.empty:
         return html.Div('Nenhuma estratégia cadastrada.', style={'color': C['text2'], 'fontSize': '12px', 'padding': '8px'})
     cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '6px 10px', 'fontSize': '11px', 'color': C['text2']})
-                          for t in ['Nome', 'Descrição', 'Checklist', '']])
+                          for t in ['Nome', 'Categoria', 'Descrição', 'Checklist', '']])
     linhas = [html.Tr([
         _td_diario(linha['nome']),
+        _td_diario(dt.ROTULO_CATEGORIA_ESTRATEGIA.get(linha.get('categoria'), '—')),
         _td_diario(linha['descricao'] or '—'),
         _td_diario(f"{len(_lista_segura(linha['checklist']))} item(ns)"),
         _td_diario(html.Div([
@@ -2342,6 +2410,14 @@ def _construir_diario_estrategias() -> html.Div:
             campo('Descrição', dcc.Textarea(id='diario-nova-estrategia-desc', rows=2, style=estilo_input({'resize': 'none', 'height': 'auto'}))),
             campo('Checklist operacional (1 item por linha, opcional)',
                   dcc.Textarea(id='diario-nova-estrategia-checklist', rows=3, style=estilo_input({'resize': 'none', 'height': 'auto'}))),
+            # Categoria (2026-07-30, "upgrade diario.docx"): característica
+            # do SETUP em si, não do resultado — ver dt.CATEGORIA_ESTRATEGIA_
+            # OPCOES pra definição de cada uma.
+            campo('Categoria', dcc.Dropdown(
+                id='diario-nova-estrategia-categoria',
+                options=[{'label': dt.ROTULO_CATEGORIA_ESTRATEGIA[c], 'value': c}
+                         for c in dt.CATEGORIA_ESTRATEGIA_OPCOES],
+                placeholder='(opcional)', className='classico-dropdown', style={'width': '220px'})),
             html.Button('Adicionar Estratégia', id='btn-diario-add-estrategia', n_clicks=0, style=_estilo_btn_primario()),
             html.Button('Cancelar Edição', id='btn-diario-cancelar-edicao-estrategia', n_clicks=0,
                         style={**_estilo_btn_pequeno(), 'marginLeft': '8px', 'display': 'none'}),
@@ -2845,6 +2921,7 @@ def atualizar_estrategias(sub_aba_ativa):
     Output('diario-nova-estrategia-nome', 'value'),
     Output('diario-nova-estrategia-desc', 'value'),
     Output('diario-nova-estrategia-checklist', 'value'),
+    Output('diario-nova-estrategia-categoria', 'value'),
     Output('store-diario-estrategia-editando', 'data'),
     Output('btn-diario-add-estrategia', 'children'),
     Output('btn-diario-cancelar-edicao-estrategia', 'style'),
@@ -2856,10 +2933,12 @@ def atualizar_estrategias(sub_aba_ativa):
     State('diario-nova-estrategia-nome', 'value'),
     State('diario-nova-estrategia-desc', 'value'),
     State('diario-nova-estrategia-checklist', 'value'),
+    State('diario-nova-estrategia-categoria', 'value'),
     State('store-diario-estrategia-editando', 'data'),
     prevent_initial_call=True,
 )
-def gerenciar_estrategias(n_add, n_desativar, n_editar, n_cancelar, nome, descricao, checklist_texto, editando_id):
+def gerenciar_estrategias(n_add, n_desativar, n_editar, n_cancelar, nome, descricao, checklist_texto,
+                          categoria, editando_id):
     """Um único form ("Nova Estratégia") serve os 2 modos — criar e editar
     (feedback 2026-07-20: "preciso de um botão pra editar a estratégia").
     `store-diario-estrategia-editando` guarda o id em edição (None = modo
@@ -2868,7 +2947,7 @@ def gerenciar_estrategias(n_add, n_desativar, n_editar, n_cancelar, nome, descri
     está setado) voltam ao modo criar."""
     ctx = callback_context
     if not ctx.triggered:
-        return (no_update,) * 9
+        return (no_update,) * 10
     origem = ctx.triggered[0]['prop_id']
     prop_curto = origem.rsplit('.', 1)[0]
     estilo_cancelar_oculto = {**_estilo_btn_pequeno(), 'marginLeft': '8px', 'display': 'none'}
@@ -2877,44 +2956,47 @@ def gerenciar_estrategias(n_add, n_desativar, n_editar, n_cancelar, nome, descri
 
     if prop_curto == 'btn-diario-cancelar-edicao-estrategia':
         if not n_cancelar:
-            return (no_update,) * 9
-        return (no_update, 'Edição cancelada.', '', '', '', None,
+            return (no_update,) * 10
+        return (no_update, 'Edição cancelada.', '', '', '', None, None,
                 'Adicionar Estratégia', estilo_cancelar_oculto, None)
 
     if prop_curto == 'btn-diario-add-estrategia':
         if not nome or not nome.strip():
-            return (no_update, '⚠ Informe um nome.') + (no_update,) * 7
+            return (no_update, '⚠ Informe um nome.') + (no_update,) * 8
         checklist = [linha.strip() for linha in (checklist_texto or '').split('\n') if linha.strip()]
         if editando_id:
-            dt.editar_estrategia(editando_id, nome=nome.strip(), descricao=descricao or '', checklist=checklist)
+            dt.editar_estrategia(editando_id, nome=nome.strip(), descricao=descricao or '',
+                                  checklist=checklist, categoria=categoria)
             return (_tabela_estrategias(dt.listar_estrategias()), f'✔ "{nome.strip()}" atualizada.',
-                    '', '', '', None, 'Adicionar Estratégia', estilo_cancelar_oculto, None)
-        dt.criar_estrategia(nome, descricao or '', checklist)
+                    '', '', '', None, None, 'Adicionar Estratégia', estilo_cancelar_oculto, None)
+        dt.criar_estrategia(nome, descricao or '', checklist, categoria=categoria)
         return (_tabela_estrategias(dt.listar_estrategias()), f'✔ "{nome.strip()}" cadastrada.',
-                '', '', '', no_update, no_update, no_update, no_update)
+                '', '', '', None, no_update, no_update, no_update, no_update)
 
     if prop_curto.startswith('{'):
         id_componente = json.loads(prop_curto)
         if id_componente['type'] == 'diario-estrategia-editar':
             if not any(n_editar or []):
-                return (no_update,) * 9
+                return (no_update,) * 10
             df = dt.listar_estrategias(somente_ativas=False)
             linha = df[df['id'] == id_componente['index']]
             if linha.empty:
-                return (no_update,) * 9
+                return (no_update,) * 10
             linha0 = linha.iloc[0]
             checklist_texto_novo = '\n'.join(_lista_segura(linha0['checklist']))
+            categoria_atual = linha0.get('categoria')
+            categoria_atual = None if pd.isna(categoria_atual) else str(categoria_atual)
             aviso = html.Div(f'✏ Editando "{linha0["nome"]}" (ID {linha0["id"]}).',
                               style={'fontSize': '11px', 'color': C['gold'], 'marginBottom': '8px'})
             return (no_update, '', linha0['nome'], linha0['descricao'] or '', checklist_texto_novo,
-                    int(linha0['id']), 'Salvar Alterações', estilo_cancelar_visivel, aviso)
+                    categoria_atual, int(linha0['id']), 'Salvar Alterações', estilo_cancelar_visivel, aviso)
         if id_componente['type'] == 'diario-estrategia-desativar':
             if not any(n_desativar or []):
-                return (no_update,) * 9
+                return (no_update,) * 10
             dt.desativar_estrategia(id_componente['index'])
             return (_tabela_estrategias(dt.listar_estrategias()), '✔ Estratégia desativada.',
-                    no_update, no_update, no_update, no_update, no_update, no_update, no_update)
-    return (no_update,) * 9
+                    no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update)
+    return (no_update,) * 10
 
 
 @app.callback(
@@ -3447,6 +3529,51 @@ def alternar_detalhe_estrategia(n_clicks, seta_atual, id_componente):
     if seta_atual == '▶':
         return _detalhe_estrategia_expandido(id_componente['index']), '▼'
     return None, '▶'
+
+
+@app.callback(
+    Output('diario-corpo-confiabilidade-estrategia', 'children'),
+    Output({'type': 'diario-btn-sort-estrategia', 'campo': ALL}, 'children'),
+    Output('store-ordenacao-estrategia', 'data'),
+    Input({'type': 'diario-btn-sort-estrategia', 'campo': ALL}, 'n_clicks'),
+    State({'type': 'diario-btn-sort-estrategia', 'campo': ALL}, 'id'),
+    State('store-ordenacao-estrategia', 'data'),
+    prevent_initial_call=True,
+)
+def ordenar_confiabilidade_estrategia(n_clicks_lista, ids_cabecalho, ordenacao_atual):
+    """Clique num cabeçalho de "Confiabilidade por Estratégia" ordena por
+    aquela coluna; clicar de novo no MESMO cabeçalho inverte a direção
+    (como no Excel — pedido do Jesué em 2026-07-30).
+
+    Reescreve o `<tbody>` (`diario-corpo-confiabilidade-estrategia`) inteiro
+    — NUNCA os botões de cabeçalho que disparam esta callback. A seta ▲/▼
+    do cabeçalho ativo muda pelo segundo Output (`children` de texto via
+    `ALL`, na MESMA ordem de `ids_cabecalho`, que é como o Dash exige a
+    resposta de um Output `ALL` — ver `destacar_imagem_principal` pro mesmo
+    padrão já usado neste arquivo). Trocar só o texto do botão não recria o
+    componente, então `n_clicks` nunca zera — mas nem dependemos dele pra
+    nada além de detectar QUAL cabeçalho foi clicado: o estado de ordenação
+    inteiro mora em `store-ordenacao-estrategia`."""
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update, no_update, no_update
+    campo_clicado = json.loads(ctx.triggered[0]['prop_id'].rsplit('.', 1)[0])['campo']
+
+    campo_atual = (ordenacao_atual or {}).get('campo')
+    direcao_atual = (ordenacao_atual or {}).get('direcao', 'desc')
+    nova_direcao = ('asc' if direcao_atual == 'desc' else 'desc') if campo_clicado == campo_atual else 'desc'
+    nova_ordenacao = {'campo': campo_clicado, 'direcao': nova_direcao}
+
+    scores = dt.calcular_score_confiabilidade()
+    stats = dt.calcular_estatisticas()
+    linhas = _linhas_confiabilidade_estrategia(scores, stats['por_estrategia'], nova_ordenacao)
+
+    rotulos_por_campo = dict(_CAMPOS_ORDENAVEIS_CONFIABILIDADE)
+    novos_rotulos = [
+        _rotulo_cabecalho_ordenavel(rotulos_por_campo[item_id['campo']], item_id['campo'], nova_ordenacao)
+        for item_id in ids_cabecalho
+    ]
+    return linhas, novos_rotulos, nova_ordenacao
 
 
 @app.callback(

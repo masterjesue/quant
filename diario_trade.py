@@ -154,7 +154,22 @@ def classificar_sentimento_mercado(valor) -> tuple[str, str] | None:
 # slug, sumir da tabela quebraria o Histórico.
 # -----------------------------------------------------------------------------
 
-COLUNAS_ESTRATEGIAS = ["id", "slug", "nome", "descricao", "checklist", "ativo", "criado_em"]
+COLUNAS_ESTRATEGIAS = ["id", "slug", "nome", "descricao", "checklist", "categoria", "ativo", "criado_em"]
+
+# Categoria da estratégia (2026-07-30, "upgrade diario.docx") — característica
+# do SETUP em si (definição padrão dos livros de price action), não do
+# resultado nem da direção. Serve pra agrupar "melhor estratégia por
+# categoria" no bloco Análise de Estratégia.
+#   tendencia    = opera a CONTINUAÇÃO de um movimento (rompimento, pullback
+#                  a favor da tendência, bandeira/canal, alinhamento de médias)
+#   reversao     = opera a REJEIÇÃO de um nível ou a virada de um padrão
+#                  (bounce, OCO, topo/fundo duplo)
+#   lateralidade = setup que só faz sentido em mercado sem direção definida
+#                  (range, compressão, indecisão)
+CATEGORIA_ESTRATEGIA_OPCOES = ["tendencia", "reversao", "lateralidade"]
+ROTULO_CATEGORIA_ESTRATEGIA = {
+    "tendencia": "Tendência", "reversao": "Reversão", "lateralidade": "Lateralidade",
+}
 COLUNAS_RR_PRESETS = ["id", "nome", "alvo_pontos", "stop_pontos", "breakeven_pontos", "ativo", "criado_em"]
 COLUNAS_TAGS_SETUP_ERRO = ["id", "slug", "nome", "tipo", "ativo", "criado_em"]
 
@@ -189,7 +204,7 @@ def listar_estrategias(somente_ativas: bool = True) -> pd.DataFrame:
         agora = datetime.now()
         df = pd.DataFrame([
             {"id": i + 1, "slug": slug, "nome": slug.replace("_", " ").title(),
-             "descricao": "", "checklist": [], "ativo": True, "criado_em": agora}
+             "descricao": "", "checklist": [], "categoria": None, "ativo": True, "criado_em": agora}
             for i, slug in enumerate(ESTRATEGIA_TAGS_CANONICAS)
         ], columns=COLUNAS_ESTRATEGIAS)
         persistencia.salvar_estrategias(df)
@@ -199,7 +214,8 @@ def listar_estrategias(somente_ativas: bool = True) -> pd.DataFrame:
     return df.sort_values("nome").reset_index(drop=True)
 
 
-def criar_estrategia(nome: str, descricao: str = "", checklist: list[str] | None = None) -> int | None:
+def criar_estrategia(nome: str, descricao: str = "", checklist: list[str] | None = None,
+                      categoria: str | None = None) -> int | None:
     with persistencia.lock_estrategias() as adquirida:
         if not adquirida:
             return None
@@ -209,7 +225,7 @@ def criar_estrategia(nome: str, descricao: str = "", checklist: list[str] | None
         nova = {
             "id": _proximo_id(df), "slug": _slugificar(nome), "nome": nome.strip(),
             "descricao": descricao or "", "checklist": list(checklist or []),
-            "ativo": True, "criado_em": datetime.now(),
+            "categoria": categoria, "ativo": True, "criado_em": datetime.now(),
         }
         df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
         persistencia.salvar_estrategias(df.reindex(columns=COLUNAS_ESTRATEGIAS))
