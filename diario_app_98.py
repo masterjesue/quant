@@ -2748,6 +2748,14 @@ def limpar_form_diario98(n_clicks):
             None, None)
 
 
+# Ver diario_app_classico.py — mesmos tetos, mesmo motivo. Teto do "com
+# filtro" em 100 (não 300): o travamento real do Jesué aconteceu com 210
+# trades na página embutida de verdade (gráfico ao vivo competindo pelo
+# mesmo thread de render); 100 fica bem abaixo disso, com margem de sobra.
+_LIMITE_HISTORICO_98_SEM_FILTRO = 50
+_LIMITE_HISTORICO_98_COM_FILTRO = 100
+
+
 def _montar_tabela_historico_98(ativo, janela, estrategia, data_ini_efetivo, data_fim_efetivo, filtro_cal):
     """Ver diario_app_classico.py::_montar_tabela_historico pro raciocínio
     completo — extraído de `atualizar_historico_98` pra ser reaproveitado
@@ -2757,12 +2765,11 @@ def _montar_tabela_historico_98(ativo, janela, estrategia, data_ini_efetivo, dat
     df = dt.listar_trades(ativo=ativo, janela=janela, estrategia_tag=estrategia,
                            data_ini=data_ini_efetivo, data_fim=data_fim_efetivo, is_simulated=False)
     df = df.sort_values('data_op', ascending=False)
-    # Ver diario_app_classico.py::_montar_tabela_historico — bug real
-    # 2026-07-30: o corte de 50 era incondicional, então um range de datas
-    # explícito sem outro filtro continuava mostrando só as 50 mais recentes.
+    total_encontrado = len(df)
     sem_filtro_nenhum = not (ativo or janela or estrategia or data_ini_efetivo or data_fim_efetivo or filtro_cal)
-    if sem_filtro_nenhum:
-        df = df.head(50)
+    limite = _LIMITE_HISTORICO_98_SEM_FILTRO if sem_filtro_nenhum else _LIMITE_HISTORICO_98_COM_FILTRO
+    truncado = total_encontrado > limite
+    df = df.head(limite)
 
     # Pendências (fechamentos ao vivo + descobertas históricas) — ver
     # diario_app_classico.py::atualizar_historico pro mesmo raciocínio.
@@ -2775,12 +2782,18 @@ def _montar_tabela_historico_98(ativo, janela, estrategia, data_ini_efetivo, dat
         if data_fim_efetivo:
             pendencias = pendencias[pendencias['data'].astype(str) <= str(data_fim_efetivo)]
 
-    banner = html.Div([
-        html.Span(f'Filtrando pelo dia {filtro_cal} (clique no calendário). ',
-                  style={'fontSize': '11px', 'color': C['text2']}),
-        html.Button('Limpar', id='btn-diario98-hist-limpar-filtro-cal', n_clicks=0,
-                    className='win98-btn', style={**win98_button(), 'minHeight': '18px', 'padding': '0 8px'}),
-    ], style={'display': 'flex', 'alignItems': 'center', 'gap': '6px'}) if filtro_cal else ''
+    partes_banner = []
+    if filtro_cal:
+        partes_banner.append(html.Span(f'Filtrando pelo dia {filtro_cal} (clique no calendário). ',
+                                        style={'fontSize': '11px', 'color': C['text2']}))
+        partes_banner.append(html.Button('Limpar', id='btn-diario98-hist-limpar-filtro-cal', n_clicks=0,
+                    className='win98-btn', style={**win98_button(), 'minHeight': '18px', 'padding': '0 8px'}))
+    if truncado:
+        partes_banner.append(html.Span(
+            f'Mostrando as {limite} mais recentes de {total_encontrado} — refine o filtro.',
+            style={'fontSize': '11px', 'color': C['yellow']}))
+    banner = html.Div(partes_banner, style={'display': 'flex', 'alignItems': 'center', 'gap': '6px',
+                                            'flexWrap': 'wrap'}) if partes_banner else ''
 
     if df.empty and pendencias.empty:
         return html.Div('Nenhuma operação encontrada.', style={

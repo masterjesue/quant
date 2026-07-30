@@ -26,16 +26,24 @@ a uma eventual compactação da conversa.
    operacional). Antes disso = heurística de erro/teste/aprendizagem.
 3. **Mentor de IA (item D)**: escopo/prompt só depois dos blocos visuais
    estarem prontos e estáveis.
-4. **⚠️ SQ'98 será DESCONTINUADO** (dito a meio da sessão, depois do item A
-   já ter sido espelhado nos 2 skins): já que o redesenho vai seguir o
-   TradeZella, o skin '98 (`diario_app_98.py`/`dashboard_98.py`) deixa de
-   receber features novas a partir daqui — "depois pensaremos no que fazer
-   com ele". **Não apagar nada agora, só parar de espelhar.** Daqui pra
-   frente (item B em diante, e principalmente o item F), qualquer trabalho
-   de UI é SÓ no skin clássico (`diario_app_classico.py`/`dashboard.py`).
-   Isto muda uma regra estabelecida no `CLAUDE.md` ("2 front-ends,
-   nunca duplicam lógica" e a arquitetura de espelhamento constante ao longo
-   desta sessão) — vale reler o `CLAUDE.md` antes de decidir se essa seção
+4. **⚠️⚠️ SQ'98 ESTÁ DESCONTINUADO — decisão reforçada 2x na mesma sessão.**
+   Primeiro aviso (dito a meio da sessão, depois do item A já ter sido
+   espelhado nos 2 skins): já que o redesenho vai seguir o TradeZella, o
+   skin '98 deixa de receber features novas — "depois pensaremos no que
+   fazer com ele". **Segundo aviso, mais forte** (depois de eu ainda ter
+   espelhado a correção do travamento do Histórico pro '98, julgando ser
+   "correção de regressão, não feature nova"): *"Eu vejo que está gastando
+   tokens com o '98, não vamos mexer mais lá. Essa versão do Super Quant
+   está descontinuada. Registre isso."*
+
+   **Regra a partir daqui, sem exceção nenhuma**: NENHUMA mudança em
+   `diario_app_98.py`/`dashboard_98.py`/`assets_98/` — nem feature nova, nem
+   correção de bug, nem "só espelhar uma correção de 2 linhas". Se um bug
+   for encontrado no '98, **anotar e seguir em frente**, nunca corrigir ali.
+   Todo trabalho de UI daqui pra frente é 100% `diario_app_classico.py`/
+   `dashboard.py`/`assets/`. **Não apagar nada do '98 agora** — só parar de
+   tocar. Isto substitui a regra anterior do `CLAUDE.md` ("2 front-ends,
+   nunca duplicam lógica" e o espelhamento constante ao longo desta sessão)
    precisa de nota, numa sessão futura que for tratar disso formalmente.
 
 ## Pendente — organizado por bloco do docx

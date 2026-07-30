@@ -3319,6 +3319,21 @@ def limpar_form_diario(n_clicks):
             None, None)
 
 
+# Tetos do Histórico (2026-07-30) — nunca renderizar sem limite algum: o
+# custo de reconciliação do Dash escala com a contagem TOTAL de componentes
+# montados (ver MAPA_ESTRUTURA.md), e o Jesué travou a página de verdade
+# selecionando um período amplo com a base de 210 trades reais (420 `<tr>`,
+# cada trade vira resumo+detalhe) — na página embutida real (dashboard.py,
+# com o gráfico candlestick ao vivo e o sync em background disputando o
+# mesmo thread de render, não só o processo isolado do Diário). Não dava
+# pra reproduzir esse ambiente exato daqui pra medir o limiar certo — por
+# isso o teto do "com filtro" fica BEM abaixo do que já travou (210), não
+# só "abaixo": 100 é menos da metade do caso confirmado ruim, com margem de
+# sobra. Navegação livre continua conservadora (50, nunca mudou).
+_LIMITE_HISTORICO_SEM_FILTRO = 50
+_LIMITE_HISTORICO_COM_FILTRO = 100
+
+
 def _montar_tabela_historico(ativo, janela, estrategia, data_ini_efetivo, data_fim_efetivo, filtro_cal):
     """Monta a tabela do Histórico (trades reais + pendências) pros filtros
     já resolvidos — extraído de `atualizar_historico`, que só resolve os
@@ -3341,12 +3356,27 @@ def _montar_tabela_historico(ativo, janela, estrategia, data_ini_efetivo, data_f
     # ativo/janela/estratégia continuava mostrando só as 50 operações mais
     # recentes, que quase sempre são todas do mês corrente. Com outro filtro
     # (ativo, janela, estratégia) o subconjunto ficava menor e o corte passava
-    # despercebido — foi exatamente essa diferença que ele reportou. O corte
-    # de 50 agora só vale pra navegação livre, sem NENHUM filtro; qualquer
-    # filtro explícito (inclusive só o range de datas) mostra tudo que casar.
+    # despercebido — foi exatamente essa diferença que ele reportou.
+    #
+    # BUG REAL nº2, achado pelo Jesué na hora ("agora está travando ao tentar
+    # selecionar o período"): a correção acima removeu o corte por completo
+    # pra qualquer filtro — mas SEM corte nenhum, escolher um período amplo
+    # (ex: desde 2016) devolve os 210 trades reais de uma vez, 420 `<tr>`
+    # (cada trade vira 2 linhas: resumo + detalhe). Renderizar isso inteiro
+    # trava o navegador — a mesma classe de problema que já tinha justificado
+    # botar o Diário inteiro num iframe (ver MAPA_ESTRUTURA.md: custo de
+    # reconciliação do Dash escala com a contagem TOTAL de componentes
+    # montados). NUNCA renderizar sem limite algum, então — só limites
+    # diferentes: navegação livre (sem filtro nenhum) continua limitada a 50;
+    # qualquer filtro explícito ganha uma margem bem mais folgada (300, cobre
+    # a base inteira de hoje com sobra), mas segue BOUNDED, com aviso visível
+    # quando o corte realmente acontecer (diferença chave: o corte antigo era
+    # SILENCIOSO, esse avisa).
+    total_encontrado = len(df)
     sem_filtro_nenhum = not (ativo or janela or estrategia or data_ini_efetivo or data_fim_efetivo or filtro_cal)
-    if sem_filtro_nenhum:
-        df = df.head(50)
+    limite = _LIMITE_HISTORICO_SEM_FILTRO if sem_filtro_nenhum else _LIMITE_HISTORICO_COM_FILTRO
+    truncado = total_encontrado > limite
+    df = df.head(limite)
 
     # Pendências (fechamentos ao vivo + descobertas históricas, ver
     # dt.listar_pendencias_historico) — mesmos filtros de ativo/data do
@@ -3361,14 +3391,21 @@ def _montar_tabela_historico(ativo, janela, estrategia, data_ini_efetivo, data_f
         if data_fim_efetivo:
             pendencias = pendencias[pendencias['data'].astype(str) <= str(data_fim_efetivo)]
 
-    banner = html.Div([
-        html.Span(f'Filtrando pelo dia {filtro_cal} (clique no calendário). ',
-                  style={'fontSize': '12px', 'color': C['text2']}),
-        html.Button('Limpar', id='btn-diario-hist-limpar-filtro-cal', n_clicks=0, style={
+    partes_banner = []
+    if filtro_cal:
+        partes_banner.append(html.Span(f'Filtrando pelo dia {filtro_cal} (clique no calendário). ',
+                                        style={'fontSize': '12px', 'color': C['text2']}))
+        partes_banner.append(html.Button('Limpar', id='btn-diario-hist-limpar-filtro-cal', n_clicks=0, style={
             'background': 'transparent', 'color': C['text2'], 'border': f'1px solid {C["border"]}',
             'borderRadius': '4px', 'padding': '2px 10px', 'cursor': 'pointer', 'fontSize': '11px',
-        }),
-    ], style={'display': 'flex', 'alignItems': 'center', 'gap': '8px'}) if filtro_cal else ''
+        }))
+    if truncado:
+        partes_banner.append(html.Span(
+            f'Mostrando as {limite} operações mais recentes de {total_encontrado} encontradas — '
+            f'refine o ativo, janela, estratégia ou período pra ver o restante.',
+            style={'fontSize': '12px', 'color': C['yellow']}))
+    banner = html.Div(partes_banner, style={'display': 'flex', 'alignItems': 'center', 'gap': '8px',
+                                            'flexWrap': 'wrap'}) if partes_banner else ''
 
     if df.empty and pendencias.empty:
         return html.Div('Nenhuma operação encontrada.', style={

@@ -20,11 +20,25 @@ diario.docx"):
    relatado. Com outro filtro (ativo/janela/estratégia) o subconjunto ficava
    menor e o corte passava despercebido, o que também bate com o relato.
 
-   A regra corrigida testada aqui (`_sem_filtro_nenhum`, réplica exata da
-   condição em diario_app_classico.py::_montar_tabela_historico e
-   diario_app_98.py::_montar_tabela_historico_98) só corta em 50 quando
-   NENHUM filtro está ativo — nem ativo, nem janela, nem estratégia, nem
-   data_ini/data_fim, nem o clique no calendário.
+   A regra testada aqui (`_sem_filtro_nenhum`, réplica exata da condição em
+   diario_app_classico.py::_montar_tabela_historico e
+   diario_app_98.py::_montar_tabela_historico_98) decide qual TETO aplicar
+   — nunca "sem corte nenhum".
+
+3. BUG REAL Nº2, achado pelo Jesué ao vivo na sequência: a primeira correção
+   removeu o corte por completo pra qualquer filtro — só que sem limite
+   algum, um período amplo sem outro filtro devolve os 210 trades reais de
+   uma vez (420 `<tr>`), e isso TRAVOU o navegador de verdade, na página
+   embutida real (dashboard.py, com o gráfico candlestick ao vivo e o sync
+   em background disputando o mesmo thread de render — mesma classe de
+   problema documentada em MAPA_ESTRUTURA.md que já tinha justificado pôr o
+   Diário inteiro num iframe). Corrigido: nunca renderizar sem teto algum —
+   navegação livre continua em 50; qualquer filtro explícito ganha uma
+   margem maior (100) mas ainda finita, com aviso visível quando o corte
+   acontecer. 100, não um número maior: o travamento aconteceu com 210, e
+   não deu pra reproduzir o ambiente embutido exato daqui pra medir o
+   limiar certo — por isso a margem fica bem abaixo do que já travou, com
+   folga de sobra, em vez de só "um pouco abaixo".
 
 Roda direto: `python testes/teste_historico_filtros_estatisticas.py`.
 Sai != 0 se falhar.
@@ -55,6 +69,22 @@ def _sem_filtro_nenhum(ativo, janela, estrategia, data_ini_efetivo, data_fim_efe
     return not (ativo or janela or estrategia or data_ini_efetivo or data_fim_efetivo or filtro_cal)
 
 
+# Réplica dos tetos reais — se algum dos dois arquivos divergir do valor
+# aqui, o teste de "linha-fonte" abaixo pega a divergência. 100, não 300:
+# o travamento real do Jesué aconteceu com 210 trades na página embutida de
+# verdade (gráfico ao vivo competindo pelo mesmo thread de render) — não deu
+# pra reproduzir esse ambiente exato pra medir o limiar certo, então o teto
+# fica bem abaixo do que já travou, não só "abaixo".
+_LIMITE_SEM_FILTRO = 50
+_LIMITE_COM_FILTRO = 100
+
+
+def _limite_aplicavel(ativo, janela, estrategia, data_ini_efetivo, data_fim_efetivo, filtro_cal):
+    return _LIMITE_SEM_FILTRO if _sem_filtro_nenhum(
+        ativo, janela, estrategia, data_ini_efetivo, data_fim_efetivo, filtro_cal
+    ) else _LIMITE_COM_FILTRO
+
+
 scratch = Path(tempfile.mkdtemp(prefix="teste_hist_filtros_"))
 persistencia._caminho_diario = lambda: scratch / "diario_trades.parquet"
 persistencia._caminho_diario_lock = lambda: scratch / ".diario.lock"
@@ -74,6 +104,11 @@ try:
     for arquivo in ("diario_app_classico.py", "diario_app_98.py"):
         texto = (raiz / arquivo).read_text(encoding="utf-8")
         checar(linha_fonte in texto, f"{arquivo} ainda contém a condição corrigida (não divergiu do teste)")
+        # BUG REAL Nº2: garante que o arquivo NUNCA volte a ter um `.head()`
+        # incondicional pra "sem filtro" só, sem um teto pro caso "com
+        # filtro" — os dois tetos de verdade precisam existir como constante.
+        checar(f"{_LIMITE_COM_FILTRO}" in texto,
+               f"{arquivo} ainda define o teto de {_LIMITE_COM_FILTRO} pro caso com filtro (nunca 'sem corte')")
 
     print("\n=== Ganho Total / Perda Total ===")
     dt.registrar_trade({"data_op": "2026-01-05", "ativo": "WIN", "tipo_operacao": "long", "saldo_operacao_reais": 100.0})
@@ -109,7 +144,7 @@ try:
     checar(_sem_filtro_nenhum(None, None, None, None, None, "2026-07-15") is False,
            "filtro de calendário -> não corta")
 
-    print("\n=== Contra o dado real: range amplo sem outro filtro devolve tudo ===")
+    print("\n=== Contra o dado real: range amplo sem outro filtro, dentro do teto ===")
     for i in range(60):
         dt.registrar_trade({
             "data_op": (date(2026, 1, 1) + timedelta(days=i)).isoformat(),
@@ -118,10 +153,32 @@ try:
     todos = dt.listar_trades(is_simulated=False, data_ini="2026-01-01", data_fim="2026-12-31")
     checar(len(todos) == 65, f"65 trades no total no range amplo (veio {len(todos)})")
     ordenado = todos.sort_values("data_op", ascending=False)
-    resultado = ordenado if not _sem_filtro_nenhum(None, None, None, "2026-01-01", "2026-12-31", None) \
-        else ordenado.head(50)
+    limite = _limite_aplicavel(None, None, None, "2026-01-01", "2026-12-31", None)
+    checar(limite == _LIMITE_COM_FILTRO,
+           f"range de datas explícito usa o teto do 'com filtro' ({_LIMITE_COM_FILTRO}), não 50")
+    resultado = ordenado.head(limite)
     checar(len(resultado) == 65,
-           f"com range de datas explícito, mostra as 65 (não trunca em 50) — veio {len(resultado)}")
+           f"65 está dentro do teto de {limite} — mostra todas, não trunca (veio {len(resultado)})")
+
+    print("\n=== BUG REAL Nº2: mais resultados que o teto NUNCA renderiza sem limite ===")
+    # 400 trades adicionais (chegando a 465 no total) — bem acima do teto de
+    # 100 que existe EXATAMENTE pra nunca deixar o Dash tentar montar um
+    # `<table>` desse tamanho de uma vez (foi isso que travou o navegador).
+    for i in range(400):
+        dt.registrar_trade({
+            "data_op": (date(2020, 1, 1) + timedelta(days=i)).isoformat(),
+            "ativo": "WIN", "tipo_operacao": "long", "saldo_operacao_reais": 1.0,
+        })
+    todos2 = dt.listar_trades(is_simulated=False, data_ini="2016-01-01", data_fim="2026-12-31")
+    total_real = len(todos2)
+    checar(total_real > _LIMITE_COM_FILTRO,
+           f"a base de teste tem {total_real} trades, mais que o teto de {_LIMITE_COM_FILTRO}")
+    ordenado2 = todos2.sort_values("data_op", ascending=False)
+    limite2 = _limite_aplicavel(None, None, None, "2016-01-01", "2026-12-31", None)
+    resultado2 = ordenado2.head(limite2)
+    checar(len(resultado2) == _LIMITE_COM_FILTRO,
+           f"mesmo com {total_real} trades encontrados, renderiza NO MÁXIMO {_LIMITE_COM_FILTRO} "
+           f"(veio {len(resultado2)}) — nunca 'mostrar tudo' sem teto")
 
 finally:
     shutil.rmtree(scratch, ignore_errors=True)
