@@ -1217,6 +1217,86 @@ def calcular_score_confiabilidade(df: pd.DataFrame | None = None, min_amostra: i
     return resultado
 
 
+# Amostra mínima pra "melhor estratégia por X" e pra Estratégia Vencedora/
+# Perdedora (bloco Análise de Estratégia, 2026-07-30) — mais baixa que
+# SCORE_MIN_AMOSTRA (10) de propósito: um recorte como "melhor estratégia
+# na janela da tarde" naturalmente tem menos trades que o score geral do
+# setup, e exigir 10 ali deixaria quase todo grupo sem resposta nenhuma. 3
+# ainda descarta "melhor por 1 trade de sorte", sem also ficar vazio demais.
+ANALISE_ESTRATEGIA_MIN_AMOSTRA = 3
+
+
+def analise_estrategia(df: pd.DataFrame | None = None, min_amostra: int = ANALISE_ESTRATEGIA_MIN_AMOSTRA) -> dict:
+    """
+    Dado pro bloco "Análise de Estratégia" (2026-07-30, "upgrade
+    diario.docx"): pra cada contexto (janela, direção, ativo, categoria),
+    qual estratégia teve o melhor saldo? Mais a Estratégia Vencedora/
+    Perdedora geral (destaque ilustrado no topo do bloco).
+
+    Só entra no páreo quem tem pelo menos `min_amostra` trades NAQUELE
+    recorte — "melhor estratégia na janela X" baseado em 1 trade de sorte
+    seria ruído travestido de insight. Se nenhuma estratégia atingir a
+    amostra mínima num grupo, aquele grupo simplesmente não aparece no
+    resultado (a UI mostra "amostra insuficiente" em vez de inventar uma
+    resposta).
+    """
+    if df is None:
+        df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)].copy()
+    tags_explodidas = reais.explode("estrategia_tags")
+    tags_explodidas = tags_explodidas[tags_explodidas["estrategia_tags"].notna()]
+
+    vazio = {
+        "melhor_por_janela": {}, "melhor_por_direcao": {}, "melhor_por_ativo": {},
+        "melhor_por_categoria": {}, "vencedora": None, "perdedora": None,
+    }
+    if tags_explodidas.empty:
+        return vazio
+
+    mapa_categoria = {
+        str(r["slug"]): r.get("categoria")
+        for _, r in listar_estrategias(somente_ativas=False).iterrows()
+    }
+    tags_explodidas = tags_explodidas.copy()
+    tags_explodidas["categoria"] = tags_explodidas["estrategia_tags"].map(mapa_categoria)
+
+    def melhor_por(coluna: str) -> dict:
+        sub = tags_explodidas.dropna(subset=[coluna])
+        if sub.empty:
+            return {}
+        agrupado = sub.groupby([coluna, "estrategia_tags"])["saldo_operacao_reais"].agg(["sum", "count"])
+        resultado = {}
+        for chave in agrupado.index.get_level_values(0).unique():
+            fatia = agrupado.loc[chave]
+            fatia = fatia[fatia["count"] >= min_amostra]
+            if fatia.empty:
+                continue
+            slug_melhor = fatia["sum"].idxmax()
+            resultado[str(chave)] = {
+                "estrategia": slug_melhor,
+                "saldo": float(fatia.loc[slug_melhor, "sum"]),
+                "n": int(fatia.loc[slug_melhor, "count"]),
+            }
+        return resultado
+
+    geral = tags_explodidas.groupby("estrategia_tags")["saldo_operacao_reais"].agg(["sum", "count"])
+    geral = geral[geral["count"] >= min_amostra]
+    vencedora = perdedora = None
+    if not geral.empty:
+        idx_v, idx_p = geral["sum"].idxmax(), geral["sum"].idxmin()
+        vencedora = {"estrategia": idx_v, "saldo": float(geral.loc[idx_v, "sum"]), "n": int(geral.loc[idx_v, "count"])}
+        perdedora = {"estrategia": idx_p, "saldo": float(geral.loc[idx_p, "sum"]), "n": int(geral.loc[idx_p, "count"])}
+
+    return {
+        "melhor_por_janela": melhor_por("janela_pregao"),
+        "melhor_por_direcao": melhor_por("tipo_operacao"),
+        "melhor_por_ativo": melhor_por("ativo"),
+        "melhor_por_categoria": melhor_por("categoria"),
+        "vencedora": vencedora,
+        "perdedora": perdedora,
+    }
+
+
 def detalhe_estrategia(tag: str, df: pd.DataFrame | None = None) -> dict:
     """
     Tudo o que a linha EXPANDIDA do bloco "Confiabilidade por Estratégia"

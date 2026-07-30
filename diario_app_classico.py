@@ -1718,6 +1718,109 @@ def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
     return _bloco_diario(titulo, html.Div(linhas))
 
 
+# ---------------------------------------------------------------------------
+# Análise de Estratégia (2026-07-30, "upgrade diario.docx") — ver
+# dt.analise_estrategia pro dado. Bloco ALL-TIME (mesmo recorte de
+# "Confiabilidade por Estratégia", não reage ao seletor de mês/ano do
+# calendário) — junta Por Ativo/Janela/Sala/Tags (que antes viviam soltos
+# em `_resto_periodo_estatisticas`, reagindo ao período) com "melhor
+# estratégia por X" e o destaque de Vencedora/Perdedora.
+# ---------------------------------------------------------------------------
+
+_ROTULO_DIRECAO_OPERACAO = {'long': 'Compra', 'short': 'Venda'}
+
+
+def _tabela_melhor_por(titulo: str, dados: dict, rotulos_grupo: dict | None = None) -> html.Div:
+    """'Melhor estratégia por X' (janela/direção/ativo/categoria) — ver
+    `dt.analise_estrategia`. Cada grupo só aparece se alguma estratégia
+    atingiu `dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA` NAQUELE recorte; texto
+    explícito quando não há nenhum grupo qualificado, em vez de bloco vazio
+    sem explicação."""
+    nomes = _mapa_nomes_estrategias()
+    rotulos_grupo = rotulos_grupo or {}
+    if not dados:
+        linhas = [html.Div(f'Amostra insuficiente (mínimo {dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA} trades por grupo).',
+                           style={'fontSize': '12px', 'color': C['text2']})]
+    else:
+        linhas = []
+        for chave, info in sorted(dados.items(), key=lambda kv: -kv[1]['saldo']):
+            rotulo_chave = rotulos_grupo.get(chave, str(chave).replace('_', ' ').title())
+            nome_estrategia = nomes.get(info['estrategia'], str(info['estrategia']).replace('_', ' ').title())
+            saldo = info['saldo']
+            cor = C['green'] if saldo > 0 else (C['red'] if saldo < 0 else C['text2'])
+            linhas.append(html.Div([
+                html.Span(rotulo_chave, style={'flex': '1', 'fontSize': '12px', 'color': C['text2']}),
+                html.Span(nome_estrategia, style={'flex': '1.3', 'fontSize': '12px', 'fontWeight': '600'}),
+                html.Span(f"R$ {saldo:+.0f} ({info['n']})", style={
+                    'width': '110px', 'textAlign': 'right', 'fontSize': '12px',
+                    'fontFamily': FONTS['mono'], 'color': cor,
+                }),
+            ], style={'display': 'flex', 'padding': '4px 0', 'borderBottom': f'1px solid {C["border"]}'}))
+    return _bloco_diario(titulo, html.Div(linhas))
+
+
+def _card_estrategia_destaque(titulo: str, emoji: str, info: dict | None, cor_borda: str) -> html.Div:
+    """Estratégia Vencedora/Perdedora, destacada de forma ilustrada (pedido
+    explícito do docx: "coloque em destaque de forma ilustrativa — por
+    exemplo, um troféu ou medalha")."""
+    nomes = _mapa_nomes_estrategias()
+    if info is None:
+        conteudo = html.Div(f'Amostra insuficiente ainda (mínimo {dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA} trades).',
+                            style={'color': C['text2'], 'fontSize': '12px'})
+    else:
+        nome = nomes.get(info['estrategia'], str(info['estrategia']).replace('_', ' ').title())
+        saldo = info['saldo']
+        cor_saldo = C['green'] if saldo > 0 else (C['red'] if saldo < 0 else C['text2'])
+        conteudo = html.Div([
+            html.Div(nome, style={'fontSize': '16px', 'fontWeight': '700', 'fontFamily': FONTS['display']}),
+            html.Div(f"R$ {saldo:+.2f} em {info['n']} operações", style={
+                'fontSize': '13px', 'fontFamily': FONTS['mono'], 'color': cor_saldo, 'marginTop': '4px',
+            }),
+        ])
+    return html.Div([
+        html.Div([
+            html.Span(emoji, style={'fontSize': '26px', 'marginRight': '10px', 'lineHeight': '1'}),
+            html.Span(titulo, style={'fontSize': '11px', 'color': C['text2'], 'textTransform': 'uppercase',
+                                     'letterSpacing': '0.06em', 'fontFamily': FONTS['display']}),
+        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '8px'}),
+        conteudo,
+    ], style={'flex': '1', 'minWidth': '220px', 'padding': '14px', 'background': C['panel'],
+              'border': f'2px solid {cor_borda}', 'borderRadius': '10px'})
+
+
+def _bloco_analise_estrategia(stats_geral: dict) -> html.Div:
+    """Painel "Análise de Estratégia" — pedido do docx: "junte os blocos Por
+    Ativo, Por Janela, Por Sala/Análise e Por Tags Setup/Erro num painel de
+    dashboard estatístico, adicionando melhor estratégia por horário/
+    direção/ativo/categoria; destaque a Estratégia Vencedora (troféu/
+    medalha) e a Perdedora"."""
+    analise = dt.analise_estrategia()
+    rotulos_janela = {k: _formatar_janela(k) for k in cfg.JANELAS_PREGAO}
+    return html.Div([
+        html.Div([
+            _card_estrategia_destaque('Estratégia Vencedora', '🏆', analise['vencedora'], C['green']),
+            _card_estrategia_destaque('Estratégia Perdedora', '📉', analise['perdedora'], C['red']),
+        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap', 'marginBottom': '14px'}),
+        html.Div([
+            _tabela_melhor_por('Melhor por Horário', analise['melhor_por_janela'], rotulos_janela),
+            _tabela_melhor_por('Melhor por Direção', analise['melhor_por_direcao'], _ROTULO_DIRECAO_OPERACAO),
+        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+        html.Div([
+            _tabela_melhor_por('Melhor por Ativo', analise['melhor_por_ativo']),
+            _tabela_melhor_por('Melhor por Categoria', analise['melhor_por_categoria'],
+                               dt.ROTULO_CATEGORIA_ESTRATEGIA),
+        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+        html.Div([
+            _bloco_breakdown_diario('Por Ativo', stats_geral['por_ativo']),
+            _bloco_breakdown_diario('Por Janela', stats_geral['por_janela']),
+        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+        html.Div([
+            _bloco_breakdown_diario('Por Sala/Análise', stats_geral['por_sala']),
+            _bloco_breakdown_diario('Por Tags Setup/Erro', stats_geral['por_tags_setup_erro']),
+        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+    ])
+
+
 def _hex_para_rgba(hex_cor: str, alpha: float) -> str:
     """Converte '#RRGGBB' pra 'rgba(r,g,b,a)' — Plotly só aceita opacidade
     via rgba(), não hex separado. Usado pelo fill translúcido dos gráficos
@@ -2003,38 +2106,43 @@ def _mini_recorte(titulo: str, dados: dict) -> html.Div:
 
 def _detalhe_estrategia_expandido(tag: str) -> html.Div:
     """Conteúdo da linha expandida — ver `dt.detalhe_estrategia` (a conta
-    mora lá, compartilhada entre os 2 skins)."""
+    mora lá, compartilhada entre os 2 skins).
+
+    Visual em "mini dashboard" (2026-07-30, feedback: "no detalhamento da
+    estratégia ao clicar na seta, melhore a visualização, faça em formato
+    de blocos como se fosse um mini dashboard") — antes era uma fileira só
+    de 13 métricas soltas, sem agrupamento. Reaproveita a MESMA linguagem
+    visual dos grupos rotulados criados pro topo de Estatísticas
+    (`_grupo_cards_estatistica`) em vez de inventar um estilo novo."""
     d = dt.detalhe_estrategia(tag)
     if not d['n']:
         return html.Div('Sem trades reais neste setup.',
                         style={'padding': '10px', 'fontSize': '11px', 'color': C['text2']})
 
     def metrica(rotulo, valor, cor=None):
-        return html.Div([
-            html.Div(rotulo, style={'fontSize': '10px', 'color': C['text2']}),
-            html.Div(valor, style={'fontSize': '13px', 'fontWeight': '700',
-                                   'fontFamily': FONTS['mono'], 'color': cor or C['text']}),
-        ], style={'minWidth': '92px'})
+        return _card_estatistica(rotulo, valor, cor=cor)
 
     payoff = f"{d['payoff']:.2f}" if d['payoff'] is not None else '—'
+    grupo_resultado = _grupo_cards_estatistica('Resultado', [
+        metrica('Operações', str(d['n'])),
+        metrica('Saldo', f"R$ {d['saldo_total']:+.2f}", C['green'] if d['saldo_total'] > 0 else C['red']),
+        metrica('Wins', str(d['n_win']), C['green']),
+        metrica('Losses', str(d['n_loss']), C['red']),
+        metrica('Zero a zero', str(d['zero_a_zero'])),
+        metrica('Expectativa', f"R$ {d['expectativa']:+.2f}", C['green'] if d['expectativa'] > 0 else C['red']),
+    ])
+    grupo_qualidade = _grupo_cards_estatistica('Qualidade', [
+        metrica('Taxa de Acerto', f"{d['taxa_acerto'] * 100:.1f}%"),
+        metrica('Payoff', payoff),
+        metrica('Max Gain', f"R$ {d['max_gain']:+.2f}", C['green']),
+        metrica('Max Loss', f"R$ {d['max_loss']:+.2f}", C['red']),
+        metrica('Drawdown Máx.', f"R$ {d['drawdown_maximo_reais']:+.2f}", C['red']),
+        metrica('Seq. Wins', str(d['maior_sequencia_win'])),
+        metrica('Seq. Losses', str(d['maior_sequencia_loss'])),
+    ])
     return html.Div([
-        html.Div([
-            metrica('Operações', str(d['n'])),
-            metrica('Saldo', f"R$ {d['saldo_total']:+.2f}",
-                    C['green'] if d['saldo_total'] > 0 else C['red']),
-            metrica('Wins', str(d['n_win']), C['green']),
-            metrica('Losses', str(d['n_loss']), C['red']),
-            metrica('Zero a zero', str(d['zero_a_zero'])),
-            metrica('Taxa de Acerto', f"{d['taxa_acerto'] * 100:.1f}%"),
-            metrica('Payoff', payoff),
-            metrica('Expectativa', f"R$ {d['expectativa']:+.2f}",
-                    C['green'] if d['expectativa'] > 0 else C['red']),
-            metrica('Max Gain', f"R$ {d['max_gain']:+.2f}", C['green']),
-            metrica('Max Loss', f"R$ {d['max_loss']:+.2f}", C['red']),
-            metrica('Drawdown Máx.', f"R$ {d['drawdown_maximo_reais']:+.2f}", C['red']),
-            metrica('Seq. Wins', str(d['maior_sequencia_win'])),
-            metrica('Seq. Losses', str(d['maior_sequencia_loss'])),
-        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap', 'marginBottom': '12px'}),
+        html.Div([grupo_resultado, grupo_qualidade],
+                 style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginBottom': '12px'}),
         html.Div([
             _mini_recorte('Por direção', d['por_direcao']),
             _mini_recorte('Por janela', d['por_janela']),
@@ -2140,28 +2248,23 @@ def _cards_ou_vazio_estatisticas(stats: dict) -> html.Div:
 
 
 def _resto_periodo_estatisticas(stats: dict, tema: str = 'light') -> html.Div:
-    """Evolução de saldo + breakdowns do período — a parte do painel de
-    Estatísticas que pode ser livremente recriada a cada troca de mês/ano
-    (nenhum desses componentes guarda estado de clique). O calendário em si
-    (grade + botões) NÃO mora aqui — ver o comentário em
-    `_construir_diario_estatisticas` pro porquê."""
+    """Evolução de saldo do período — a parte do painel de Estatísticas que
+    pode ser livremente recriada a cada troca de mês/ano (nenhum desses
+    componentes guarda estado de clique). O calendário em si (grade +
+    botões) NÃO mora aqui — ver o comentário em `_construir_diario_
+    estatisticas` pro porquê.
+
+    Por Ativo/Janela/Sala/Tags Setup-Erro NÃO moram mais aqui (2026-07-30,
+    "upgrade diario.docx": "junte os blocos... num painel de dashboard
+    estatístico") — migraram pra dentro de "Análise de Estratégia"
+    (`_bloco_analise_estrategia`), junto de "Confiabilidade por Estratégia".
+    Antes eram sensíveis ao período (mês/ano selecionado); agora são
+    ALL-TIME, consistentes com o resto daquele painel — só a Evolução de
+    Saldo continua reagindo ao seletor de período."""
     return html.Div([
         _bloco_diario('Evolução de Saldo', dcc.Graph(
             figure=_grafico_evolucao_saldo(stats, tema), config={'displayModeBar': False},
         )),
-
-        html.Div([
-            _bloco_breakdown_diario('Por Ativo', stats['por_ativo']),
-            _bloco_breakdown_diario('Por Janela', stats['por_janela']),
-        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
-        # "Por Estratégia" NÃO mora mais aqui (2026-07-30): virou o bloco
-        # "Confiabilidade por Estratégia", fundido com o Score — ver
-        # `_tabela_score_confiabilidade`. Manter os dois separados era o que
-        # fazia os painéis se contradizerem.
-        html.Div([
-            _bloco_breakdown_diario('Por Sala/Análise', stats['por_sala']),
-            _bloco_breakdown_diario('Por Tags Setup/Erro', stats['por_tags_setup_erro']),
-        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
     ])
 
 
@@ -2283,6 +2386,10 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict) -> html.Div:
         # store-em-andamento-ids-conhecidos), aceitável porque entrar na aba
         # é ação deliberada e rara, não um evento repetitivo.
         dcc.Store(id='store-ordenacao-estrategia', data=None),
+        # "Análise de Estratégia" (2026-07-30) fica ACIMA de "Confiabilidade
+        # por Estratégia", pedido explícito do docx — os dois são ALL-TIME,
+        # mesmo recorte (stats_geral/scores computados 1x na entrada da aba).
+        _bloco_diario('Análise de Estratégia', _bloco_analise_estrategia(stats_geral)),
         _bloco_diario('Confiabilidade por Estratégia',
                       _tabela_score_confiabilidade(scores, stats_geral['por_estrategia'])),
 
