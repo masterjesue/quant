@@ -46,6 +46,34 @@ a uma eventual compactação da conversa.
    nunca duplicam lógica" e o espelhamento constante ao longo desta sessão)
    precisa de nota, numa sessão futura que for tratar disso formalmente.
 
+## 🔴 Problema CRÍTICO conhecido, adiado de propósito
+
+**Histórico: lentidão absurda ao selecionar período e mostrar os trades.**
+Reportado pelo Jesué em 2026-07-30 depois do fix do travamento (commit
+`87532b7`) — o travamento parou, mas a troca de filtro/período ficou muito
+lenta. Causa provável: o mesmo limite estrutural documentado em
+MAPA_ESTRUTURA.md (custo de reconciliação do Dash escala com a contagem
+TOTAL de componentes montados) — mesmo o teto de 100 trades (200 `<tr>`)
+ainda é pesado o bastante pra ficar perceptível, rodando dentro do iframe
+embutido ao lado do gráfico candlestick ao vivo.
+
+**Decisão do Jesué: NÃO consertar agora.** Resolver só depois do redesenho
+TradeZella (item F) — faz sentido, porque o redesenho provavelmente troca a
+abordagem inteira (paginação de verdade, virtualização de lista, ou um
+componente de tabela nativo em vez de uma `<table>` HTML montada linha a
+linha pelo Python) em vez de só ajustar o teto de novo.
+
+Quando for atacar isto: não é só "baixar o teto ainda mais" — vale
+investigar se dá pra:
+- usar `dash_table.DataTable` (paginação nativa, já importado no projeto
+  noutro contexto) em vez de `html.Table` montada à mão;
+- ou paginar de verdade (botão "página seguinte", em vez de "top N por
+  recência");
+- medir COM profiling real (não só adivinhar) onde o tempo vai — pode não
+  ser só contagem de `<tr>`, pode ser `dt.avaliar_aderencia_tracados()`
+  (chamado toda vez que o Histórico remonta) ou o registro de estratégias
+  sendo recarregado do disco por linha.
+
 ## Pendente — organizado por bloco do docx
 
 ### A. Bloco "Confiabilidade por Estratégia"
