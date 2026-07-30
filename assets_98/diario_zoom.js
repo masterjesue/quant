@@ -90,4 +90,59 @@
     container.addEventListener('pointerup', soltar);
     container.addEventListener('pointercancel', soltar);
   });
+
+  // Botões explícitos de zoom (feedback 2026-07-30: "com a opção de expandir
+  // e dar zoom"). A roda do mouse já fazia zoom desde 2026-07-20, mas era
+  // invisível — nada na tela dizia que dava. Delegação pelo atributo
+  // `data-zoom-acao`, no mesmo `document`, pra não precisar de id Dash nem
+  // callback Python (zoom é puramente client-side).
+  function containerVisivel() {
+    var todos = document.querySelectorAll(SELETOR_CONTAINER);
+    return todos.length ? todos[todos.length - 1] : null;
+  }
+
+  function aplicarAcao(acao) {
+    var container = containerVisivel();
+    if (!container) return;
+    var img = container.querySelector(SELETOR_IMG);
+    if (!img) return;
+    var estado = estadoDe(img);
+    if (acao === 'reset') {
+      estado.escala = ESCALA_MIN; estado.x = 0; estado.y = 0;
+    } else {
+      var anterior = estado.escala;
+      var fator = acao === 'mais' ? 1.35 : 1 / 1.35;
+      estado.escala = Math.max(ESCALA_MIN, Math.min(ESCALA_MAX, estado.escala * fator));
+      // Zoom pelo CENTRO do container (a roda usa o cursor como âncora; sem
+      // cursor, o centro é o que não desloca a imagem de forma estranha).
+      var cx = container.clientWidth / 2, cy = container.clientHeight / 2;
+      var razao = estado.escala / anterior;
+      estado.x = cx - (cx - estado.x) * razao;
+      estado.y = cy - (cy - estado.y) * razao;
+    }
+    limitar(estado, container);
+    aplicar(img, estado);
+    container.classList.toggle('diario-zoom-ativo', estado.escala > ESCALA_MIN);
+  }
+
+  document.addEventListener('click', function (evento) {
+    var alvo = evento.target.closest ? evento.target.closest('[data-zoom-acao]') : null;
+    if (!alvo) return;
+    evento.preventDefault();
+    aplicarAcao(alvo.getAttribute('data-zoom-acao'));
+  });
+
+  // Teclado: + / - / 0 enquanto um pop-up de imagem estiver aberto, e Esc
+  // fechando (o Esc dispara o clique no backdrop, que a callback Python já
+  // trata — evita duplicar a lógica de fechamento aqui).
+  document.addEventListener('keydown', function (evento) {
+    if (!containerVisivel()) return;
+    if (evento.key === '+' || evento.key === '=') aplicarAcao('mais');
+    else if (evento.key === '-' || evento.key === '_') aplicarAcao('menos');
+    else if (evento.key === '0') aplicarAcao('reset');
+    else if (evento.key === 'Escape') {
+      var fundo = document.querySelector('.diario-overlay-backdrop');
+      if (fundo) fundo.click();
+    }
+  });
 })();

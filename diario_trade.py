@@ -74,6 +74,9 @@ TIPO_OPERACAO = ["long", "short"]
 # 'Simulador' NÃO entra aqui — vira a flag `is_simulated` própria (unifica
 # o que a planilha original espalhava entre a aba Diario e a aba Sim).
 TIPO_SAIDA = ["stop", "breakeven", "gain", "manual"]
+# Nomeado porque `status_do_dia` conta stops do dia — comparar com a string
+# solta em outro arquivo é o tipo de acoplamento que quebra em silêncio.
+TIPO_SAIDA_STOP = "stop"
 
 # Vocabulário ABERTO (não travado) — a UI permite adicionar tags novas além
 # desta lista inicial, que só serve de sugestão/autocomplete.
@@ -1281,6 +1284,126 @@ def detalhe_estrategia(tag: str, df: pd.DataFrame | None = None) -> dict:
         "melhor_trade": extremo(saldo.idxmax()),
         "pior_trade": extremo(saldo.idxmin()),
     }
+
+
+def status_do_dia(data=None, df: pd.DataFrame | None = None) -> dict:
+    """
+    Guarda-corpo operacional: quantas operações já saíram HOJE, quantos stops,
+    qual o saldo, e o veredito ('livre' / 'atencao' / 'critico').
+
+    Existe por causa do maior achado do estudo de 2026-07-30: dias com 1-2
+    operações somaram +R$ 328, dias com 3-4 somaram -R$ 137, e dias com 5 ou
+    mais destruíram R$ 627 em apenas 12 dias — mais do que a perda do ano
+    inteiro. O plano do mês vira letra morta se esse número só aparecer no
+    relatório do dia seguinte; ele precisa estar na tela ANTES da próxima
+    entrada.
+
+    É AVISO, não bloqueio — o sistema não impede nada. Mesmo princípio do
+    Modo Aprendizagem: mede e mostra, quem decide é o Jesué.
+
+    Conta trades JÁ FINALIZADOS (`diario_trades.parquet`) do dia, sem
+    simulados. Posições ainda abertas não entram: a decisão que este bloco
+    apoia é "abro mais uma?", e uma posição viva ainda não é uma operação
+    concluída — mas ela aparece na tela logo acima, então o Jesué a vê.
+    """
+    dia = pd.Timestamp(data).date() if data is not None else date.today()
+    if df is None:
+        df = listar_trades(is_simulated=False)
+    if df.empty:
+        do_dia = df
+    else:
+        datas = df["data_op"].apply(lambda d: pd.Timestamp(d).date() if d is not None else None)
+        do_dia = df[datas == dia]
+
+    n = len(do_dia)
+    saldo = float(do_dia["saldo_operacao_reais"].fillna(0).sum()) if n else 0.0
+    stops = int((do_dia["tipo_saida"] == TIPO_SAIDA_STOP).sum()) if n else 0
+
+    if n >= cfg.DIARIO_TRADES_DIA_CRITICO or stops >= cfg.DIARIO_LIMITE_STOPS_DIA:
+        estado = "critico"
+    elif n >= cfg.DIARIO_LIMITE_TRADES_DIA:
+        estado = "atencao"
+    else:
+        estado = "livre"
+
+    motivos = []
+    if stops >= cfg.DIARIO_LIMITE_STOPS_DIA:
+        motivos.append(f"{stops} stops no dia — o plano manda encerrar aqui.")
+    if n >= cfg.DIARIO_TRADES_DIA_CRITICO:
+        motivos.append(
+            f"{n}ª operação do dia. Dias com {cfg.DIARIO_TRADES_DIA_CRITICO}+ trades "
+            f"somaram prejuízo em toda a amostra."
+        )
+    elif n >= cfg.DIARIO_LIMITE_TRADES_DIA:
+        motivos.append(
+            f"Limite de {cfg.DIARIO_LIMITE_TRADES_DIA} operações/dia atingido. "
+            f"Dias de 1-2 trades são os únicos lucrativos da amostra."
+        )
+
+    return {
+        "data": str(dia),
+        "n_trades": n,
+        "n_stops": stops,
+        "saldo": saldo,
+        "limite": cfg.DIARIO_LIMITE_TRADES_DIA,
+        "restantes": max(cfg.DIARIO_LIMITE_TRADES_DIA - n, 0),
+        "estado": estado,
+        "motivos": motivos,
+    }
+
+
+def avaliar_contexto_operacao(estrategias, ativo=None, janela=None) -> list[dict]:
+    """
+    Avisos sobre a operação que está sendo montada AGORA — setup suspenso,
+    ativo/janela fora do contexto que se provou. Devolve uma lista de
+    `{'nivel': 'alerta'|'info'|'ok', 'texto': ...}`, vazia quando não há nada
+    a dizer.
+
+    Mesma natureza de `status_do_dia`: é o estudo de 2026-07-30 falando na
+    hora da decisão, não uma regra que o sistema imponha.
+    """
+    tags = [str(t) for t in (estrategias or [])]
+    avisos = []
+
+    suspensas = [t for t in tags if t in cfg.DIARIO_ESTRATEGIAS_SUSPENSAS]
+    if suspensas:
+        nomes = _nomes_de_slugs(suspensas)
+        avisos.append({
+            "nivel": "alerta",
+            "texto": f"{', '.join(nomes)} está na lista de setups suspensos "
+                     f"(expectativa negativa medida). Confirme que vale a exceção.",
+        })
+
+    vencedoras = [t for t in tags if t in cfg.DIARIO_ESTRATEGIAS_VENCEDORAS]
+    if vencedoras:
+        avisos.append({
+            "nivel": "ok",
+            "texto": f"{', '.join(_nomes_de_slugs(vencedoras))} — setup com expectativa positiva medida.",
+        })
+
+    if janela and janela != cfg.DIARIO_JANELA_PREFERIDA:
+        avisos.append({
+            "nivel": "info",
+            "texto": f"Fora da janela do {cfg.DIARIO_JANELA_PREFERIDA} — prime e tarde "
+                     f"somaram -R$ 259 na amostra, inclusive nos melhores setups.",
+        })
+    if ativo and ativo != cfg.DIARIO_ATIVO_PREFERIDO and vencedoras:
+        avisos.append({
+            "nivel": "info",
+            "texto": f"Os setups vencedores renderam muito mais em "
+                     f"{cfg.DIARIO_ATIVO_PREFERIDO} do que em {ativo}.",
+        })
+    return avisos
+
+
+def _nomes_de_slugs(slugs) -> list[str]:
+    """Slug -> nome legível do cadastro, com fallback pro próprio slug."""
+    try:
+        mapa = {str(r["slug"]): str(r["nome"])
+                for _, r in listar_estrategias(somente_ativas=False).iterrows()}
+    except Exception:
+        mapa = {}
+    return [mapa.get(s, s.replace("_", " ").title()) for s in slugs]
 
 
 def _parear_hedge_deals(posicoes: pd.DataFrame) -> pd.DataFrame:

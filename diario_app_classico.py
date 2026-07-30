@@ -1199,8 +1199,103 @@ def _renderizar_posicao_completa(posicoes: pd.DataFrame, ordens: pd.DataFrame | 
     return html.Div(filhos)
 
 
+_CORES_ESTADO_DIA = {'livre': 'green', 'atencao': 'yellow', 'critico': 'red'}
+_ROTULO_ESTADO_DIA = {
+    'livre': 'Dentro do plano',
+    'atencao': 'Limite do dia atingido',
+    'critico': 'Fora do plano',
+}
+
+
+def _bloco_guarda_corpo_dia() -> html.Div:
+    """Contador de operações do dia + checklist pré-trade (2026-07-30).
+
+    O maior achado do estudo (`PLANO_DE_TRADE_AGOSTO_2026.md`) foi
+    comportamental: dias com 1-2 operações somaram +R$ 328, e dias com 5 ou
+    mais destruíram R$ 627 em apenas 12 dias — mais que a perda do ano.
+    Esse número só existia no relatório do dia seguinte, quando já não muda
+    nada. Aqui ele fica na tela ANTES da próxima entrada.
+
+    É AVISO, nunca bloqueio — nada aqui impede o Jesué de operar. Mesmo
+    princípio do Modo Aprendizagem: o sistema mede e mostra, quem decide é
+    ele. A conta mora em `dt.status_do_dia`, compartilhada com o skin '98.
+
+    Devolve SÓ os contadores. O botão do checklist e o conteúdo dele ficam
+    fora, estáticos no layout — este bloco é reconstruído a cada 6s pelo
+    interval, e recriar o botão zeraria `n_clicks` no browser (a armadilha
+    recorrente deste código: nunca recriar o componente que dispara a
+    própria callback)."""
+    s = dt.status_do_dia()
+    cor = C[_CORES_ESTADO_DIA[s['estado']]]
+    cor_saldo = C['green'] if s['saldo'] > 0 else (C['red'] if s['saldo'] < 0 else C['text2'])
+
+    def contador(rotulo, valor, cor_valor=None):
+        return html.Div([
+            html.Div(rotulo, style={'fontSize': '10px', 'color': C['text2']}),
+            html.Div(valor, style={'fontSize': '20px', 'fontWeight': '700',
+                                   'fontFamily': FONTS['mono'], 'color': cor_valor or C['text'],
+                                   'lineHeight': '1.1'}),
+        ], style={'minWidth': '80px'})
+
+    return html.Div([
+        contador('Operações hoje', f"{s['n_trades']}/{s['limite']}", cor),
+        contador('Stops', str(s['n_stops']), C['red'] if s['n_stops'] else None),
+        contador('Saldo do dia', f"R$ {s['saldo']:+.2f}", cor_saldo),
+        html.Div([
+            html.Div(_ROTULO_ESTADO_DIA[s['estado']], style={
+                'fontSize': '12px', 'fontWeight': '700', 'color': cor,
+                'fontFamily': FONTS['display'],
+            }),
+            html.Div([html.Div(m, style={'marginTop': '2px'}) for m in s['motivos']],
+                     style={'fontSize': '11px', 'color': C['text2'], 'maxWidth': '460px'}),
+        ], style={'flex': '1', 'minWidth': '220px'}),
+    ], style={'display': 'flex', 'gap': '18px', 'alignItems': 'flex-start', 'flexWrap': 'wrap'})
+
+
+def _borda_guarda_corpo() -> str:
+    return C[_CORES_ESTADO_DIA[dt.status_do_dia()['estado']]]
+
+
+def _conteudo_checklist_pre_trade() -> html.Div:
+    """As 8 linhas de filtro do plano. `dcc.Checklist` de verdade (não texto
+    decorativo) — o feedback de 2026-07-20 sobre as estrelas vale igual aqui:
+    se é pra marcar, tem que ser marcável. Nada é persistido de propósito: é
+    um ritual de 20 segundos antes da entrada, não mais um formulário."""
+    return html.Div([
+        dcc.Checklist(
+            id='diario-checklist-itens',
+            options=[{'label': item, 'value': str(i)}
+                     for i, item in enumerate(cfg.DIARIO_CHECKLIST_PRE_TRADE)],
+            value=[], labelStyle={'display': 'block', 'marginBottom': '5px', 'fontSize': '12px'},
+            inputStyle={'marginRight': '8px'},
+        ),
+        html.Div(id='diario-checklist-status', style={'fontSize': '11px', 'marginTop': '8px'}),
+    ], style={'marginTop': '12px', 'paddingTop': '12px', 'borderTop': f'1px solid {C["border"]}'})
+
+
 def _construir_diario_em_andamento() -> html.Div:
     return html.Div([
+        # Guarda-corpo do dia (2026-07-30) — fica ACIMA de tudo na Posição
+        # de propósito: é a informação que precisa ser vista antes de abrir a
+        # próxima operação, não depois. Só os contadores são atualizados pelo
+        # interval; o botão e o checklist são estáticos (ver
+        # `_bloco_guarda_corpo_dia`).
+        html.Div([
+            html.Div([
+                html.Div(_bloco_guarda_corpo_dia(), id='diario-guarda-corpo-dia',
+                         style={'flex': '1'}),
+                html.Button('Checklist pré-trade', id='btn-diario-checklist', n_clicks=0, style={
+                    'background': 'transparent', 'color': C['text2'],
+                    'border': f'1px solid {C["border"]}', 'borderRadius': '6px',
+                    'padding': '5px 12px', 'cursor': 'pointer', 'fontSize': '11px',
+                    'alignSelf': 'center', 'flexShrink': '0', 'marginLeft': '12px',
+                }),
+            ], style={'display': 'flex', 'alignItems': 'flex-start'}),
+            html.Div(id='diario-checklist-conteudo'),
+        ], style={
+            'padding': '12px 14px', 'marginBottom': '14px', 'background': C['panel'],
+            'border': f'1px solid {C["border"]}', 'borderRadius': '8px',
+        }),
         # Sub-abas WIN/WDO (feedback 2026-07-16: "eu quero WDO e WIN
         # separados em sub-abas da aba Posições") — mesmo padrão de
         # Store+botões+callback de estilo já usado pras abas principais do
@@ -1402,34 +1497,34 @@ def _construir_diario_historico() -> html.Div:
 
 
 def _overlay(conteudo, id_backdrop: str) -> html.Div:
-    """Painel de detalhe — ver diario_app_98.py::_overlay_98 pro mesmo
-    raciocínio. NÃO usa mais `position:fixed` (bug real confirmado em
-    2026-07-16, comparando screenshot standalone :8053 vs embutido no
-    dashboard.py): o Diário roda num `<iframe>` que CRESCE pra caber TODO
-    o conteúdo, sem scroll próprio (`assets/diario_iframe_resize.js`) — um
-    elemento `fixed` ali é fixado à altura TOTAL do iframe (facilmente
-    2000px+), não ao viewport real da janela, então "centralizado" cai bem
-    abaixo da dobra e o usuário nunca via o popup abrir (o clique
-    "funcionava" — só o resultado ficava invisível). Fix: renderiza em
-    fluxo normal (sem `position:fixed`) + rola até ele automaticamente
-    (`_registrar_scroll_ate_overlay`) — não depende de altura de viewport
-    nenhuma, funciona igual embutido ou standalone.
+    """Pop-up centralizado no viewport REAL da janela.
 
-    Único uso hoje é o popup de imagem (feedback 2026-07-20: "preencher o
-    bloco inteiro") — por isso o wrapper de conteúdo é um flex column de
-    altura fixa (88vh) em vez do antigo maxWidth:900px + overflowY:auto
-    (pensado pra texto de altura variável); o filho (`renderizar_overlay_
-    imagem`) usa flex:1 no container de zoom pra ocupar o espaço todo."""
+    Histórico desta função, porque ela já errou nas duas direções:
+
+    1. `position: fixed` (até 2026-07-16) — dentro do iframe do Diário,
+       `fixed` se ancora à altura TOTAL do iframe, que se auto-ajusta pra
+       caber todo o conteúdo (`assets/diario_iframe_resize.js`). O pop-up
+       "centralizado" caía milhares de px abaixo da dobra e parecia que o
+       clique não fazia nada.
+    2. Fluxo normal + `scrollIntoView` (2026-07-16 a 2026-07-30) — resolvia
+       o "invisível", mas produzia o sintoma que o Jesué reportou em
+       2026-07-30: *"abre no meio da página, preciso rolar para chegar lá"*.
+       Pior: com `height: 88vh` e `vh` valendo a altura do iframe crescido,
+       o painel virava uma caixa de milhares de px com a imagem perdida no
+       meio de uma área cinza (foi o que o screenshot mostrou).
+
+    3. **Agora:** o PAI mede onde o iframe cruza o viewport de verdade e
+       manda a fatia visível por postMessage; o CSS posiciona o overlay
+       exatamente sobre ela (`.diario-overlay-viewport` em style.css, medida
+       em `assets/diario_overlay_viewport.js`). Standalone em :8053, o
+       fallback do CSS é `fixed; inset: 0` — que sempre foi o certo lá.
+
+    Não depende mais de `scrollIntoView` — ver `_registrar_scroll_ate_overlay`,
+    hoje inofensiva (o overlay já nasce na tela)."""
     return html.Div([
-        html.Div(id=id_backdrop, n_clicks=0, style={
-            'position': 'absolute', 'top': 0, 'left': 0, 'right': 0, 'bottom': 0,
-            'background': 'rgba(0,0,0,0.55)', 'borderRadius': '10px',
-        }),
-        html.Div(conteudo, style={
-            'position': 'relative', 'maxWidth': '95vw', 'margin': '0 auto',
-            'height': '88vh', 'display': 'flex', 'flexDirection': 'column',
-        }),
-    ], id=f'{id_backdrop}-wrap', style={'position': 'relative', 'padding': '24px 16px'})
+        html.Div(id=id_backdrop, n_clicks=0, className='diario-overlay-backdrop'),
+        html.Div(conteudo, className='diario-overlay-painel'),
+    ], id=f'{id_backdrop}-wrap', className='diario-overlay-viewport')
 
 
 def _registrar_scroll_ate_overlay(app, id_store: str, id_container_estavel: str, id_wrap: str):
@@ -2555,12 +2650,14 @@ for _tipo_estrela in (
 ):
     _registrar_clique_estrela_match(app, _tipo_estrela)
 
-_registrar_scroll_ate_overlay(app, 'diario-imagem-ampliada', 'diario-overlay-imagem',
-                               'diario-overlay-imagem-backdrop-wrap')
-_registrar_scroll_ate_overlay(app, 'store-pendencia-editar', 'diario-overlay-pendencia',
-                               'diario-overlay-pendencia-backdrop-wrap')
-_registrar_scroll_ate_overlay(app, 'store-trade-editar', 'diario-overlay-trade',
-                               'diario-overlay-trade-backdrop-wrap')
+# O auto-scroll até o overlay foi DESLIGADO em 2026-07-30. Ele existia porque
+# o pop-up era renderizado em fluxo normal, no meio da página — e era
+# exatamente isso que o Jesué reportou: "abre no meio da página, preciso rolar
+# para chegar lá". Agora o overlay é posicionado sobre a fatia visível da
+# janela (ver `_overlay` e assets/diario_overlay_viewport.js), então ele já
+# nasce na tela; rolar a página por baixo dele só desorienta.
+# `_registrar_scroll_ate_overlay` continua no arquivo de propósito, com o
+# histórico documentado — não apagar sem ler o comentário dela.
 
 _PADRAO_NOME_IMAGEM_DIARIO = re.compile(r'^(\d{4}_[A-Z]+_\d{8}|rascunho_\d+_\d{2})\.png$')
 
@@ -3263,6 +3360,56 @@ def alternar_detalhe_historico(n_clicks, seta_atual, id_componente):
 
 
 @app.callback(
+    Output('diario-guarda-corpo-dia', 'children'),
+    Input('interval-em-andamento', 'n_intervals'),
+)
+def atualizar_guarda_corpo_dia(_n):
+    """Contadores do dia, a cada 6s.
+
+    O Input é o interval da PRÓPRIA aba Posição, não `store-diario-refresh`
+    (global). Parece pior — o número só atualiza depois de até 6s em vez de
+    na hora — mas evita a armadilha recorrente deste arquivo: um Output pra
+    id que só existe na Posição, disparado por um store global, seria
+    rejeitado INTEIRO pelo Dash sempre que o Jesué finalizasse um trade
+    estando no Histórico. Ver o comentário de `store-diario-refresh` no
+    layout. 6s de atraso num contador não muda decisão nenhuma."""
+    return _bloco_guarda_corpo_dia()
+
+
+@app.callback(
+    Output('diario-checklist-conteudo', 'children'),
+    Output('btn-diario-checklist', 'children'),
+    Input('btn-diario-checklist', 'n_clicks'),
+    State('btn-diario-checklist', 'children'),
+    prevent_initial_call=True,
+)
+def alternar_checklist_pre_trade(n_clicks, rotulo_atual):
+    """Abre/fecha o checklist. Mesma mecânica das outras setas: o próprio
+    rótulo do botão é o estado, e o botão nunca é recriado por esta
+    callback (só o `children` dele muda)."""
+    if not n_clicks:
+        return no_update, no_update
+    if rotulo_atual == 'Checklist pré-trade':
+        return _conteudo_checklist_pre_trade(), 'Fechar checklist'
+    return None, 'Checklist pré-trade'
+
+
+@app.callback(
+    Output('diario-checklist-status', 'children'),
+    Output('diario-checklist-status', 'style'),
+    Input('diario-checklist-itens', 'value'),
+)
+def resumir_checklist(marcados):
+    total = len(cfg.DIARIO_CHECKLIST_PRE_TRADE)
+    n = len(marcados or [])
+    base = {'fontSize': '11px', 'marginTop': '8px', 'fontWeight': '700'}
+    if n == total:
+        return f'✔ {n}/{total} — dentro do plano.', {**base, 'color': C['green']}
+    return (f'{n}/{total} conferidos — faltam {total - n}.',
+            {**base, 'color': C['text2'] if n else C['text2']})
+
+
+@app.callback(
     Output({'type': 'diario-detalhe-estrategia', 'index': dash.MATCH}, 'children'),
     Output({'type': 'diario-btn-expandir-estrategia', 'index': dash.MATCH}, 'children'),
     Input({'type': 'diario-btn-expandir-estrategia', 'index': dash.MATCH}, 'n_clicks'),
@@ -3394,23 +3541,39 @@ def renderizar_overlay_imagem(dados):
         return None
     imagens = dados['imagens']
     indice = dados.get('indice', 0)
+    estilo_botao = {
+        'background': 'transparent', 'color': C['text'], 'border': f'1px solid {C["border"]}',
+        'borderRadius': '6px', 'padding': '4px 12px', 'cursor': 'pointer',
+    }
+    # Controles de zoom (feedback 2026-07-30: "com a opção de expandir e dar
+    # zoom"). A roda do mouse já dava zoom desde 2026-07-20, mas nada na tela
+    # dizia isso. Estes botões não têm callback Python — o comportamento é
+    # 100% client-side via `data-zoom-acao` (ver assets/diario_zoom.js);
+    # colocá-los no Dash só pra emitir um n_clicks que voltaria pro browser
+    # seria um round-trip inútil num controle que precisa ser instantâneo.
+    controles_zoom = html.Div([
+        html.Button('−', **{'data-zoom-acao': 'menos'}, title='Diminuir (tecla −)',
+                    style={**estilo_botao, 'padding': '4px 14px', 'fontWeight': '700'}),
+        html.Button('+', **{'data-zoom-acao': 'mais'}, title='Ampliar (tecla +)',
+                    style={**estilo_botao, 'padding': '4px 14px', 'fontWeight': '700'}),
+        html.Button('⛶ Ajustar', **{'data-zoom-acao': 'reset'},
+                    title='Voltar ao tamanho da tela (tecla 0)', style=estilo_botao),
+        html.Span('roda do mouse amplia · arraste para mover · Esc fecha',
+                  style={'fontSize': '11px', 'color': C['text2'], 'marginLeft': '4px'}),
+    ], style={'display': 'flex', 'gap': '8px', 'alignItems': 'center', 'flexWrap': 'wrap'})
+
     topo = [
-        html.Button('✕ Fechar', id='btn-diario-fechar-imagem', n_clicks=0, style={
-            'background': 'transparent', 'color': C['text'], 'border': f'1px solid {C["border"]}',
-            'borderRadius': '6px', 'padding': '4px 12px', 'cursor': 'pointer',
-        }),
+        html.Div([
+            html.Button('✕ Fechar', id='btn-diario-fechar-imagem', n_clicks=0, style=estilo_botao),
+            controles_zoom,
+        ], style={'display': 'flex', 'gap': '12px', 'alignItems': 'center',
+                  'flexWrap': 'wrap', 'justifyContent': 'space-between'}),
     ]
     if len(imagens) > 1:
         topo.append(html.Div([
-            html.Button('◀ Anterior', id='btn-diario-imagem-anterior', n_clicks=0, style={
-                'background': 'transparent', 'color': C['text'], 'border': f'1px solid {C["border"]}',
-                'borderRadius': '6px', 'padding': '4px 12px', 'cursor': 'pointer',
-            }),
+            html.Button('◀ Anterior', id='btn-diario-imagem-anterior', n_clicks=0, style=estilo_botao),
             html.Span(f'{indice + 1} / {len(imagens)}', style={'fontSize': '12px', 'color': C['text2']}),
-            html.Button('Próxima ▶', id='btn-diario-imagem-proxima', n_clicks=0, style={
-                'background': 'transparent', 'color': C['text'], 'border': f'1px solid {C["border"]}',
-                'borderRadius': '6px', 'padding': '4px 12px', 'cursor': 'pointer',
-            }),
+            html.Button('Próxima ▶', id='btn-diario-imagem-proxima', n_clicks=0, style=estilo_botao),
         ], style={'display': 'flex', 'gap': '10px', 'alignItems': 'center'}))
     # Feedback 2026-07-20: "preencher o bloco inteiro com zoom pela rolagem
     # do scroll, e clicar e arrastar" — comportamento em assets/diario_zoom.js

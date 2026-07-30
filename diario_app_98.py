@@ -908,8 +908,73 @@ def _renderizar_posicao_completa_98(posicoes: pd.DataFrame, ordens: pd.DataFrame
     return html.Div(filhos)
 
 
+_CORES_ESTADO_DIA = {'livre': 'green', 'atencao': 'yellow', 'critico': 'red'}
+_ROTULO_ESTADO_DIA = {
+    'livre': 'Dentro do plano',
+    'atencao': 'Limite do dia atingido',
+    'critico': 'Fora do plano',
+}
+
+
+def _bloco_guarda_corpo_dia_98() -> html.Div:
+    """Ver diario_app_classico.py::_bloco_guarda_corpo_dia — a conta mora em
+    `dt.status_do_dia`, compartilhada. Devolve SÓ os contadores: o botão do
+    checklist fica estático fora daqui, porque este bloco é recriado a cada
+    6s pelo interval."""
+    s = dt.status_do_dia()
+    cor = C[_CORES_ESTADO_DIA[s['estado']]]
+    cor_saldo = C['green'] if s['saldo'] > 0 else (C['red'] if s['saldo'] < 0 else C['text2'])
+
+    def contador(rotulo, valor, cor_valor=None):
+        return html.Div([
+            html.Div(rotulo, style={'fontSize': '9px', 'color': C['text2']}),
+            html.Div(valor, style={'fontSize': '18px', 'fontWeight': '700',
+                                   'fontFamily': FONTS['mono'], 'color': cor_valor or C['text'],
+                                   'lineHeight': '1.1'}),
+        ], style={'minWidth': '76px'})
+
+    return html.Div([
+        contador('Operações hoje', f"{s['n_trades']}/{s['limite']}", cor),
+        contador('Stops', str(s['n_stops']), C['red'] if s['n_stops'] else None),
+        contador('Saldo do dia', f"R$ {s['saldo']:+.2f}", cor_saldo),
+        html.Div([
+            html.Div(_ROTULO_ESTADO_DIA[s['estado']], style={
+                'fontSize': '11px', 'fontWeight': '700', 'color': cor,
+                'fontFamily': FONTS['display'],
+            }),
+            html.Div([html.Div(m, style={'marginTop': '2px'}) for m in s['motivos']],
+                     style={'fontSize': '10px', 'color': C['text2'], 'maxWidth': '430px'}),
+        ], style={'flex': '1', 'minWidth': '210px'}),
+    ], style={'display': 'flex', 'gap': '14px', 'alignItems': 'flex-start', 'flexWrap': 'wrap'})
+
+
+def _conteudo_checklist_pre_trade_98() -> html.Div:
+    return html.Div([
+        dcc.Checklist(
+            id='diario98-checklist-itens',
+            options=[{'label': item, 'value': str(i)}
+                     for i, item in enumerate(cfg.DIARIO_CHECKLIST_PRE_TRADE)],
+            value=[], labelStyle={'display': 'block', 'marginBottom': '4px', 'fontSize': '11px'},
+            inputStyle={'marginRight': '7px'},
+        ),
+        html.Div(id='diario98-checklist-status', style={'fontSize': '10px', 'marginTop': '6px'}),
+    ], style={'marginTop': '10px', 'paddingTop': '10px', 'borderTop': f"1px solid {C['border']}"})
+
+
 def _construir_diario98_em_andamento() -> html.Div:
     return html.Div([
+        # Guarda-corpo do dia (2026-07-30) — ver o clássico pro raciocínio.
+        win98_groupbox('Guarda-corpo do dia', html.Div([
+            html.Div([
+                html.Div(_bloco_guarda_corpo_dia_98(), id='diario98-guarda-corpo-dia',
+                         style={'flex': '1'}),
+                html.Button('Checklist pré-trade', id='btn-diario98-checklist', n_clicks=0,
+                            className='win98-btn',
+                            style={**win98_button(), 'alignSelf': 'center',
+                                   'flexShrink': '0', 'marginLeft': '10px'}),
+            ], style={'display': 'flex', 'alignItems': 'flex-start'}),
+            html.Div(id='diario98-checklist-conteudo'),
+        ])),
         # Sub-abas WIN/WDO (feedback 2026-07-16) — mesmo padrão de
         # Store+botões+callback de estilo das abas principais do Diário.
         dcc.Store(id='store-posicao98-ativo-subaba', data='WIN'),
@@ -1090,27 +1155,18 @@ def _construir_diario98_historico() -> html.Div:
 
 
 def _overlay_98(conteudo, id_backdrop: str) -> html.Div:
-    """Painel de detalhe — ver diario_app_classico.py::_overlay pro
-    raciocínio completo (bug real confirmado em 2026-07-16: `position:fixed`
-    dentro do iframe do Diário fica preso à altura TOTAL dele, não ao
-    viewport real da janela). Mesmo fix aqui por consistência entre os 2
-    skins, mesmo o SQ'98 não tendo mostrado o bug até agora (a janela
-    win98 já tem scroll interno próprio, diferente do iframe que cresce
-    sem limite do clássico).
-
-    Único uso hoje é o popup de imagem (feedback 2026-07-20: "preencher o
-    bloco inteiro") — ver diario_app_classico.py::_overlay pro mesmo
-    raciocínio do flex column de altura fixa (88vh)."""
+    """Pop-up centralizado no viewport REAL — ver
+    diario_app_classico.py::_overlay pro raciocínio completo (3 versões:
+    fixed preso à altura do iframe → fluxo normal + scrollIntoView → medição
+    do PAI via postMessage, a atual). Aqui era `position:absolute` com
+    `88vh`, mesma classe de bug do clássico (o comentário anterior desta
+    função dizia que o SQ'98 "não tinha mostrado o bug até agora" — não
+    verificado ao vivo; a arquitetura do iframe é idêntica à do clássico,
+    então corrigido por consistência e prevenção)."""
     return html.Div([
-        html.Div(id=id_backdrop, n_clicks=0, style={
-            'position': 'absolute', 'top': 0, 'left': 0, 'right': 0, 'bottom': 0,
-            'background': 'rgba(0,0,0,0.6)', 'borderRadius': '4px',
-        }),
-        html.Div(conteudo, style={
-            'position': 'relative', 'maxWidth': '95vw', 'margin': '0 auto',
-            'height': '88vh', 'display': 'flex', 'flexDirection': 'column',
-        }),
-    ], id=f'{id_backdrop}-wrap', style={'position': 'relative', 'padding': '24px 16px'})
+        html.Div(id=id_backdrop, n_clicks=0, className='diario-overlay-backdrop'),
+        html.Div(conteudo, className='diario-overlay-painel'),
+    ], id=f'{id_backdrop}-wrap', className='diario-overlay-viewport')
 
 
 def _registrar_scroll_ate_overlay_98(app, id_store: str, id_container_estavel: str, id_wrap: str):
@@ -2159,12 +2215,12 @@ for _tipo_estrela in (
 ):
     _registrar_clique_estrela_match_98(app, _tipo_estrela)
 
-_registrar_scroll_ate_overlay_98(app, 'diario98-imagem-ampliada', 'diario98-overlay-imagem',
-                                  'diario98-overlay-imagem-backdrop-wrap')
-_registrar_scroll_ate_overlay_98(app, 'store-pendencia98-editar', 'diario98-overlay-pendencia',
-                                  'diario98-overlay-pendencia-backdrop-wrap')
-_registrar_scroll_ate_overlay_98(app, 'store-trade98-editar', 'diario98-overlay-trade',
-                                  'diario98-overlay-trade-backdrop-wrap')
+# Auto-scroll até o overlay DESLIGADO (2026-07-30) — ver
+# diario_app_classico.py pro mesmo raciocínio: o overlay agora é
+# posicionado sobre a fatia visível da janela (assets_98/diario_overlay_
+# viewport.js), então já nasce na tela; rolar por baixo dele desorienta.
+# `_registrar_scroll_ate_overlay_98` fica no arquivo com o histórico
+# documentado.
 
 _PADRAO_NOME_IMAGEM_DIARIO = re.compile(r'^(\d{4}_[A-Z]+_\d{8}|rascunho_\d+_\d{2})\.png$')
 
@@ -2809,6 +2865,46 @@ def alternar_detalhe_historico_98(n_clicks, seta_atual, id_componente):
 
 
 @app.callback(
+    Output('diario98-guarda-corpo-dia', 'children'),
+    Input('interval-em-andamento98', 'n_intervals'),
+)
+def atualizar_guarda_corpo_dia_98(_n):
+    """Ver diario_app_classico.py::atualizar_guarda_corpo_dia — o Input é o
+    interval da própria aba Posição, nunca um store global (Output pra id de
+    outra aba derruba a callback inteira em silêncio)."""
+    return _bloco_guarda_corpo_dia_98()
+
+
+@app.callback(
+    Output('diario98-checklist-conteudo', 'children'),
+    Output('btn-diario98-checklist', 'children'),
+    Input('btn-diario98-checklist', 'n_clicks'),
+    State('btn-diario98-checklist', 'children'),
+    prevent_initial_call=True,
+)
+def alternar_checklist_pre_trade_98(n_clicks, rotulo_atual):
+    if not n_clicks:
+        return no_update, no_update
+    if rotulo_atual == 'Checklist pré-trade':
+        return _conteudo_checklist_pre_trade_98(), 'Fechar checklist'
+    return None, 'Checklist pré-trade'
+
+
+@app.callback(
+    Output('diario98-checklist-status', 'children'),
+    Output('diario98-checklist-status', 'style'),
+    Input('diario98-checklist-itens', 'value'),
+)
+def resumir_checklist_98(marcados):
+    total = len(cfg.DIARIO_CHECKLIST_PRE_TRADE)
+    n = len(marcados or [])
+    base = {'fontSize': '10px', 'marginTop': '6px', 'fontWeight': '700'}
+    if n == total:
+        return f'✔ {n}/{total} — dentro do plano.', {**base, 'color': C['green']}
+    return f'{n}/{total} conferidos — faltam {total - n}.', {**base, 'color': C['text2']}
+
+
+@app.callback(
     Output({'type': 'diario98-detalhe-estrategia', 'index': dash.MATCH}, 'children'),
     Output({'type': 'diario98-btn-expandir-estrategia', 'index': dash.MATCH}, 'children'),
     Input({'type': 'diario98-btn-expandir-estrategia', 'index': dash.MATCH}, 'n_clicks'),
@@ -2924,9 +3020,28 @@ def renderizar_overlay_imagem_98(dados):
         return None
     imagens = dados['imagens']
     indice = dados.get('indice', 0)
+    # Controles de zoom (feedback 2026-07-30) — 100% client-side via
+    # `data-zoom-acao`, ver diario_app_classico.py::renderizar_overlay_imagem
+    # pro mesmo raciocínio (nenhuma callback Python: o round-trip seria
+    # inútil num controle que precisa ser instantâneo).
+    controles_zoom = html.Div([
+        html.Button('−', **{'data-zoom-acao': 'menos'}, className='win98-btn',
+                    title='Diminuir (tecla −)', style=win98_button()),
+        html.Button('+', **{'data-zoom-acao': 'mais'}, className='win98-btn',
+                    title='Ampliar (tecla +)', style=win98_button()),
+        html.Button('⛶ Ajustar', **{'data-zoom-acao': 'reset'}, className='win98-btn',
+                    title='Voltar ao tamanho da tela (tecla 0)', style=win98_button()),
+        html.Span('roda do mouse amplia · arraste para mover · Esc fecha',
+                  style={'fontSize': '10px', 'color': C['text2'], 'marginLeft': '4px'}),
+    ], style={'display': 'flex', 'gap': '6px', 'alignItems': 'center', 'flexWrap': 'wrap'})
+
     topo = [
-        html.Button('✕ Fechar', id='btn-diario98-fechar-imagem', n_clicks=0,
-                    className='win98-btn', style=win98_button()),
+        html.Div([
+            html.Button('✕ Fechar', id='btn-diario98-fechar-imagem', n_clicks=0,
+                        className='win98-btn', style=win98_button()),
+            controles_zoom,
+        ], style={'display': 'flex', 'gap': '10px', 'alignItems': 'center',
+                  'flexWrap': 'wrap', 'justifyContent': 'space-between'}),
     ]
     if len(imagens) > 1:
         topo.append(html.Div([

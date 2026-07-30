@@ -694,3 +694,40 @@ html, body, #react-entry-point {
     border-right: 1px solid #FFFFFF;
     border-bottom: 1px solid #FFFFFF;
 }
+
+/* -------------------------------------------------------------------------
+   Pop-ups do Diário centralizados no viewport REAL (2026-07-30)
+   Ver assets/diario_overlay_viewport.js / assets/style.css pro raciocínio
+   completo — mesmo bug do clássico: `fixed`/`vh` dentro do iframe do
+   Diário se referem à altura TOTAL auto-crescida do iframe, não ao que o
+   usuário está vendo.
+   ------------------------------------------------------------------------- */
+.diario-overlay-viewport {
+    position: fixed;
+    inset: 0;
+    z-index: 900;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px 16px;
+    box-sizing: border-box;
+}
+.diario-embutido .diario-overlay-viewport {
+    position: absolute;
+    inset: auto 0 auto 0;
+    top: var(--sq-vp-topo, 0px);
+    height: var(--sq-vp-altura, 100vh);
+}
+.diario-overlay-viewport > .diario-overlay-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+}
+.diario-overlay-viewport > .diario-overlay-painel {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: min(1400px, 100%);
+    max-height: 100%;
+    min-height: 0;
+}

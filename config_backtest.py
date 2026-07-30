@@ -640,6 +640,58 @@ DIARIO_LOCK_USUARIO_TENTATIVAS = 40
 DIARIO_LOCK_USUARIO_ESPERA_S = 0.1
 
 # -----------------------------------------------------------------------------
+# GUARDA-CORPO OPERACIONAL DO DIÁRIO (2026-07-30)
+# -----------------------------------------------------------------------------
+# Todos os números abaixo vieram do estudo em `PLANO_DE_TRADE_AGOSTO_2026.md`
+# sobre 210 operações reais — não são preferência, são o que a amostra mostrou.
+# São AVISO, nunca bloqueio: o sistema não impede o Jesué de operar, só coloca
+# na tela o que ele mesmo já concluiu quando estava frio. Mesmo princípio do
+# Modo Aprendizagem — o sistema mede e mostra, quem decide é ele.
+
+# Operações por dia. Dias de 1-2 trades somaram +R$ 328; dias de 3-4, -R$ 137;
+# dias de 5 ou mais destruíram R$ 627 em apenas 12 dias — mais que a perda do
+# ano inteiro. É o maior vazamento medido, e o de conserto mais simples.
+DIARIO_LIMITE_TRADES_DIA = 2
+# A partir daqui a tela fica vermelha (o "3º trade" que o plano manda evitar).
+DIARIO_TRADES_DIA_CRITICO = 3
+# Regra clássica de gerenciamento que ele já segue de forma inconsistente.
+DIARIO_LIMITE_STOPS_DIA = 2
+
+# Setups com expectativa positiva medida (n >= 8, positivos em TODOS os meses).
+DIARIO_ESTRATEGIAS_VENCEDORAS = [
+    "bounce_em_resistencia",   # n=19, +R$ 310, payoff 2,82
+    "trowback_de_pivot",       # n=8,  +R$ 245, melhor expectativa (+30,62)
+    "rompimento_de_suporte",   # n=17, +R$ 221, payoff 1,96
+]
+# Suspensos até revisão — não "proibidos para sempre", ver o plano.
+DIARIO_ESTRATEGIAS_SUSPENSAS = [
+    "bounce_em_suporte",          # n=23, -R$ 289, 13% de acerto
+    "rompimento_de_resistencia",  # n=19, -R$ 211, 16%
+    "alinhamento_de_medias",      # n=5,  -R$ 145, 0%
+    "espadada",                   # n=3,  -R$ 95,  0%
+    "bounce_mme21",               # n=23, -R$ 86 — vale como confluência, não como gatilho
+]
+
+# Contexto onde o dinheiro efetivamente apareceu: setup vencedor + WDO +
+# almoço = 22 operações, +R$ 607 (+27,59/trade), contra -R$ 1.113 em todo o
+# resto. Prime e tarde são negativos até nos melhores setups.
+DIARIO_JANELA_PREFERIDA = "almoco"
+DIARIO_ATIVO_PREFERIDO = "WDO"
+
+# Checklist pré-trade — destilado do que deu certo. As 5 primeiras são filtro
+# de entrada; se alguma falhar, a operação não deveria acontecer.
+DIARIO_CHECKLIST_PRE_TRADE = [
+    "Conta REAL conferida (não é o simulador)",
+    "Não é dia de rolagem de contrato nem super-quarta",
+    "Estou na janela do almoço (11h-13h)",
+    "O setup está entre os 3 vencedores",
+    "Se for COMPRA: é Trowback de Pivô?",
+    "O nível tem 3+ toques ou vem do dia anterior",
+    "Stop TÉCNICO atrás da estrutura (não financeiro)",
+    "Ainda estou dentro do limite de operações do dia",
+]
+
+# -----------------------------------------------------------------------------
 # MODO APRENDIZAGEM — Fase 3.3 (2026-07-21): ajuste fino automático
 # -----------------------------------------------------------------------------
 # Thresholds de `diario_trade.avaliar_aderencia_tracados` (movidos de
