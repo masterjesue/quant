@@ -1348,6 +1348,19 @@ def _mapa_nomes_estrategias() -> dict:
     return {l['slug']: l['nome'] for _, l in dt.listar_estrategias(somente_ativas=False).iterrows()}
 
 
+def _mapa_categorias_estrategias() -> dict:
+    """slug -> rótulo da categoria (Tendência/Reversão/Lateralidade), ou '—'
+    quando não classificada. Usado pela coluna Categoria de "Confiabilidade
+    por Estratégia" (2026-07-30, feedback: "o bloco de estratégias não
+    mudou nada" — a categoria só aparecia na aba Estratégias, não onde o
+    Jesué de fato olha o desempenho)."""
+    df = dt.listar_estrategias(somente_ativas=False)
+    return {
+        l['slug']: dt.ROTULO_CATEGORIA_ESTRATEGIA.get(l.get('categoria'), '—')
+        for _, l in df.iterrows()
+    }
+
+
 def _formatar_tags_estrategia(tags, mapa_nomes: dict) -> str:
     lista = list(tags) if hasattr(tags, '__iter__') and not isinstance(tags, str) else []
     return ', '.join(mapa_nomes.get(t, t.replace('_', ' ').title()) for t in lista) or '—'
@@ -1832,7 +1845,7 @@ def _faixa_score(score: float) -> str:
 # "upgrade diario.docx": "adicionar classificação crescente/decrescente por
 # coluna, como no Excel"). Ordem = ordem visual das colunas na tabela.
 _CAMPOS_ORDENAVEIS_CONFIABILIDADE = [
-    ('nome', 'Estratégia'), ('n', 'N'), ('saldo', 'Saldo'),
+    ('nome', 'Estratégia'), ('categoria', 'Categoria'), ('n', 'N'), ('saldo', 'Saldo'),
     ('taxa_acerto', 'Taxa Acerto'), ('payoff', 'Payoff'),
     ('profit_factor', 'Profit Factor'), ('score', 'Score'),
 ]
@@ -1842,6 +1855,8 @@ def _valor_ordenacao_confiabilidade(item, saldos_por_estrategia: dict, campo: st
     tag, v = item
     if campo == 'nome':
         return _mapa_nomes_estrategias().get(tag, tag)
+    if campo == 'categoria':
+        return _mapa_categorias_estrategias().get(tag, '—')
     if campo == 'saldo':
         return saldos_por_estrategia.get(tag, {}).get('saldo', 0.0)
     valor = v.get(campo)
@@ -1861,6 +1876,7 @@ def _linhas_confiabilidade_estrategia(scores: dict, saldos_por_estrategia: dict,
     reescreve SÓ este corpo, nunca o cabeçalho (ver o raciocínio completo em
     `_tabela_score_confiabilidade`)."""
     nomes = _mapa_nomes_estrategias()
+    categorias = _mapa_categorias_estrategias()
     campo = (ordenacao or {}).get('campo') or 'saldo'
     direcao = (ordenacao or {}).get('direcao') or 'desc'
     linhas_ordenadas = sorted(
@@ -1890,6 +1906,7 @@ def _linhas_confiabilidade_estrategia(scores: dict, saldos_por_estrategia: dict,
         linhas.append(html.Tr([
             _td_diario(seta),
             _td_diario(nomes.get(tag, tag.replace('_', ' ').title())),
+            _td_diario(categorias.get(tag, '—'), extra={'color': C['text2']}),
             _td_diario(str(v['n'])),
             _td_diario(f"R$ {saldo:+.0f}" if saldo is not None else '—',
                        extra={'color': cor_saldo, 'fontWeight': '700'}),
@@ -1900,7 +1917,7 @@ def _linhas_confiabilidade_estrategia(scores: dict, saldos_por_estrategia: dict,
         ]))
         linhas.append(html.Tr(
             html.Td(html.Div(id={'type': 'diario-detalhe-estrategia', 'index': tag}),
-                    colSpan=8, style={'padding': '0', 'border': 'none'})
+                    colSpan=9, style={'padding': '0', 'border': 'none'})
         ))
     return linhas
 
@@ -2036,17 +2053,37 @@ def _detalhe_estrategia_expandido(tag: str) -> html.Div:
               'borderLeft': f'2px solid {C["gold"]}', 'marginBottom': '6px'})
 
 
+def _grupo_cards_estatistica(titulo: str, cards: list) -> html.Div:
+    """Um grupo rotulado de cards (2026-07-30, feedback: "está meio bagunçado,
+    aleatório. Agrupe as quantidades de operações, taxas e valores em blocos
+    diferentes") — antes os 15 cards eram uma única fileira sem nenhuma
+    ordem lógica visível (contagem, R$ e % intercalados). Agora cada grupo
+    tem seu próprio rótulo e uma borda mais sutil que a dos cards
+    individuais, só pra indicar "isto pertence junto"."""
+    return html.Div([
+        html.Div(titulo, style={'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                                 'textTransform': 'uppercase', 'letterSpacing': '0.08em', 'marginBottom': '8px'}),
+        html.Div(cards, style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
+    ], style={'padding': '10px', 'border': f'1px dashed {C["border"]}', 'borderRadius': '10px'})
+
+
 def _cards_estatisticas(stats: dict) -> html.Div:
     payoff_str = f"{stats['payoff']:.2f}" if stats['payoff'] is not None else '—'
-    return html.Div([
+    grupo_quantidade = _grupo_cards_estatistica('Quantidade', [
         _card_estatistica('Operações', str(stats['num_operacoes'])),
-        _card_estatistica('Saldo Total', f"R$ {stats['saldo_total']:+.2f}",
-                           cor=C['green'] if stats['saldo_total'] > 0 else C['red']),
         _card_estatistica('Wins', str(stats['n_win']), cor=C['green']),
         _card_estatistica('Losses', str(stats['n_loss']), cor=C['red']),
         _card_estatistica('Breakeven', str(stats['n_breakeven'])),
+        _card_estatistica('Seq. Wins', str(stats['maior_sequencia_win'])),
+        _card_estatistica('Seq. Losses', str(stats['maior_sequencia_loss'])),
+    ])
+    grupo_taxas = _grupo_cards_estatistica('Taxas', [
         _card_estatistica('Taxa de Acerto', f"{stats['taxa_acerto'] * 100:.1f}%"),
         _card_estatistica('Payoff', payoff_str),
+    ])
+    grupo_valores = _grupo_cards_estatistica('Valores (R$)', [
+        _card_estatistica('Saldo Total', f"R$ {stats['saldo_total']:+.2f}",
+                           cor=C['green'] if stats['saldo_total'] > 0 else C['red']),
         _card_estatistica('Expectativa', f"R$ {stats['expectativa']:+.2f}"),
         # Ganho Total/Perda Total (2026-07-30, feedback: "está faltando") —
         # soma de todos os vencedores/perdedores, ao lado de Max Gain/Max Loss
@@ -2057,9 +2094,9 @@ def _cards_estatisticas(stats: dict) -> html.Div:
         _card_estatistica('Max Loss', f"R$ {stats['max_loss']:+.2f}", cor=C['red']),
         _card_estatistica('Drawdown Máx.', f"R$ {stats['drawdown_maximo_reais']:+.2f}",
                            cor=C['red'] if stats['drawdown_maximo_reais'] < 0 else None),
-        _card_estatistica('Seq. Wins', str(stats['maior_sequencia_win'])),
-        _card_estatistica('Seq. Losses', str(stats['maior_sequencia_loss'])),
-    ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '16px'})
+    ])
+    return html.Div([grupo_quantidade, grupo_taxas, grupo_valores],
+                     style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginBottom': '16px'})
 
 
 _TOGGLE_LARGURA = 42
