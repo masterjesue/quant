@@ -103,6 +103,73 @@ Lista viva — mover pra uma entrada datada quando resolvida, apagar daqui.
 
 ---
 
+## 2026-07-30 — Classificação retroativa das estratégias, Editar no Histórico e fusão do bloco de Confiabilidade
+
+**O problema.** O Diário tinha **dois vocabulários de estratégia que nunca
+foram reconciliados**: 11 slugs herdados da importação do XLSM
+(`suporte_resistencia`, `inversao_polaridade`, `pullback_mme21`,
+`medias_moveis`…) marcando 140 dos 225 trades, e um cadastro editável de 16
+estratégias com checklist, das quais 6 nunca tinham sido usadas uma única vez.
+67 trades não tinham estratégia nenhuma. Os painéis "Score de Confiabilidade"
+e "Por Estratégia" se contradiziam porque liam listas diferentes.
+
+**Causa raiz do desencontro dos painéis:**
+`calcular_score_confiabilidade` varria `ESTRATEGIA_TAGS_CANONICAS` — a lista
+de **bootstrap**, congelada no código, usada só pra semear a tabela na
+primeira execução. Como o cadastro virou editável depois disso, as duas listas
+divergiram. Agora varre o cadastro ativo (`dt._tags_para_pontuar`), mais
+qualquer slug que apareça nos trades — nunca esconder resultado real de um
+setup desativado depois de usado.
+
+**Reclassificação.** `migracao_classificacao_estrategias.py` (mapa auditável
+trade a trade, cada linha com o motivo). 206 trades reclassificados, 19
+preservados, 0 slugs legados restantes, 0 trades sem estratégia. A fonte de
+cada classificação é o `resumo_operacional` escrito pelo Jesué na época, o
+`estrategia_raw` (que **não** é tocado, então a rotulagem original continua
+auditável) e a leitura dos prints para os trades cujo resumo é só "Veja o
+print".
+
+Decisão do Jesué que guiou o desenho: *"Inversão de Polaridade e Reteste são
+características de uma estratégia... identifique se foi Suporte/Resistência,
+bounce/rompimento, pivô"*. O eixo virou **(nível) × (interação)** —
+`bounce_em_X` quando o nível segurou, `rompimento_de_X` quando rompeu e a
+entrada foi no reteste. Isso explicou por que `rompimento_de_suporte`/
+`_de_resistencia` tinham checklist de 7 itens e zero uso: os trades delas
+estavam todos rotulados `inversao_polaridade`. Categorias novas: `oco`,
+`alinhamento_de_medias`, `espadada` (as duas últimas explicitamente distintas
+de `bounce_mme21`, que é a MME21 isolada) e `outros`.
+
+**Editar no Histórico (botão ✎).** `dt.atualizar_trade` — a contraparte de
+`atualizar_rascunho`, que só alcança `posicoes_abertas.parquet`. Allowlist de
+campos (`CAMPOS_EDITAVEIS_TRADE`): edita-se a LEITURA do trade (estratégia,
+texto, contexto emocional); preço, resultado, saldo e data vêm do MT5 e são
+fato — reescrevê-los pela UI reabriria a divergência contra o relatório de
+performance que a auditoria de 2026-07-28 levou uma sessão inteira pra fechar.
+
+> **Armadilha destrutiva encontrada e travada em teste.** Um `dcc.Dropdown`
+> cujo `value` não consta das `options` **não desenha o chip**. O usuário
+> abriria o pop-up, veria o campo vazio, salvaria — e o `State` devolvido pelo
+> Dash APAGARIA a classificação existente. Com 140 trades carregando slugs
+> fora do cadastro, isso teria comido a classificação de dois terços do
+> Diário. Corrigido por `_opcoes_com_valores_atuais` (acrescenta o valor
+> gravado às options, marcado "(fora do cadastro)"), com
+> `testes/teste_opcoes_fora_cadastro.py` conferindo contra o dado real.
+
+**Fusão dos blocos.** "Score de Confiabilidade" + "Por Estratégia" viraram um
+bloco só, **"Confiabilidade por Estratégia"**, ordenado por saldo, com seta ▶
+por linha abrindo o detalhe (direção, janela, ativo, zero a zero, drawdown,
+sequências, melhor/pior trade). A conta mora em `dt.detalhe_estrategia`,
+compartilhada pelos 2 skins. A seta segue a regra recorrente do projeto: botão
+estático, callback só escreve numa linha irmã.
+
+**Estudo resultante:** `PLANO_DE_TRADE_AGOSTO_2026.md`. O achado central é que
+4 estratégias somam +R$ 776 (50% de acerto) e 4 outras somam −R$ 740 (16%) —
+quase simetria perfeita, e é por isso que o ano fecha em −R$ 436. Mais: 12 dias
+com 5+ operações custaram −R$ 627, e 31% de todas as operações morrem
+exatamente em R$ 0,00 no breakeven.
+
+---
+
 ## 2026-07-27 a 2026-07-28 — Motor MT5→Diário: duplicidade, pernas de hedge e alinhamento anual
 
 Detalhe cru (causa raiz de cada bug, com arquivo:linha) em

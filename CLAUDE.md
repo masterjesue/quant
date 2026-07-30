@@ -89,6 +89,8 @@ and dashboards only read from there.
   python testes/teste_agrupar_posicoes.py    # partial fills, out-of-order deals
   python testes/teste_ignorar_pendencia.py   # "this operation is not mine"
   python testes/teste_limpeza_temporarios.py # orphan .tmp cleanup
+  python testes/teste_editar_trade.py        # editing a finalized trade (allowlist of fields)
+  python testes/teste_opcoes_fora_cadastro.py # dropdown must never silently drop a stored tag
   python testes/auditoria_ids_callbacks.py   # cross-tab callback coupling — must print 0
   ```
   `testes/auditar_vs_profit.py <export.csv>` is read-only and compares the

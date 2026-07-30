@@ -285,7 +285,7 @@ def _caminho_diario_lock() -> Path:
 
 
 @contextmanager
-def lock_diario():
+def lock_diario(tentativas: int = 1, espera_segundos: float = 0.15):
     """
     Mesmo mecanismo de `lock_atualizacao()` (criação atômica via O_EXCL),
     trava separada. Uso: `with persistencia.lock_diario() as adquirida: if
@@ -293,6 +293,12 @@ def lock_diario():
     contrário do update de candle, a escrita foi disparada por um clique do
     usuário, então o chamador deve mostrar um erro/retry visível, não pular
     em silêncio).
+
+    `tentativas`/`espera_segundos`: mesma adição que `lock_posicoes_abertas`
+    ganhou em 2026-07-20 (ver lá o achado). Escritas disparadas por clique
+    (`atualizar_trade`, pela edição no Histórico) pedem algumas tentativas
+    com espera curta antes de desistir; o default segue `tentativas=1` pra
+    não mudar o comportamento de nenhum chamador existente.
     """
     caminho = _caminho_diario_lock()
     caminho.parent.mkdir(parents=True, exist_ok=True)
@@ -308,12 +314,17 @@ def lock_diario():
             except FileNotFoundError:
                 pass
 
-    try:
-        fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-    except FileExistsError:
-        yield False
-        return
+    fd = None
+    for tentativa in range(max(1, tentativas)):
+        try:
+            fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            if tentativa + 1 >= max(1, tentativas):
+                yield False
+                return
+            time.sleep(espera_segundos)
+    os.close(fd)
 
     try:
         yield True

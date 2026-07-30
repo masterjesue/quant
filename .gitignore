@@ -23,3 +23,7 @@ scratch_*.txt
 
 # Material de referência pesado (PDFs de pesquisa), não faz parte do app
 diario/
+
+# Parquets de rascunho das suites de testes/ (as mais antigas apagam os arquivos
+# mas deixam a pasta vazia para tras). As suites novas usam tempfile.mkdtemp.
+testes/_scratch_*/

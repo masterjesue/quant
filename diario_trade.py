@@ -792,6 +792,79 @@ def registrar_trade(
         return trade["id_trade"]
 
 
+# Campos que a edição de um trade JÁ GRAVADO pode tocar (ver
+# `atualizar_trade`). É uma allowlist de propósito, não uma denylist: tudo
+# que descreve a EXECUÇÃO (preços, resultado, saldo, lote, datas, tickets,
+# `snapshot_mercado_json`) vem do MT5/da corretora e é fato, não opinião —
+# reescrever isso pela UI abriria a porta pro Diário divergir do relatório
+# de performance, exatamente o problema que a auditoria anual de 2026-07-28
+# levou uma sessão inteira pra fechar. Só entra aqui o que é LEITURA do
+# trade: classificação, texto, contexto emocional.
+CAMPOS_EDITAVEIS_TRADE = (
+    "estrategia_tags", "janela_pregao", "sala_analise",
+    "resumo_operacional", "obs",
+    "nivel_sr_referencia", "nivel_sr_tipo", "nivel_sr_forte",
+    "tags_setup_erro", "tags_emocionais", "sentimento_mercado",
+    "emo_confianca", "emo_humor", "emo_energia", "emo_atencao", "emo_presenca",
+)
+
+# Subconjunto de `CAMPOS_EDITAVEIS_TRADE` guardado como lista no parquet.
+COLUNAS_LISTA_TRADE = ("estrategia_tags", "tags_setup_erro", "tags_emocionais")
+
+
+def atualizar_trade(id_trade: int, campos: dict) -> bool:
+    """
+    Edita um trade JÁ FINALIZADO em `diario_trades.parquet` — a contraparte
+    de `atualizar_rascunho`, que só mexe em `posicoes_abertas.parquet` e
+    portanto não alcança nada que já virou registro permanente.
+
+    Pedido do Jesué em 2026-07-30, junto da classificação retroativa das
+    estratégias: "implemente o botão Editar dentro do histórico para que eu
+    possa posteriormente avaliar os trades fora das estratégias e
+    reclassificá-las". Sem isto, uma classificação errada (ou uma proposta
+    automática que ele quisesse corrigir) só teria conserto editando o
+    parquet na mão.
+
+    Só aceita as chaves de `CAMPOS_EDITAVEIS_TRADE` — as demais são
+    ignoradas em silêncio (o chamador é a UI, que nunca deveria mandar
+    outras; se mandar, é bug dela e não pode corromper o histórico).
+
+    Retorna False se a trava estava ocupada ou se `id_trade` não existe.
+    """
+    campos_validos = {k: v for k, v in (campos or {}).items() if k in CAMPOS_EDITAVEIS_TRADE}
+    if not campos_validos:
+        return False
+
+    with persistencia.lock_diario(
+            tentativas=cfg.DIARIO_LOCK_USUARIO_TENTATIVAS,
+            espera_segundos=cfg.DIARIO_LOCK_USUARIO_ESPERA_S) as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_diario()
+        if df is None or df.empty:
+            return False
+        df = df.reindex(columns=COLUNAS_DIARIO)
+        alvo = df.index[df["id_trade"] == int(id_trade)]
+        if len(alvo) == 0:
+            return False
+        idx = alvo[0]
+
+        for chave, valor in campos_validos.items():
+            if chave in COLUNAS_LISTA_TRADE:
+                # Colunas de lista voltam do parquet como numpy array —
+                # normaliza pra não gravar uma string solta onde o resto do
+                # código itera esperando lista. E força dtype=object ANTES do
+                # `.at`: se a coluna estiver 100% vazia ela vem como float64,
+                # e atribuir uma lista nela levanta ValueError.
+                valor = _para_lista(valor)
+                if df[chave].dtype != object:
+                    df[chave] = df[chave].astype(object)
+            df.at[idx, chave] = valor
+
+        persistencia.salvar_diario(df)
+        return True
+
+
 def salvar_imagem(conteudo_bytes: bytes, id_trade: int, ativo: str, data_op: date | datetime) -> str:
     """
     Salva um print (upload ou colado do clipboard) em
@@ -1016,6 +1089,27 @@ SCORE_CAP_PAYOFF = 2.5
 SCORE_CAP_PROFIT_FACTOR = 2.5
 
 
+def _tags_para_pontuar() -> list[str]:
+    """Vocabulário que o Score de Confiabilidade percorre.
+
+    BUG REAL corrigido em 2026-07-30: isto era `ESTRATEGIA_TAGS_CANONICAS`
+    — a lista de BOOTSTRAP, congelada no código, usada só pra semear a
+    tabela de estratégias na primeira execução. Como o cadastro é editável
+    desde então (criar/desativar pela aba Estratégias), as duas listas
+    divergiram: "Score de Confiabilidade" mostrava o vocabulário velho e
+    "Por Estratégia" mostrava o cadastro, com nomes diferentes para os
+    mesmos trades — exatamente a discordância entre painéis que o Jesué
+    reportou. Depois da reclassificação de 2026-07-30 seria pior ainda: a
+    tabela de score listaria 15 slugs todos com n=0.
+
+    Fonte da verdade agora é o cadastro ATIVO, mais qualquer slug que
+    apareça nos trades (para nunca esconder resultado de um setup que foi
+    desativado depois de já ter sido usado).
+    """
+    ativas = [str(s) for s in listar_estrategias()["slug"]]
+    return ativas
+
+
 def calcular_score_confiabilidade(df: pd.DataFrame | None = None, min_amostra: int = SCORE_MIN_AMOSTRA) -> dict:
     """
     Score de Confiabilidade 0-100 por `estrategia_tags` (não por conta
@@ -1040,8 +1134,13 @@ def calcular_score_confiabilidade(df: pd.DataFrame | None = None, min_amostra: i
     tags_explodidas = reais.explode("estrategia_tags")
     tags_explodidas = tags_explodidas[tags_explodidas["estrategia_tags"].notna()]
 
+    # Slug usado em algum trade mas já desativado no cadastro continua
+    # aparecendo — esconder resultado real seria pior que uma linha a mais.
+    usadas = {str(t) for t in tags_explodidas["estrategia_tags"].unique()}
+    vocabulario = list(dict.fromkeys(_tags_para_pontuar() + sorted(usadas)))
+
     resultado = {}
-    for tag in ESTRATEGIA_TAGS_CANONICAS:
+    for tag in vocabulario:
         subset = tags_explodidas[tags_explodidas["estrategia_tags"] == tag]
         n = len(subset)
         if n == 0:
@@ -1088,6 +1187,100 @@ def calcular_score_confiabilidade(df: pd.DataFrame | None = None, min_amostra: i
             "amostra_suficiente": amostra_suficiente,
         }
     return resultado
+
+
+def detalhe_estrategia(tag: str, df: pd.DataFrame | None = None) -> dict:
+    """
+    Tudo o que a linha EXPANDIDA do bloco "Confiabilidade por Estratégia"
+    mostra sobre um setup — pedido do Jesué em 2026-07-30: "coloque uma seta
+    no canto da linha para expandir os detalhes da estratégia, trazendo mais
+    estatísticas (as mesmas do cabeçalho e outras que você achar
+    importante)".
+
+    Mora aqui, e não na UI, porque os dois skins renderizam o MESMO bloco —
+    é a regra da arquitetura: lógica de dado em `diario_trade`, só a
+    construção visual em `diario_app_*`.
+
+    Além do que o cabeçalho de Estatísticas já traz (saldo, W/L/BE, taxa de
+    acerto, payoff, expectativa, max gain/loss, drawdown, sequências),
+    devolve três recortes que a amostra atual mostrou serem os que mais
+    discriminam resultado neste Diário:
+      - **por direção** (compra × venda): o mesmo setup pode ser lucrativo
+        de um lado e ruinoso do outro — foi o achado mais forte do estudo
+        de 2026-07-30;
+      - **por janela de pregão**: `almoco` é a única janela positiva;
+      - **por ativo**.
+    Mais o `zero_a_zero`: 31% dos trades morrem exatamente em R$ 0,00
+    (breakeven), então essa contagem é indispensável pra ler a taxa de
+    acerto sem se enganar.
+    """
+    if df is None:
+        df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)].copy()
+    reais = reais[reais["estrategia_tags"].apply(
+        lambda tags: hasattr(tags, "__iter__") and not isinstance(tags, str) and tag in list(tags)
+    )]
+    reais = reais.sort_values("data_op")
+
+    vazio = {
+        "n": 0, "saldo_total": 0.0, "n_win": 0, "n_loss": 0, "n_breakeven": 0,
+        "taxa_acerto": None, "payoff": None, "expectativa": None,
+        "max_gain": None, "max_loss": None, "drawdown_maximo_reais": 0.0,
+        "maior_sequencia_win": 0, "maior_sequencia_loss": 0,
+        "zero_a_zero": 0, "primeiro": None, "ultimo": None,
+        "por_direcao": {}, "por_janela": {}, "por_ativo": {},
+        "melhor_trade": None, "pior_trade": None,
+    }
+    if reais.empty:
+        return vazio
+
+    saldo = reais["saldo_operacao_reais"].astype(float)
+    vencedoras, perdedoras = saldo[saldo > 0], saldo[saldo < 0]
+    n, n_win, n_loss = len(reais), len(vencedoras), len(perdedoras)
+    media_perda = float(perdedoras.mean()) if n_loss else 0.0
+
+    acumulado = saldo.cumsum()
+    drawdown = float((acumulado - acumulado.cummax()).min()) if n else 0.0
+    sinais = saldo.apply(lambda v: 1 if v > 0 else (-1 if v < 0 else 0))
+
+    def recorte(coluna: str) -> dict:
+        sub = reais.copy()
+        sub[coluna] = sub[coluna].fillna("(sem)")
+        agrupado = sub.groupby(coluna)["saldo_operacao_reais"].agg(["count", "sum", "mean"])
+        return {
+            str(k): {"n": int(v["count"]), "saldo": float(v["sum"]), "media": float(v["mean"])}
+            for k, v in agrupado.sort_values("sum", ascending=False).iterrows()
+        }
+
+    def extremo(indice) -> dict | None:
+        if indice is None:
+            return None
+        linha = reais.loc[indice]
+        return {
+            "id_trade": int(linha["id_trade"]), "data_op": str(linha["data_op"]),
+            "ativo": str(linha["ativo"]), "saldo": float(linha["saldo_operacao_reais"]),
+        }
+
+    return {
+        "n": n,
+        "saldo_total": float(saldo.sum()),
+        "n_win": n_win, "n_loss": n_loss, "n_breakeven": int((saldo == 0).sum()),
+        "taxa_acerto": n_win / n,
+        "payoff": abs(float(vencedoras.mean()) / media_perda) if (n_win and media_perda) else None,
+        "expectativa": float(saldo.mean()),
+        "max_gain": float(saldo.max()), "max_loss": float(saldo.min()),
+        "drawdown_maximo_reais": drawdown,
+        "maior_sequencia_win": _maior_sequencia(sinais, 1),
+        "maior_sequencia_loss": _maior_sequencia(sinais, -1),
+        "zero_a_zero": int((saldo == 0).sum()),
+        "primeiro": str(reais["data_op"].iloc[0]),
+        "ultimo": str(reais["data_op"].iloc[-1]),
+        "por_direcao": recorte("tipo_operacao"),
+        "por_janela": recorte("janela_pregao"),
+        "por_ativo": recorte("ativo"),
+        "melhor_trade": extremo(saldo.idxmax()),
+        "pior_trade": extremo(saldo.idxmin()),
+    }
 
 
 def _parear_hedge_deals(posicoes: pd.DataFrame) -> pd.DataFrame:

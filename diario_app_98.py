@@ -103,6 +103,16 @@ def _opcoes_tags_setup_erro() -> list[dict]:
     return [{'label': linha['nome'], 'value': linha['slug']} for _, linha in dt.listar_tags_setup_erro().iterrows()]
 
 
+def _opcoes_com_valores_atuais_98(opcoes: list[dict], valores_atuais: list) -> list[dict]:
+    """Ver diario_app_classico.py::_opcoes_com_valores_atuais — sem isto o
+    pop-up de edição APAGA silenciosamente qualquer tag herdada que não
+    esteja mais no cadastro (140 dos 225 trades)."""
+    conhecidos = {o['value'] for o in opcoes}
+    extras = [{'label': f"{str(v).replace('_', ' ').title()} (fora do cadastro)", 'value': v}
+              for v in dict.fromkeys(valores_atuais) if v not in conhecidos]
+    return opcoes + extras
+
+
 def _opcoes_tags_emocionais_98() -> list[dict]:
     return [{'label': linha['nome'], 'value': linha['slug']} for _, linha in dt.listar_tags_emocionais().iterrows()]
 
@@ -987,6 +997,16 @@ def _linha_historico_98(trade: pd.Series, aderencia_por_trade: dict, mapa_nomes_
                     className='win98-btn', style={**win98_button(), 'minHeight': '16px', 'padding': '0 8px', 'fontSize': '10px'})
         if id_trade is not None else ''
     )
+    # Ver diario_app_classico.py::_linha_historico — botão ✎ (2026-07-30),
+    # reclassificação retroativa de estratégia.
+    botao_editar_trade = (
+        html.Button('✎', id={'type': 'diario98-btn-editar-trade', 'index': id_trade}, n_clicks=0,
+                    className='win98-btn', title='Editar classificação e anotações desta operação',
+                    style={**win98_button(), 'minHeight': '16px', 'padding': '0 8px',
+                           'fontSize': '10px', 'marginRight': '4px'})
+        if id_trade is not None else ''
+    )
+    acoes = html.Div([botao_editar_trade, botao_expandir], style={'display': 'flex'}) if id_trade is not None else ''
     linha_resumo = html.Tr([
         _td_diario98(str(trade['data_op'])),
         _td_diario98(trade['ativo']),
@@ -998,7 +1018,7 @@ def _linha_historico_98(trade: pd.Series, aderencia_por_trade: dict, mapa_nomes_
                      extra={'color': cor_saldo, 'fontWeight': '700'}),
         _td_diario98(thumb),
         celula_aderencia,
-        _td_diario98(botao_expandir),
+        _td_diario98(acoes),
     ])
     linha_detalhe = html.Tr(
         html.Td(html.Div(id={'type': 'diario98-detalhe-linha', 'index': id_trade}),
@@ -1397,14 +1417,22 @@ def _faixa_score(score: float) -> str:
     return 'baixo'
 
 
-def _tabela_score_confiabilidade_98(scores: dict) -> html.Div:
-    """Score de Confiabilidade 0-100 por setup (`estrategia_tags`) — ver
-    `diario_trade.calcular_score_confiabilidade`. Mostra os 15 setups
-    canônicos, mesmo os sem dado nenhum ainda (referência completa)."""
-    linhas_ordenadas = sorted(scores.items(), key=lambda item: item[1]['n'], reverse=True)
+def _tabela_score_confiabilidade_98(scores: dict, saldos_por_estrategia: dict | None = None) -> html.Div:
+    """Bloco fundido "Confiabilidade por Estratégia" (2026-07-30) — ver
+    `diario_app_classico.py::_tabela_score_confiabilidade` pro raciocínio
+    completo (dois painéis liam vocabulários diferentes e se contradiziam)."""
+    saldos_por_estrategia = saldos_por_estrategia or {}
+    nomes = _mapa_nomes_estrategias_98()
+
+    def chave(item):
+        tag, v = item
+        return (v['n'] > 0, saldos_por_estrategia.get(tag, {}).get('saldo', 0.0))
+    linhas_ordenadas = sorted(scores.items(), key=chave, reverse=True)
+
     cabecalho = html.Tr([
-        html.Th(t, style={'textAlign': 'left', 'padding': '4px 8px', 'fontSize': '10px', 'color': C['text2']})
-        for t in ['Setup', 'N', 'Taxa Acerto', 'Payoff', 'Profit Factor', 'Score']
+        html.Th(t, style={'textAlign': 'left', 'padding': '4px 8px', 'fontSize': '10px',
+                          'color': C['text2'], 'whiteSpace': 'nowrap'})
+        for t in ['', 'Estratégia', 'N', 'Saldo', 'Taxa Acerto', 'Payoff', 'Profit Factor', 'Score']
     ])
     linhas = []
     for tag, v in linhas_ordenadas:
@@ -1415,16 +1443,108 @@ def _tabela_score_confiabilidade_98(scores: dict) -> html.Div:
         else:
             cor = C[_COR_SCORE_CONFIABILIDADE[_faixa_score(v['score'])]]
             score_cel = _td_diario98(f"{v['score']:.0f}", extra={'color': cor, 'fontWeight': '700'})
+
+        saldo = saldos_por_estrategia.get(tag, {}).get('saldo')
+        cor_saldo = C['text2'] if not saldo else (C['green'] if saldo > 0 else C['red'])
+        seta = html.Button('▶', id={'type': 'diario98-btn-expandir-estrategia', 'index': tag},
+                           n_clicks=0, className='win98-btn',
+                           style={**win98_button(), 'minHeight': '14px', 'padding': '0 6px',
+                                  'fontSize': '9px'}) if v['n'] else ''
         linhas.append(html.Tr([
-            _td_diario98(tag.replace('_', ' ').title()),
+            _td_diario98(seta),
+            _td_diario98(nomes.get(tag, tag.replace('_', ' ').title())),
             _td_diario98(str(v['n'])),
+            _td_diario98(f"R$ {saldo:+.0f}" if saldo is not None else '—',
+                         extra={'color': cor_saldo, 'fontWeight': '700'}),
             _td_diario98(f"{v['taxa_acerto'] * 100:.1f}%" if v['taxa_acerto'] is not None else '—'),
             _td_diario98(f"{v['payoff']:.2f}" if v['payoff'] is not None else '—'),
             _td_diario98(f"{v['profit_factor']:.2f}" if v['profit_factor'] is not None else '—'),
             score_cel,
         ]))
-    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
-                       style={'width': '100%', 'borderCollapse': 'collapse'})
+        linhas.append(html.Tr(
+            html.Td(html.Div(id={'type': 'diario98-detalhe-estrategia', 'index': tag}),
+                    colSpan=8, style={'padding': '0', 'border': 'none'})
+        ))
+    return html.Div([
+        html.Div('Só trades reais (o simulador não entra). A seta abre o detalhe do setup.',
+                 style={'fontSize': '10px', 'color': C['text2'], 'marginBottom': '6px'}),
+        html.Table([html.Thead(cabecalho), html.Tbody(linhas)],
+                   style={'width': '100%', 'borderCollapse': 'collapse'}),
+    ])
+
+
+def _mini_recorte_98(titulo: str, dados: dict) -> html.Div:
+    if not dados:
+        return html.Div()
+    linhas = [
+        html.Div([
+            html.Span(str(k).replace('_', ' ').title(), style={'flex': '1', 'fontSize': '10px'}),
+            html.Span(str(v['n']), style={'width': '26px', 'textAlign': 'right',
+                                          'fontSize': '10px', 'fontFamily': FONTS['mono']}),
+            html.Span(f"R$ {v['saldo']:+.0f}", style={
+                'width': '72px', 'textAlign': 'right', 'fontSize': '10px', 'fontFamily': FONTS['mono'],
+                'color': C['green'] if v['saldo'] > 0 else (C['red'] if v['saldo'] < 0 else C['text2']),
+            }),
+        ], style={'display': 'flex', 'padding': '2px 0'})
+        for k, v in dados.items()
+    ]
+    return html.Div([
+        html.Div(titulo, style={'fontSize': '9px', 'color': C['text2'], 'marginBottom': '2px',
+                                'textTransform': 'uppercase'}),
+        html.Div(linhas),
+    ], style={'flex': '1', 'minWidth': '175px'})
+
+
+def _detalhe_estrategia_expandido_98(tag: str) -> html.Div:
+    """Ver diario_app_classico.py::_detalhe_estrategia_expandido — a conta
+    mora em `dt.detalhe_estrategia`, compartilhada pelos 2 skins."""
+    d = dt.detalhe_estrategia(tag)
+    if not d['n']:
+        return html.Div('Sem trades reais neste setup.',
+                        style={'padding': '8px', 'fontSize': '10px', 'color': C['text2']})
+
+    def metrica(rotulo, valor, cor=None):
+        return html.Div([
+            html.Div(rotulo, style={'fontSize': '9px', 'color': C['text2']}),
+            html.Div(valor, style={'fontSize': '12px', 'fontWeight': '700',
+                                   'fontFamily': FONTS['mono'], 'color': cor or C['text']}),
+        ], style={'minWidth': '86px'})
+
+    payoff = f"{d['payoff']:.2f}" if d['payoff'] is not None else '—'
+    return html.Div([
+        html.Div([
+            metrica('Operações', str(d['n'])),
+            metrica('Saldo', f"R$ {d['saldo_total']:+.2f}",
+                    C['green'] if d['saldo_total'] > 0 else C['red']),
+            metrica('Wins', str(d['n_win']), C['green']),
+            metrica('Losses', str(d['n_loss']), C['red']),
+            metrica('Zero a zero', str(d['zero_a_zero'])),
+            metrica('Taxa de Acerto', f"{d['taxa_acerto'] * 100:.1f}%"),
+            metrica('Payoff', payoff),
+            metrica('Expectativa', f"R$ {d['expectativa']:+.2f}",
+                    C['green'] if d['expectativa'] > 0 else C['red']),
+            metrica('Max Gain', f"R$ {d['max_gain']:+.2f}", C['green']),
+            metrica('Max Loss', f"R$ {d['max_loss']:+.2f}", C['red']),
+            metrica('Drawdown Máx.', f"R$ {d['drawdown_maximo_reais']:+.2f}", C['red']),
+            metrica('Seq. Wins', str(d['maior_sequencia_win'])),
+            metrica('Seq. Losses', str(d['maior_sequencia_loss'])),
+        ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '10px'}),
+        html.Div([
+            _mini_recorte_98('Por direção', d['por_direcao']),
+            _mini_recorte_98('Por janela', d['por_janela']),
+            _mini_recorte_98('Por ativo', d['por_ativo']),
+        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap', 'marginBottom': '8px'}),
+        html.Div([
+            html.Span(f"Período: {d['primeiro']} a {d['ultimo']}", style={'marginRight': '12px'}),
+            html.Span(f"Melhor: #{d['melhor_trade']['id_trade']} "
+                      f"({d['melhor_trade']['ativo']}, R$ {d['melhor_trade']['saldo']:+.2f})",
+                      style={'marginRight': '12px', 'color': C['green']}),
+            html.Span(f"Pior: #{d['pior_trade']['id_trade']} "
+                      f"({d['pior_trade']['ativo']}, R$ {d['pior_trade']['saldo']:+.2f})",
+                      style={'color': C['red']}),
+        ], style={'fontSize': '10px', 'color': C['text2']}),
+    ], style={'padding': '10px', 'background': C['bg'],
+              'borderLeft': f"2px solid {C['shadow_dk']}", 'marginBottom': '4px'})
 
 
 def _cards_estatisticas_98(stats: dict) -> html.Div:
@@ -1469,11 +1589,10 @@ def _resto_periodo_estatisticas_98(stats: dict) -> html.Div:
             _bloco_breakdown_98('Por Ativo', stats['por_ativo']),
             _bloco_breakdown_98('Por Janela', stats['por_janela']),
         ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
+        # "Por Estratégia" saiu daqui (2026-07-30) — fundido com o Score no
+        # bloco "Confiabilidade por Estratégia". Ver o classico.
         html.Div([
             _bloco_breakdown_98('Por Sala/Análise', stats['por_sala']),
-            _bloco_breakdown_98('Por Estratégia', stats['por_estrategia']),
-        ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
-        html.Div([
             _bloco_breakdown_98('Por Tags Setup/Erro', stats['por_tags_setup_erro']),
         ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
     ])
@@ -1579,7 +1698,8 @@ def _construir_diario98_estatisticas(stats_geral: dict, scores: dict) -> html.Di
 
         html.Div(id='diario98-resto-periodo-conteudo'),
 
-        win98_groupbox('Score de Confiabilidade', _tabela_score_confiabilidade_98(scores)),
+        win98_groupbox('Confiabilidade por Estratégia',
+                       _tabela_score_confiabilidade_98(scores, stats_geral['por_estrategia'])),
 
         _bloco_status_badges_98(),
     ])
@@ -2043,6 +2163,8 @@ _registrar_scroll_ate_overlay_98(app, 'diario98-imagem-ampliada', 'diario98-over
                                   'diario98-overlay-imagem-backdrop-wrap')
 _registrar_scroll_ate_overlay_98(app, 'store-pendencia98-editar', 'diario98-overlay-pendencia',
                                   'diario98-overlay-pendencia-backdrop-wrap')
+_registrar_scroll_ate_overlay_98(app, 'store-trade98-editar', 'diario98-overlay-trade',
+                                  'diario98-overlay-trade-backdrop-wrap')
 
 _PADRAO_NOME_IMAGEM_DIARIO = re.compile(r'^(\d{4}_[A-Z]+_\d{8}|rascunho_\d+_\d{2})\.png$')
 
@@ -2066,6 +2188,9 @@ app.layout = html.Div([
     # `id_posicao` da pendência aberta no pop-up de edição do Histórico —
     # ver diario_app_classico.py::store-pendencia-editar.
     dcc.Store(id='store-pendencia98-editar', data=None),
+    # `id_trade` do trade JÁ FINALIZADO aberto no pop-up ✎ do Histórico —
+    # ver diario_app_classico.py::store-trade-editar.
+    dcc.Store(id='store-trade98-editar', data=None),
     # Bug real 2026-07-22 (mesma causa raiz de diario_app_classico.py): esta
     # Store vivia duplicada dentro de "Novo Trade" e de "Posição"
     # (`_construir_diario98_em_andamento`) — nenhuma existe quando a aba
@@ -2093,6 +2218,7 @@ app.layout = html.Div([
     # a callback inteira em silêncio se escrita de outra aba.
     html.Div(id='diario98-overlay-imagem'),
     html.Div(id='diario98-overlay-pendencia'),
+    html.Div(id='diario98-overlay-trade'),
     html.Div(id='diario98-aba-conteudo'),
 ], style={
     # `height: 100vh` + `overflowY: auto` (não mais `minHeight: 100vh` sem
@@ -2683,6 +2809,24 @@ def alternar_detalhe_historico_98(n_clicks, seta_atual, id_componente):
 
 
 @app.callback(
+    Output({'type': 'diario98-detalhe-estrategia', 'index': dash.MATCH}, 'children'),
+    Output({'type': 'diario98-btn-expandir-estrategia', 'index': dash.MATCH}, 'children'),
+    Input({'type': 'diario98-btn-expandir-estrategia', 'index': dash.MATCH}, 'n_clicks'),
+    State({'type': 'diario98-btn-expandir-estrategia', 'index': dash.MATCH}, 'children'),
+    State({'type': 'diario98-btn-expandir-estrategia', 'index': dash.MATCH}, 'id'),
+    prevent_initial_call=True,
+)
+def alternar_detalhe_estrategia_98(n_clicks, seta_atual, id_componente):
+    """Seta do bloco "Confiabilidade por Estratégia" (2026-07-30) — ver
+    diario_app_classico.py::alternar_detalhe_estrategia."""
+    if not n_clicks:
+        return no_update, no_update
+    if seta_atual == '▶':
+        return _detalhe_estrategia_expandido_98(id_componente['index']), '▼'
+    return None, '▶'
+
+
+@app.callback(
     Output({'type': 'ea98-imagem-principal', 'index': dash.MATCH}, 'data'),
     Input({'type': 'ea98-imagem-thumb-escolher', 'index': dash.MATCH, 'nome': ALL}, 'n_clicks'),
     prevent_initial_call=True,
@@ -3126,6 +3270,188 @@ def renderizar_overlay_pendencia_98(id_pos):
         html.Div(_bloco_posicao_completo_98(pos, imagens), style={'overflowY': 'auto', 'marginTop': '8px'}),
     ], style={'display': 'flex', 'flexDirection': 'column', 'height': '100%'})
     return _overlay_98(conteudo, 'diario98-overlay-pendencia-backdrop')
+
+
+# ---------------------------------------------------------------------------
+# Editar operação JÁ GRAVADA (botão ✎ do Histórico) — 2026-07-30
+# ---------------------------------------------------------------------------
+# Espelho de diario_app_classico.py; ver lá o raciocínio completo. O fluxo
+# inteiro só toca ids GLOBAIS (`store-trade98-editar`,
+# `diario98-overlay-trade`, `store-diario98-refresh`).
+
+@app.callback(
+    Output('store-trade98-editar', 'data'),
+    Input({'type': 'diario98-btn-editar-trade', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def abrir_trade_editar_98(n_clicks_lista):
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    return json.loads(prop_id)['index']
+
+
+@app.callback(
+    Output('store-trade98-editar', 'data', allow_duplicate=True),
+    Input('btn-diario98-fechar-trade', 'n_clicks'),
+    Input('diario98-overlay-trade-backdrop', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def fechar_trade_editar_98(_n1, _n2):
+    """Guarda de `value` obrigatória — os gatilhos nascem com `n_clicks=0`
+    junto com o pop-up e essa inserção dispara a callback (bug real
+    2026-07-27, ver `fechar_pendencia_editar_98`)."""
+    ctx = callback_context
+    if not ctx.triggered or not ctx.triggered[0].get('value'):
+        return no_update
+    return None
+
+
+def _bloco_editar_trade_98(trade: pd.Series) -> html.Div:
+    """Ver diario_app_classico.py::_bloco_editar_trade — execução (preço,
+    resultado, saldo, data) fica só-leitura no cabeçalho; edita-se apenas a
+    leitura do trade."""
+    saldo = trade.get('saldo_operacao_reais')
+    saldo_num = float(saldo) if pd.notna(saldo) else 0.0
+    cor_saldo = C['green'] if saldo_num > 0 else (C['red'] if saldo_num < 0 else C['text2'])
+    pontos = trade.get('resultado_pontos')
+    cabecalho = (f"{trade.get('data_op')} · {trade.get('ativo')} · "
+                 f"{trade.get('tipo_operacao') or '—'}")
+    if pd.notna(pontos):
+        cabecalho += f" · {float(pontos):+.0f} pts"
+    largura_total = {'width': '100%'}
+    campo = _campo_diario98
+    est_atuais = _lista_segura_98(trade.get('estrategia_tags'))
+    erro_atuais = _lista_segura_98(trade.get('tags_setup_erro'))
+    emo_atuais = _lista_segura_98(trade.get('tags_emocionais'))
+
+    return html.Div([
+        html.Div([
+            html.Span(f"#{int(trade['id_trade'])}", style={
+                'fontFamily': FONTS['mono'], 'fontSize': '14px', 'fontWeight': '700', 'marginRight': '8px'}),
+            html.Span(cabecalho, style={'fontSize': '11px', 'color': C['text2']}),
+            html.Span(f"  R$ {saldo_num:+.2f}", style={
+                'fontFamily': FONTS['mono'], 'fontSize': '12px', 'fontWeight': '700', 'color': cor_saldo}),
+        ], style={'marginBottom': '2px'}),
+        html.Div('Execução (preço, resultado, saldo, data) vem do MT5 e não é editável aqui.',
+                 style={'fontSize': '10px', 'color': C['text2'], 'marginBottom': '10px'}),
+
+        win98_groupbox('Classificação', html.Div([
+            campo('Estratégia', dcc.Dropdown(
+                id='diario98-edit-estrategia', multi=True,
+                options=_opcoes_com_valores_atuais_98(_opcoes_estrategias(), est_atuais),
+                value=est_atuais,
+                className='win98-dropdown win98-dropdown-tags', style=largura_total)),
+            campo('Janela do pregão', dcc.Dropdown(
+                id='diario98-edit-janela', options=_opcoes_janelas_98(),
+                value=trade.get('janela_pregao') if pd.notna(trade.get('janela_pregao')) else None,
+                className='win98-dropdown', style=largura_total)),
+            campo('Sala/Análise', dcc.Dropdown(
+                id='diario98-edit-sala', options=_opcoes_diario(dt.SALA_ANALISE_CANONICA),
+                value=trade.get('sala_analise') if pd.notna(trade.get('sala_analise')) else None,
+                className='win98-dropdown', style=largura_total)),
+        ])),
+        win98_groupbox('Nível de S/R referenciado', html.Div([
+            campo('Preço', dcc.Input(
+                id='diario98-edit-nivel-sr', type='text', inputMode='decimal',
+                value=trade.get('nivel_sr_referencia') if pd.notna(trade.get('nivel_sr_referencia')) else None,
+                style={**win98_field(), **largura_total})),
+            campo('Tipo', dcc.Input(
+                id='diario98-edit-nivel-sr-tipo', type='text', placeholder='ex: suporte',
+                value=trade.get('nivel_sr_tipo') if pd.notna(trade.get('nivel_sr_tipo')) else None,
+                style={**win98_field(), **largura_total})),
+        ])),
+        win98_groupbox('Anotações', html.Div([
+            campo('Resumo Operacional', dcc.Textarea(
+                id='diario98-edit-resumo', rows=4,
+                value=trade.get('resumo_operacional') if pd.notna(trade.get('resumo_operacional')) else '',
+                style={**win98_field(), **largura_total, 'height': 'auto', 'resize': 'vertical'})),
+            campo('Obs (autocoaching)', dcc.Textarea(
+                id='diario98-edit-obs', rows=2,
+                value=trade.get('obs') if pd.notna(trade.get('obs')) else '',
+                style={**win98_field(), **largura_total, 'height': 'auto', 'resize': 'vertical'})),
+            campo('Tags de Setup/Erro', dcc.Dropdown(
+                id='diario98-edit-tags-erro', multi=True,
+                options=_opcoes_com_valores_atuais_98(_opcoes_tags_setup_erro(), erro_atuais),
+                value=erro_atuais,
+                className='win98-dropdown win98-dropdown-tags', style=largura_total)),
+            campo('Print Emocional', dcc.Dropdown(
+                id='diario98-edit-tags-emocionais', multi=True,
+                options=_opcoes_com_valores_atuais_98(_opcoes_tags_emocionais_98(), emo_atuais),
+                value=emo_atuais,
+                className='win98-dropdown win98-dropdown-tags', style=largura_total)),
+        ])),
+    ])
+
+
+@app.callback(
+    Output('diario98-overlay-trade', 'children'),
+    Input('store-trade98-editar', 'data'),
+)
+def renderizar_overlay_trade_98(id_trade):
+    if not id_trade:
+        return None
+    df = dt.listar_trades()
+    linha = df[df['id_trade'] == int(id_trade)]
+    if linha.empty:
+        return None
+    conteudo = html.Div([
+        html.Div([
+            html.Button('✕ Fechar', id='btn-diario98-fechar-trade', n_clicks=0, className='win98-btn',
+                        style={**win98_button(), 'flexShrink': '0', 'alignSelf': 'flex-start'}),
+            html.Button('Salvar alterações', id='btn-diario98-salvar-trade', n_clicks=0, className='win98-btn',
+                        style={**win98_button(), 'flexShrink': '0', 'alignSelf': 'flex-start', 'marginLeft': '8px'}),
+            html.Span(id='diario98-editar-trade-status',
+                      style={'fontSize': '11px', 'color': C['red'], 'marginLeft': '8px'}),
+        ], style={'display': 'flex', 'alignItems': 'center'}),
+        html.Div(_bloco_editar_trade_98(linha.iloc[0]),
+                 style={'overflowY': 'auto', 'marginTop': '8px'}),
+    ], style={'display': 'flex', 'flexDirection': 'column', 'height': '100%'})
+    return _overlay_98(conteudo, 'diario98-overlay-trade-backdrop')
+
+
+@app.callback(
+    Output('store-trade98-editar', 'data', allow_duplicate=True),
+    Output('diario98-editar-trade-status', 'children'),
+    Output('store-diario98-refresh', 'data', allow_duplicate=True),
+    Input('btn-diario98-salvar-trade', 'n_clicks'),
+    State('store-trade98-editar', 'data'),
+    State('diario98-edit-estrategia', 'value'),
+    State('diario98-edit-janela', 'value'),
+    State('diario98-edit-sala', 'value'),
+    State('diario98-edit-nivel-sr', 'value'),
+    State('diario98-edit-nivel-sr-tipo', 'value'),
+    State('diario98-edit-resumo', 'value'),
+    State('diario98-edit-obs', 'value'),
+    State('diario98-edit-tags-erro', 'value'),
+    State('diario98-edit-tags-emocionais', 'value'),
+    State('store-diario98-refresh', 'data'),
+    prevent_initial_call=True,
+)
+def salvar_trade_editado_98(n_clicks, id_trade, estrategias, janela, sala, nivel_sr, nivel_sr_tipo,
+                            resumo, obs, tags_erro, tags_emocionais, refresh_atual):
+    """Guarda de `n_clicks` obrigatória — sem ela, ABRIR o pop-up já gravaria
+    por cima do trade com os `State` ainda vazios, APAGANDO a classificação
+    existente (ver diario_app_classico.py::salvar_trade_editado)."""
+    if not n_clicks or not id_trade:
+        return no_update, no_update, no_update
+    campos = {
+        'estrategia_tags': estrategias or [],
+        'janela_pregao': janela,
+        'sala_analise': sala,
+        'nivel_sr_referencia': _num(nivel_sr),
+        'nivel_sr_tipo': (nivel_sr_tipo or '').strip() or None,
+        'resumo_operacional': (resumo or '').strip() or None,
+        'obs': (obs or '').strip() or None,
+        'tags_setup_erro': tags_erro or [],
+        'tags_emocionais': tags_emocionais or [],
+    }
+    if not dt.atualizar_trade(int(id_trade), campos):
+        return no_update, '⚠ Ocupado — não foi possível gravar. Tente de novo.', no_update
+    _log_diario98.info('trade #%s editado no Histórico — estratégias: %s',
+                       id_trade, campos['estrategia_tags'])
+    return None, '', (refresh_atual or 0) + 1
 
 
 @app.callback(
