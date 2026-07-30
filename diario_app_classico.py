@@ -1988,6 +1988,11 @@ def _cards_estatisticas(stats: dict) -> html.Div:
         _card_estatistica('Taxa de Acerto', f"{stats['taxa_acerto'] * 100:.1f}%"),
         _card_estatistica('Payoff', payoff_str),
         _card_estatistica('Expectativa', f"R$ {stats['expectativa']:+.2f}"),
+        # Ganho Total/Perda Total (2026-07-30, feedback: "está faltando") —
+        # soma de todos os vencedores/perdedores, ao lado de Max Gain/Max Loss
+        # (melhor/pior trade ÚNICO) pra não confundir os dois.
+        _card_estatistica('Ganho Total', f"R$ {stats['ganho_total']:+.2f}", cor=C['green']),
+        _card_estatistica('Perda Total', f"R$ {stats['perda_total']:+.2f}", cor=C['red']),
         _card_estatistica('Max Gain', f"R$ {stats['max_gain']:+.2f}", cor=C['green']),
         _card_estatistica('Max Loss', f"R$ {stats['max_loss']:+.2f}", cor=C['red']),
         _card_estatistica('Drawdown Máx.', f"R$ {stats['drawdown_maximo_reais']:+.2f}",
@@ -3208,7 +3213,21 @@ def _montar_tabela_historico(ativo, janela, estrategia, data_ini_efetivo, data_f
     e o Dash derruba a callback inteira em silêncio)."""
     df = dt.listar_trades(ativo=ativo, janela=janela, estrategia_tag=estrategia,
                            data_ini=data_ini_efetivo, data_fim=data_fim_efetivo, is_simulated=False)
-    df = df.sort_values('data_op', ascending=False).head(200 if filtro_cal else 50)
+    df = df.sort_values('data_op', ascending=False)
+    # BUG REAL 2026-07-30 (reportado pelo Jesué: "mesmo marcando o período no
+    # seletor de datas ele exibe apenas o mês atual"): o corte de linhas era
+    # incondicional (top 50 por recência) a menos que um clique no calendário
+    # estivesse ativo. Um filtro de DATA explícito no seletor não bastava pra
+    # levantar o corte — então escolher um período amplo sem também mexer em
+    # ativo/janela/estratégia continuava mostrando só as 50 operações mais
+    # recentes, que quase sempre são todas do mês corrente. Com outro filtro
+    # (ativo, janela, estratégia) o subconjunto ficava menor e o corte passava
+    # despercebido — foi exatamente essa diferença que ele reportou. O corte
+    # de 50 agora só vale pra navegação livre, sem NENHUM filtro; qualquer
+    # filtro explícito (inclusive só o range de datas) mostra tudo que casar.
+    sem_filtro_nenhum = not (ativo or janela or estrategia or data_ini_efetivo or data_fim_efetivo or filtro_cal)
+    if sem_filtro_nenhum:
+        df = df.head(50)
 
     # Pendências (fechamentos ao vivo + descobertas históricas, ver
     # dt.listar_pendencias_historico) — mesmos filtros de ativo/data do

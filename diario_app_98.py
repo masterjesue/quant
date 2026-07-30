@@ -1615,6 +1615,8 @@ def _cards_estatisticas_98(stats: dict) -> html.Div:
         _card_estatistica_98('Taxa de Acerto', f"{stats['taxa_acerto'] * 100:.1f}%"),
         _card_estatistica_98('Payoff', payoff_str),
         _card_estatistica_98('Expectativa', f"R$ {stats['expectativa']:+.2f}"),
+        _card_estatistica_98('Ganho Total', f"R$ {stats['ganho_total']:+.2f}", cor=C['green']),
+        _card_estatistica_98('Perda Total', f"R$ {stats['perda_total']:+.2f}", cor=C['red']),
         _card_estatistica_98('Max Gain', f"R$ {stats['max_gain']:+.2f}", cor=C['green']),
         _card_estatistica_98('Max Loss', f"R$ {stats['max_loss']:+.2f}", cor=C['red']),
         _card_estatistica_98('Drawdown Máx.', f"R$ {stats['drawdown_maximo_reais']:+.2f}",
@@ -2742,7 +2744,13 @@ def _montar_tabela_historico_98(ativo, janela, estrategia, data_ini_efetivo, dat
     Histórico não refletia finalizar/descartar sem sair e voltar da aba)."""
     df = dt.listar_trades(ativo=ativo, janela=janela, estrategia_tag=estrategia,
                            data_ini=data_ini_efetivo, data_fim=data_fim_efetivo, is_simulated=False)
-    df = df.sort_values('data_op', ascending=False).head(200 if filtro_cal else 50)
+    df = df.sort_values('data_op', ascending=False)
+    # Ver diario_app_classico.py::_montar_tabela_historico — bug real
+    # 2026-07-30: o corte de 50 era incondicional, então um range de datas
+    # explícito sem outro filtro continuava mostrando só as 50 mais recentes.
+    sem_filtro_nenhum = not (ativo or janela or estrategia or data_ini_efetivo or data_fim_efetivo or filtro_cal)
+    if sem_filtro_nenhum:
+        df = df.head(50)
 
     # Pendências (fechamentos ao vivo + descobertas históricas) — ver
     # diario_app_classico.py::atualizar_historico pro mesmo raciocínio.

@@ -999,6 +999,7 @@ def calcular_estatisticas(
 
     vazio = {
         "num_operacoes": 0, "saldo_total": 0.0, "max_gain": 0.0, "max_loss": 0.0,
+        "ganho_total": 0.0, "perda_total": 0.0,
         "taxa_acerto": 0.0, "payoff": None, "expectativa": 0.0,
         "n_win": 0, "n_loss": 0, "n_breakeven": 0,
         "maior_sequencia_win": 0, "maior_sequencia_loss": 0,
@@ -1058,6 +1059,14 @@ def calcular_estatisticas(
         "saldo_total": float(saldo.sum()),
         "max_gain": float(saldo.max()),
         "max_loss": float(saldo.min()),
+        # Ganho Total / Perda Total (2026-07-30, pedido do Jesué: "está
+        # faltando"): soma de TODOS os trades vencedores/perdedores, distinto
+        # de max_gain/max_loss (o melhor/pior trade ÚNICO). saldo_total já
+        # existia, mas sem os dois lados separados não dá pra ver, por
+        # exemplo, se o total positivo é grande e os losses é que destroem —
+        # ou o contrário.
+        "ganho_total": float(vencedoras["saldo_operacao_reais"].sum()) if n_win else 0.0,
+        "perda_total": float(perdedoras["saldo_operacao_reais"].sum()) if n_loss else 0.0,
         "taxa_acerto": taxa_acerto,
         "payoff": payoff,
         "expectativa": expectativa,
