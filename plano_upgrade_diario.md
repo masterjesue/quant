@@ -96,7 +96,20 @@ investigar se dá pra:
 5. Destaque ilustrado (troféu/medalha) pra Estratégia Vencedora, e destaque
    equivalente pra Estratégia Perdedora.
 
-### C. Reclassificação de "Outros" — **precisa da sua memória, não é dado puro**
+### C. Reclassificação de "Outros" — ✅ CONCLUÍDO (2026-07-30, `migracao_reclassificacao_outros.py`)
+
+69 trades reclassificados em 5 estratégias novas: `estrela_da_tarde` (1),
+`srp_sem_registro` (23, o bloco de julho), `outras_estrategias` (2, #16 e
+#70 — seguiram call de mentor sem setup próprio), `sem_estrategia_
+aprendizagem` (16, dias com 4+ trades = overtrading mensurável, não
+achismo), `nao_classificado` (27, sem nenhum sinal). "Outros" continua
+cadastrada e ativa (fallback futuro), mas sem trade real associado.
+Achado ao vivo: com "Outros" desmembrado, a **Estratégia Perdedora real
+virou "Bounce em Suporte"** (−R$289/23) em vez do genérico "Outros" — o
+sistema ficou mais útil, não só mais granular.
+
+~~precisa da sua memória, não é dado puro~~ (texto original abaixo, mantido
+pro histórico da decisão):
 O docx distingue 2 casos que os números sozinhos não conseguem separar:
 - Trades "Outros" **deste mês** (julho) → você lembra que eram do seu
   operacional S/R/Pivô com análise do Professor Igor, só sem registro (o
