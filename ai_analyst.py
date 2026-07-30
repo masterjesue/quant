@@ -2,10 +2,15 @@
 # ai_analyst.py — Mentor IA (Gemini + OpenRouter, integrado ao dashboard)
 # =============================================================================
 
-import requests
 import json
+import os
+import time
+from contextlib import contextmanager
 from datetime import datetime
+
 import numpy as np
+import requests
+
 import config_backtest as cfg
 import diario_trade
 import persistencia
@@ -371,9 +376,163 @@ def analisar_com_pergunta_raw(metricas: dict, pergunta: str, ativo: str, modelo:
       - retry_after: int (segundos a aguardar, se 429)
     """
     prompt = _montar_prompt(metricas, pergunta, ativo)
+    return _despachar_para_modelo(prompt, modelo)
 
+
+def _despachar_para_modelo(prompt: str, modelo: str | None = None) -> dict:
+    """Envia um prompt JÁ PRONTO pro provedor certo — o "hub" único de
+    verdade (extraído de `analisar_com_pergunta_raw` em 2026-07-30, item D
+    do "upgrade diario.docx": o Mentor de IA de análise retrospectiva do
+    Diário precisa do MESMO hub Gemini/OpenRouter do chat de mercado, só
+    com um prompt diferente — nenhum dos dois deve ter lógica própria de
+    "qual provedor chamar", ou eles divergem com o tempo)."""
     if modelo is None or modelo == 'gemini':
         return _chamar_gemini(prompt)
     if modelo == 'openrouter-auto':
         return _chamar_openrouter_auto(prompt)
     return _chamar_openrouter(prompt, modelo)
+
+
+# =============================================================================
+# MENTOR DE IA — análise retrospectiva do Diário (item D, "upgrade
+# diario.docx", 2026-07-30)
+# =============================================================================
+# "Faça uma análise interpretativa do meu operacional, analisando curva de
+# aprendizagem, evolução operacional/estratégica e próximos passos. Para
+# controle de tokens, esse feedback deve ser diário, uma vez ao dia
+# analisando do dia anterior para trás." — decisões confirmadas com o
+# Jesué: tom DIRETO e objetivo (não reflexivo/coach); usa o MESMO hub
+# Gemini/OpenRouter do chat (`_despachar_para_modelo`), nunca uma chamada
+# de API própria.
+#
+# A cadência de "1x por dia" é reforçada em 2 camadas, não só de boa fé:
+# (1) o dado em si (`diario_trade.montar_resumo_para_mentor_ia`) já corta
+# em "até ontem", então gerar de novo no mesmo dia produziria o MESMO
+# resumo; (2) o cache abaixo guarda a data da última geração, e a UI
+# (`diario_app_classico.py`) usa isso pra desabilitar o botão até o dia
+# seguinte — sem impedir uma geração manual extra se o Jesué realmente
+# quiser (o controle de custo é undo-ável por decisão dele, não uma trava
+# de sistema).
+
+_MENTOR_LOCK_STALE_SEGUNDOS = 60
+
+
+def _caminho_analise_diaria():
+    return cfg.PASTA_BASE_PROCESSADA / "mentor_analise_diaria.json"
+
+
+def _caminho_analise_diaria_lock():
+    return cfg.PASTA_BASE_PROCESSADA / ".mentor_analise_diaria.lock"
+
+
+@contextmanager
+def _lock_analise_diaria():
+    """Mesmo mecanismo de `config_operacional._lock` (criação atômica via
+    O_EXCL) — colisão real é rara (1 usuário, 1 botão, cadência diária)."""
+    caminho = _caminho_analise_diaria_lock()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    if caminho.exists():
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+        except FileNotFoundError:
+            idade = 0
+        if idade > _MENTOR_LOCK_STALE_SEGUNDOS:
+            try:
+                caminho.unlink()
+            except FileNotFoundError:
+                pass
+    try:
+        fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            caminho.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def carregar_analise_diaria() -> dict | None:
+    """Última análise gerada — `{'data': 'YYYY-MM-DD', 'texto': ...,
+    'modelo_usado': ..., 'gerado_em': isoformat, 'tokens_usados': int}`,
+    ou None se nunca foi gerada. `data` é a data em que foi gerada (hoje),
+    não o período analisado — é o que a UI compara pra saber se já rodou
+    hoje."""
+    caminho = _caminho_analise_diaria()
+    if not caminho.exists():
+        return None
+    try:
+        with open(caminho, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _salvar_analise_diaria(dados: dict) -> None:
+    caminho = _caminho_analise_diaria()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    caminho_tmp = caminho.with_name(f"{caminho.stem}.tmp{os.getpid()}{caminho.suffix}")
+    with open(caminho_tmp, "w", encoding="utf-8") as f:
+        json.dump(dados, f, ensure_ascii=False, indent=2)
+    os.replace(caminho_tmp, caminho)
+
+
+def _montar_prompt_evolucao_operacional(resumo_dados: str) -> str:
+    """Prompt do Mentor de IA — análise retrospectiva do Diário. Tom
+    DIRETO e objetivo (decisão do Jesué, 2026-07-30): números primeiro,
+    sem enrolação motivacional, nunca inventando detalhe que não esteja no
+    resumo de dados."""
+    return f"""Você é o mentor de trading do Jesué — day trader de WIN/WDO (mini
+índice e mini dólar, B3), price action puro. Analise a evolução operacional
+dele com base SOMENTE nos dados abaixo (nunca invente detalhe, número ou
+trade que não esteja aqui).
+
+---DADOS DO DIÁRIO---
+{resumo_dados}
+---
+
+Responda em 3 blocos curtos, tom DIRETO e objetivo — fatos e números
+primeiro, sem enrolação motivacional:
+
+1. CURVA DE APRENDIZAGEM: o que mudou entre a 1ª e a 2ª metade das
+   operações? Cite os números.
+2. EVOLUÇÃO OPERACIONAL/ESTRATÉGICA: o que está funcionando de verdade
+   (setup, disciplina) e o que continua vazando resultado?
+3. PRÓXIMOS PASSOS: 1-2 ações concretas e específicas, baseadas nos
+   números acima — não genéricas.
+
+Máximo 250 palavras. Nunca apresente probabilidade como certeza."""
+
+
+def gerar_analise_evolucao_operacional(resumo_dados: str, modelo: str | None = None) -> dict:
+    """Gera a análise retrospectiva do Mentor de IA e já GRAVA no cache
+    (`_salvar_analise_diaria`) se a chamada for bem-sucedida — quem chama
+    (a callback da UI) não precisa se preocupar em persistir. `resumo_dados`
+    vem de `diario_trade.montar_resumo_para_mentor_ia()`; passado como
+    parâmetro (não buscado aqui) pra manter este módulo sem acoplamento
+    direto a quando/como o Diário monta o resumo.
+
+    Retorna o mesmo formato de dict de `analisar_com_pergunta_raw`
+    (texto/tokens_usados/modelo_usado/erro/erro_429), sem side-effect no
+    cache se vier erro — só sucesso é cacheado, senão um 429 temporário
+    "gastaria" a cota do dia sem nunca ter mostrado nada ao Jesué."""
+    if not resumo_dados.strip():
+        return {"erro": "Sem operações reais suficientes pra gerar uma análise ainda."}
+    with _lock_analise_diaria() as adquirida:
+        if not adquirida:
+            return {"erro": "Já existe uma geração em andamento — aguarde terminar."}
+        prompt = _montar_prompt_evolucao_operacional(resumo_dados)
+        resultado = _despachar_para_modelo(prompt, modelo)
+        if resultado.get("texto"):
+            _salvar_analise_diaria({
+                "data": datetime.now().date().isoformat(),
+                "texto": resultado["texto"],
+                "modelo_usado": resultado.get("modelo_usado", modelo or "gemini"),
+                "tokens_usados": resultado.get("tokens_usados", 0),
+                "gerado_em": datetime.now().isoformat(),
+            })
+        return resultado

@@ -47,6 +47,7 @@ import persistencia
 import diario_trade as dt
 import tracados
 import gerenciador_processos as gp
+import ai_analyst
 from metricas import extrair_metricas, montar_snapshot_diario, analisar_tracados
 
 PORTA_PROPRIA = 8053
@@ -1788,12 +1789,71 @@ def _card_estrategia_destaque(titulo: str, emoji: str, info: dict | None, cor_bo
               'border': f'2px solid {cor_borda}', 'borderRadius': '10px'})
 
 
+def _conteudo_mentor_ia(cache: dict | None) -> html.Div:
+    """Corpo do bloco Mentor de IA — texto cacheado (se houver) ou aviso de
+    que ainda não foi gerado. Usado tanto no render inicial quanto como
+    retorno da callback, pra manter os dois caminhos idênticos."""
+    if not cache or not cache.get('texto'):
+        return html.Div('Ainda não gerada. Clique em "Gerar análise de hoje".',
+                        style={'fontSize': '12px', 'color': C['text2']})
+    gerado_em = cache.get('gerado_em', '')
+    try:
+        horario = datetime.fromisoformat(gerado_em).strftime('%d/%m %H:%M')
+    except ValueError:
+        horario = gerado_em
+    return html.Div([
+        dcc.Markdown(cache['texto'], style={'fontSize': '13px', 'lineHeight': '1.6'}),
+        html.Div(f"Gerado em {horario} · {cache.get('modelo_usado', '')} · "
+                 f"{cache.get('tokens_usados', 0)} tokens",
+                 style={'fontSize': '10px', 'color': C['text2'], 'marginTop': '8px'}),
+    ])
+
+
+def _bloco_mentor_ia() -> html.Div:
+    """Mentor de IA — análise retrospectiva diária (item D, "upgrade
+    diario.docx", 2026-07-30): curva de aprendizagem, evolução operacional/
+    estratégica, próximos passos, tom DIRETO e objetivo. Reusa o MESMO hub
+    Gemini/OpenRouter do chat (`ai_analyst._despachar_para_modelo`), nunca
+    uma chamada própria.
+
+    Cadência de 1x/dia é só uma SUGESTÃO da UI (rótulo do botão muda pra
+    "Gerar nova análise" depois da 1ª geração do dia) — nunca um bloqueio,
+    porque o Jesué pode querer regenerar manualmente. O botão em si nunca é
+    recriado por sua própria callback (evitaria resetar n_clicks) — só o
+    `children` de `diario-mentor-ia-conteudo` e o rótulo do botão mudam."""
+    cache = ai_analyst.carregar_analise_diaria()
+    hoje = date.today().isoformat()
+    ja_gerou_hoje = bool(cache) and cache.get('data') == hoje
+    return html.Div([
+        html.Div([
+            html.Span('🧭 Mentor de IA — Evolução Operacional', style={
+                'fontSize': '13px', 'fontWeight': '700', 'fontFamily': FONTS['display'],
+            }),
+            html.Button(
+                'Gerar nova análise' if ja_gerou_hoje else 'Gerar análise de hoje',
+                id='btn-gerar-mentor-ia', n_clicks=0, style={
+                    'background': 'transparent', 'color': C['text2'],
+                    'border': f'1px solid {C["border"]}', 'borderRadius': '6px',
+                    'padding': '5px 12px', 'cursor': 'pointer', 'fontSize': '11px',
+                    'marginLeft': '14px',
+                }),
+        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '10px'}),
+        dcc.Loading(
+            id='loading-mentor-ia', type='dot', color=C['gold'],
+            children=html.Div(_conteudo_mentor_ia(cache), id='diario-mentor-ia-conteudo'),
+        ),
+    ], style={'padding': '14px', 'background': C['panel'], 'border': f'1px solid {C["border"]}',
+              'borderRadius': '10px', 'marginTop': '14px'})
+
+
 def _bloco_analise_estrategia(stats_geral: dict) -> html.Div:
     """Painel "Análise de Estratégia" — pedido do docx: "junte os blocos Por
     Ativo, Por Janela, Por Sala/Análise e Por Tags Setup/Erro num painel de
     dashboard estatístico, adicionando melhor estratégia por horário/
     direção/ativo/categoria; destaque a Estratégia Vencedora (troféu/
-    medalha) e a Perdedora"."""
+    medalha) e a Perdedora". O Mentor de IA (item D) também vive aqui dentro
+    — pedido explícito do docx: "ainda dentro da Análise de Estratégias
+    crie um bloco [do Mentor]"."""
     analise = dt.analise_estrategia()
     rotulos_janela = {k: _formatar_janela(k) for k in cfg.JANELAS_PREGAO}
     return html.Div([
@@ -1818,6 +1878,7 @@ def _bloco_analise_estrategia(stats_geral: dict) -> html.Div:
             _bloco_breakdown_diario('Por Sala/Análise', stats_geral['por_sala']),
             _bloco_breakdown_diario('Por Tags Setup/Erro', stats_geral['por_tags_setup_erro']),
         ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+        _bloco_mentor_ia(),
     ])
 
 
@@ -3689,6 +3750,28 @@ def resumir_checklist(marcados):
         return f'✔ {n}/{total} — dentro do plano.', {**base, 'color': C['green']}
     return (f'{n}/{total} conferidos — faltam {total - n}.',
             {**base, 'color': C['text2'] if n else C['text2']})
+
+
+@app.callback(
+    Output('diario-mentor-ia-conteudo', 'children'),
+    Output('btn-gerar-mentor-ia', 'children'),
+    Input('btn-gerar-mentor-ia', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def gerar_mentor_ia(n_clicks):
+    """Gera (ou regenera) a análise do Mentor de IA. Bloqueante — mesma
+    convenção do chat de IA (`enviar_mensagem_chat` em dashboard.py): não
+    há um segundo round-trip, o callback só retorna quando a resposta real
+    (ou erro) chega. `dcc.Loading` cobre a espera."""
+    if not n_clicks:
+        return no_update, no_update
+    resumo = dt.montar_resumo_para_mentor_ia()
+    resultado = ai_analyst.gerar_analise_evolucao_operacional(resumo)
+    if resultado.get('erro'):
+        conteudo = html.Div(f"⚠ {resultado['erro']}", style={'fontSize': '12px', 'color': C['red']})
+        return conteudo, no_update
+    cache = ai_analyst.carregar_analise_diaria()
+    return _conteudo_mentor_ia(cache), 'Gerar nova análise'
 
 
 @app.callback(

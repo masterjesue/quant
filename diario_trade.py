@@ -1511,6 +1511,89 @@ def _nomes_de_slugs(slugs) -> list[str]:
     return [mapa.get(s, s.replace("_", " ").title()) for s in slugs]
 
 
+def montar_resumo_para_mentor_ia(ate_data: date | None = None) -> str:
+    """
+    Resumo compacto do Diário pro Mentor de IA (item D, "upgrade
+    diario.docx", 2026-07-30): "análise interpretativa do meu operacional,
+    analisando curva de aprendizagem, evolução operacional/estratégica e
+    próximos passos". Texto puro, pronto pra entrar no prompt — nenhuma
+    chamada de API mora aqui, só a extração/formatação do dado.
+
+    `ate_data` corta o recorte em "até ontem" por padrão — a análise é
+    retrospectiva ("uma vez ao dia, analisando do dia anterior pra trás"),
+    então as operações do dia CORRENTE (ainda em andamento) não devem
+    entrar, senão o relatório de manhã incluiria um dia que mal começou.
+
+    Devolve string vazia se não houver trades reais no recorte — quem
+    chama (`ai_analyst.gerar_analise_evolucao_operacional`) decide o que
+    fazer (não vale gastar uma chamada de API pra analisar nada).
+    """
+    if ate_data is None:
+        ate_data = date.today() - timedelta(days=1)
+    todos = listar_trades(is_simulated=False, data_fim=ate_data)
+    if todos.empty:
+        return ""
+
+    stats = calcular_estatisticas(df=todos)
+    analise = analise_estrategia(df=todos)
+    nomes = {str(r["slug"]): r["nome"] for _, r in listar_estrategias(somente_ativas=False).iterrows()}
+
+    # Curva de aprendizagem: 1ª metade das OPERAÇÕES x 2ª metade (por
+    # contagem, não por tempo corrido — um mês com poucos trades não
+    # distorce a comparação do jeito que "primeiro mês x resto" distorceria).
+    ordenado = todos.sort_values("data_op")
+    corte = len(ordenado) // 2
+    primeira, segunda = ordenado.iloc[:corte], ordenado.iloc[corte:]
+
+    def _resumo_fase(fase: pd.DataFrame) -> str:
+        if fase.empty:
+            return "sem dados"
+        saldo = float(fase["saldo_operacao_reais"].sum())
+        acerto = float((fase["saldo_operacao_reais"] > 0).mean() * 100)
+        return f"{len(fase)} operações, R$ {saldo:+.2f}, {acerto:.0f}% de acerto"
+
+    # Overtrading (mesmo critério do estudo de 2026-07-30 e do guarda-corpo
+    # do dia): dias com 4+ operações reais.
+    por_dia = ordenado.groupby("data_op").size()
+    dias_overtrading = int((por_dia >= 4).sum())
+    dias_normais = int((por_dia <= 2).sum())
+
+    ranking = sorted(stats["por_estrategia"].items(), key=lambda kv: kv[1]["saldo"], reverse=True)
+    top = ranking[:3]
+    piores = ranking[-3:] if len(ranking) > 3 else []
+
+    linhas = [
+        f"PERÍODO: {todos['data_op'].min()} a {ate_data.isoformat()} ({len(todos)} operações reais)",
+        f"SALDO TOTAL: R$ {stats['saldo_total']:+.2f} | Taxa de acerto: {stats['taxa_acerto'] * 100:.1f}% | "
+        f"Payoff: {stats['payoff']:.2f}" if stats["payoff"] is not None
+        else f"SALDO TOTAL: R$ {stats['saldo_total']:+.2f} | Taxa de acerto: {stats['taxa_acerto'] * 100:.1f}%",
+        "",
+        "CURVA DE APRENDIZAGEM (1ª metade das operações vs 2ª metade):",
+        f"  1ª metade: {_resumo_fase(primeira)}",
+        f"  2ª metade: {_resumo_fase(segunda)}",
+        "",
+        f"DISCIPLINA: {dias_overtrading} dia(s) com 4+ operações (overtrading) "
+        f"de {por_dia.size} dias operados; {dias_normais} dia(s) com 1-2 operações.",
+        "",
+    ]
+    if analise["vencedora"]:
+        v = analise["vencedora"]
+        linhas.append(f"ESTRATÉGIA VENCEDORA GERAL: {nomes.get(v['estrategia'], v['estrategia'])} "
+                      f"— R$ {v['saldo']:+.2f} em {v['n']} operações")
+    if analise["perdedora"]:
+        p = analise["perdedora"]
+        linhas.append(f"ESTRATÉGIA PERDEDORA GERAL: {nomes.get(p['estrategia'], p['estrategia'])} "
+                      f"— R$ {p['saldo']:+.2f} em {p['n']} operações")
+    if top:
+        linhas.append("TOP 3 ESTRATÉGIAS POR SALDO: " + "; ".join(
+            f"{nomes.get(tag, tag)} (R$ {v['saldo']:+.2f}, n={v['n']})" for tag, v in top))
+    if piores:
+        linhas.append("3 PIORES ESTRATÉGIAS POR SALDO: " + "; ".join(
+            f"{nomes.get(tag, tag)} (R$ {v['saldo']:+.2f}, n={v['n']})" for tag, v in piores))
+
+    return "\n".join(linhas)
+
+
 def _parear_hedge_deals(posicoes: pd.DataFrame) -> pd.DataFrame:
     """
     Funde pares de posições opostas (long+short, mesmo `raiz_contrato` e

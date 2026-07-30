@@ -132,13 +132,44 @@ você confirme**: (a) qual é o corte de data exato entre "julho sem registro
 heurística me faltando contexto que só você tem (estado emocional, se
 lembra de detalhes específicos de algum trade).
 
-### D. Mentor de IA — análise interpretativa diária
-Bloco novo dentro de Análise de Estratégias, usando `ai_analyst.py`/Gemini:
-curva de aprendizagem, evolução operacional/estratégica, próximos passos.
-"Para controle de tokens, uma vez ao dia, analisando do dia anterior pra
-trás." Isso é uma feature nova com custo de API recorrente — cabe confirmar
-o escopo exato (o que exatamente entra no prompt, tamanho do contexto) antes
-de implementar, não só a cadência.
+### D. Mentor de IA — análise interpretativa diária — ✅ CONCLUÍDO (2026-07-30)
+
+Bloco novo dentro de "Análise de Estratégia", reusando o MESMO hub
+Gemini/OpenRouter do chat (`ai_analyst._despachar_para_modelo`, extraído de
+`analisar_com_pergunta_raw` — decisão explícita do Jesué: "lembra que
+estamos usando um hub de IA e não somente o Gemini"), nunca uma chamada de
+API própria.
+
+- `dt.montar_resumo_para_mentor_ia(ate_data=None)` — resumo textual puro
+  (default: até ontem, "para controle de tokens... analisando do dia
+  anterior pra trás"): curva de aprendizagem (1ª vs 2ª metade), disciplina
+  (dias com 4+ operações), top 3 / piores 3 estratégias, vencedora/
+  perdedora geral. Testado em `testes/teste_resumo_mentor_ia.py`.
+- `ai_analyst.gerar_analise_evolucao_operacional(resumo, modelo=None)` —
+  monta o prompt (tom DIRETO e objetivo, decisão do Jesué; 3 blocos: CURVA
+  DE APRENDIZAGEM / EVOLUÇÃO OPERACIONAL-ESTRATÉGICA / PRÓXIMOS PASSOS;
+  "nunca apresente probabilidade como certeza"), despacha pelo hub, e só
+  cacheia em disco (`mentor_analise_diaria.json`, escrita atômica +
+  trava O_EXCL) se vier sucesso — um 429 temporário não gasta a "cota do
+  dia" sem nunca ter mostrado nada.
+- UI em `diario_app_classico.py` (`_bloco_mentor_ia`): botão estático
+  ("Gerar análise de hoje" → "Gerar nova análise" depois da 1ª geração do
+  dia — só um RÓTULO, nunca um bloqueio real, pra permitir regeração
+  manual), `dcc.Loading` cobrindo a chamada bloqueante, callback
+  `gerar_mentor_ia`.
+- **Verificado com chamada real de API** (aprovação explícita do Jesué:
+  "Sim, pode chamar a API para testar a chamada real"): rodou 2x contra os
+  225 trades reais da base, `gemini-2.5-flash`, ~415-437 tokens por
+  chamada, texto coerente e no tom pedido, sem inventar números fora do
+  resumo. Confirmado ao vivo no navegador (clique real no botão, resposta
+  renderizada, cache lido de volta).
+- **Achado de ambiente durante a verificação** (não é bug de código): o
+  processo filho `diario_app_classico.py` NÃO recarrega sozinho quando o
+  arquivo muda no disco (sem reloader) — depois de editar o arquivo com o
+  processo já no ar, foi preciso matar e resubir `dashboard.py` (que
+  relança o filho) pra ver o código novo valendo. Vale lembrar em sessões
+  futuras: se uma mudança de UI "não aparece" mesmo sem erro nenhum, checar
+  se os 2 processos foram reiniciados DEPOIS da última edição salva.
 
 ### E. Auditoria de UX
 "Faça uma análise de UX dessa seção de Estratégia, veja o que pode ser
