@@ -171,10 +171,55 @@ API própria.
   futuras: se uma mudança de UI "não aparece" mesmo sem erro nenhum, checar
   se os 2 processos foram reiniciados DEPOIS da última edição salva.
 
-### E. Auditoria de UX
+### E. Auditoria de UX — ✅ ANALISADO (2026-07-30), aguardando decisão de escopo
+
 "Faça uma análise de UX dessa seção de Estratégia, veja o que pode ser
-ilustrado com gráficos e recursos visuais." — depende de A-D estarem
-definidos primeiro (não dá pra revisar UX de algo que ainda não existe).
+ilustrado com gráficos e recursos visuais." Auditoria feita sobre as duas
+superfícies reais (aba Estatísticas: Análise de Estratégia + Confiabilidade
+por Estratégia + Mentor de IA; aba Estratégias: cadastro/CRUD). Achados:
+
+**Alto valor, baixo custo, não conflita com a direção TradeZella (o F usa o
+mesmo tipo de gráfico):**
+1. "Confiabilidade por Estratégia" é uma tabela de 27 linhas só de números
+   — sem hierarquia visual além da cor do saldo. Um **gráfico de barras
+   horizontais de Saldo por Estratégia** (mesmo dado, ordenado) transforma
+   scan de tabela em leitura instantânea de ranking.
+2. "Melhor por Direção" (Compra vs Venda) hoje é uma mini-tabela de 2
+   linhas — é exatamente o achado do estudo de 2026-07-30 (compra perde o
+   ano, venda empata) e pede um **gráfico de barras divergente** (2 barras,
+   uma pra cada lado do zero), não uma tabela.
+
+**Médio valor, provavelmente melhor esperar o redesenho (F já pede troca de
+biblioteca/estilo visual, faria sentido nascer lá):**
+3. Coluna "Score" (`_linhas_confiabilidade_estrategia`,
+   `diario_app_classico.py:2036`) é só um número colorido — poderia virar
+   uma barra/gauge inline por linha (padrão comum em dashboards estilo
+   TradeZella).
+4. "Melhor por Horário/Ativo/Categoria" (mesmo padrão de mini-tabela de 2
+   linhas) — mesmo raciocínio do item 2, mas menor urgência.
+
+**Já adequado, não mexer:**
+- Vencedora/Perdedora (cards com troféu/medalha) — já é o tratamento visual
+  certo pro que representa.
+- Evolução de Saldo — já é gráfico de linha.
+- Mentor de IA — texto é o formato certo (é uma leitura interpretativa, não
+  um dado tabular).
+- Aba Estratégias (cadastro) — é um CRUD/registro, não uma superfície de
+  análise; investimento visual não se aplica aqui.
+
+**Achado incidental, fora do escopo desta auditoria** (aba Bem-Estar, não
+Estratégia): tags emocionais com duplicata/typo — "tranquiidade" (sem o
+"l") e "tranquilidade" cadastradas as duas, mistura de maiúsculas/minúsculas
+inconsistente entre as tags. Não corrigido agora — fica anotado pra uma
+limpeza futura de cadastro, não é uma questão de UX de gráficos.
+
+**Decisão do Jesué (2026-07-30): "melhor esperar o redesenho (item F)".**
+Nenhum gráfico novo entra agora — os itens 1-4 acima (barras de Saldo por
+Estratégia, divergente de Compra/Venda, Score como gauge, Melhor por
+Horário/Ativo/Categoria) ficam registrados aqui como INPUT direto pro
+redesenho TradeZella, não implementação solta antes dele. Item E fica
+CONCLUÍDO como auditoria (análise entregue, escopo de implementação
+explicitamente adiado).
 
 ### F. Segunda iniciativa, maior e separada: clonar o dashboard do TradeZella
 - Pesquisar o sistema de diário do TradeZella (docx já anexa 3 screenshots
