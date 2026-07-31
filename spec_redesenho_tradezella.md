@@ -408,3 +408,15 @@ cards + "gráficos não mudaram" + pergunta sobre o Fator de Recuperação) —
   Recuperação -0.39" batendo com dado real (saldo -180/drawdown -458) +
   inspeção de `fig.data` das 2 figuras Plotly da página + nenhum erro no
   console.
+
+**Bloco Trades Recentes** (2026-07-31, feedback: "você não está mostrando
+o bloco de trades recentes no dashboard, como é no TradeZella") —
+adicionado `dt.trades_recentes(n=8)` (só trades reais, ordena por
+`data_op` + `id_trade` como desempate — não há timestamp de execução
+confiável em toda a base) e `_bloco_trades_recentes(tema)` no dashboard,
+posicionado entre o grid Evolução/Calendário e "Análise de Estratégia".
+Nome de estratégia resolvido via `_mapa_nomes_estrategias` (slug→nome de
+exibição) — a 1ª versão mostrava o slug cru (`bounce_em_suporte`), corrigido
+antes de restart final. Verificado ao vivo: 8 linhas reais, ordem
+decrescente por data, nomes de estratégia legíveis, nenhum erro no
+console; suíte completa (11 suítes) passou.
