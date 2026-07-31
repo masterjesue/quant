@@ -362,3 +362,49 @@ TradeZella.") —
   português e os valores batendo com `calcular_estatisticas`; nenhum erro
   no console (nem o já conhecido/inofensivo de parse de cor apareceu
   desta vez).
+
+**2ª rodada do mesmo feedback de espaço vazio + gráficos + Fator de
+Recuperação** (2026-07-31, screenshot novo apontando vão embaixo dos
+cards + "gráficos não mudaram" + pergunta sobre o Fator de Recuperação) —
+
+- Cards do header com só texto (Saldo Líquido/Sequência Atual) sobravam
+  vão em branco embaixo do conteúdo: `SimpleGrid` estica todo card da
+  linha pra altura do card mais alto (o que tem `RingProgress`/barra),
+  mas não centraliza o conteúdo dentro dessa altura. Corrigido com
+  `display:flex, flexDirection:column, justifyContent:center` no
+  `dmc.Card` — confirmado via `getBoundingClientRect`: os 5 cards agora
+  têm 115.2px de altura idêntica, com `topGap`≈`bottomGap` em todos (ex:
+  30.9px/31.0px no card de Saldo Líquido), ou seja, conteúdo realmente
+  centralizado, não só esticado.
+- "Taxa de Acerto" removida do bloco Detalhes ("já tem no cabeçalho, não
+  precisa repetir") — sobrou só Payoff (+ Fator de Recuperação, novo) no
+  grupo Taxas.
+- **Gráfico de Evolução de Saldo não tinha mudado**: era uma linha/
+  preenchimento de UMA cor só (dourado), o resto do redesenho tinha
+  tocado só os cards DMC, não os `dcc.Graph` Plotly. Reescrito pra
+  colorir verde quando o saldo acumulado está >= 0 e vermelho quando <
+  0, com o ponto de cruzamento de zero interpolado matematicamente
+  (`_segmentos_cor_por_sinal`) pra transição limpa exatamente no cruzamento
+  — bate com o equity curve real do TradeZella (verde/vermelho conforme
+  sinal, não cor única). `plot_bgcolor` também alinhado ao `paper_bgcolor`
+  do card (antes usava um cinza de fundo diferente, um resquício do estilo
+  Plotly antigo que destoava do card branco ao redor). Testado com série
+  sintética cruzando zero 3x — 6 segmentos corretos, cores alternando
+  certo, e com dado real (só negativo) rendeu 6 segmentos verde/vermelho
+  no navegador, confirmado via inspeção de `fig.data` (`lineColor`/
+  `fillcolor` de cada trace).
+- **Fator de Recuperação** (saldo total ÷ |drawdown máximo| — quantas
+  vezes o lucro líquido "paga" o pior tombo da conta) já existia como
+  eixo normalizado 0-100 do radar (`recovery_factor` em
+  `calcular_anticovardia_score`), mas nunca aparecia em valor CRU no
+  dashboard. Adicionado `fator_recuperacao` em
+  `diario_trade.calcular_estatisticas` (calculado uma vez, reusado por
+  `calcular_anticovardia_score` em vez de recalculado) + card novo em
+  Detalhes > Taxas. Testado: fórmula bate (`saldo_total/|drawdown|`),
+  `calcular_anticovardia_score` continua funcionando com o campo
+  reaproveitado, `_cards_detalhe_estatisticas` constrói sem erro.
+- Verificado ao vivo: suíte completa (11 suítes rodadas desta vez,
+  scratch dirs do OneDrive limpos) + `get_page_text` mostrando "Fator de
+  Recuperação -0.39" batendo com dado real (saldo -180/drawdown -458) +
+  inspeção de `fig.data` das 2 figuras Plotly da página + nenhum erro no
+  console.
