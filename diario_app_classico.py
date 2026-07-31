@@ -110,6 +110,51 @@ FONTS = {
     'body':    'Inter, system-ui, sans-serif',
 }
 
+# Tokens SÓ da aba Estatísticas (redesenho TradeZella, item F,
+# `spec_redesenho_tradezella.md`) — etapa 1 de um rollout progressivo
+# (Estatísticas -> Diário inteiro -> app inteiro, decisão do Jesué
+# 2026-07-30). NÃO mexe em C/PALETA_GAUGE (usados pelo resto do app, ainda
+# no visual "cockpit" antigo, intacto de propósito até a próxima etapa).
+#
+# Achado da análise das 3 referências reais do TradeZella (`upgrade
+# diario.docx`): tema claro usa célula de calendário PASTEL + texto escuro;
+# tema escuro usa célula SATURADA + texto claro (já bem parecido com o que
+# o Diário tinha) — por isso `TZ_PASTEL_CALENDARIO` só tem entrada 'light'.
+TZ_RAIO_CARD = '14px'
+TZ_RAIO_CELULA = '8px'
+TZ_SOMBRA_CARD = '0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04)'
+TZ_PADDING_CARD = '18px 20px'
+TZ_GAP_GRID = '16px'
+
+TZ_PASTEL_CALENDARIO = {
+    'light': {'green_bg': '#DCFCE7', 'red_bg': '#FEE2E2', 'neutro_bg': '#F1F1F6', 'texto': '#14141C'},
+}
+
+
+def _tz_estilo_card(extra: dict | None = None) -> dict:
+    """Estilo de card do redesenho TradeZella — sombra suave em vez de
+    borda grossa, cantos bem arredondados, padding generoso. Reaproveita
+    `C['panel']` (já existente) como fundo, só troca a moldura."""
+    base = {
+        'background': C['panel'], 'borderRadius': TZ_RAIO_CARD,
+        'boxShadow': TZ_SOMBRA_CARD, 'padding': TZ_PADDING_CARD,
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
+def _tz_badge_icone(emoji: str, cor_fundo: str, tamanho: int = 32) -> html.Span:
+    """Emoji dentro de um badge circular pequeno, em vez de solto no meio
+    do texto — mesmo espírito dos ícones de linha fina do TradeZella (ⓘ,
+    engrenagem): reduz o peso visual do emoji sem abrir mão da
+    expressividade."""
+    return html.Span(emoji, style={
+        'display': 'inline-flex', 'alignItems': 'center', 'justifyContent': 'center',
+        'width': f'{tamanho}px', 'height': f'{tamanho}px', 'borderRadius': '50%',
+        'background': cor_fundo, 'fontSize': f'{tamanho * 0.5:.0f}px', 'flexShrink': '0',
+    })
+
 _ABAS_DIARIO_SUB = [
     ('estatisticas', 'Estatísticas'),
     ('posicao', 'Posição'),
@@ -417,6 +462,22 @@ def _bloco_diario(titulo, children) -> html.Div:
         'boxShadow': 'var(--shadow-card)',
         'borderRadius': '10px', 'padding': '14px 16px', 'marginBottom': '16px',
     })
+
+
+def _bloco_tradezella(titulo, children) -> html.Div:
+    """Equivalente a `_bloco_diario`, só que no visual do redesenho
+    TradeZella (item F, etapa 1 do rollout: só a aba Estatísticas por
+    enquanto) — cantos bem arredondados, sombra suave em vez de borda
+    grossa, rótulo em title-case sem caixa alta. NÃO substitui
+    `_bloco_diario` (as outras abas do Diário continuam com ele, sem
+    mudança, até a próxima etapa do rollout)."""
+    return html.Div([
+        html.Div(titulo, style={
+            'fontSize': '13px', 'color': C['text'], 'fontFamily': FONTS['body'],
+            'fontWeight': '600', 'marginBottom': '12px',
+        }),
+        children,
+    ], style=_tz_estilo_card({'marginBottom': TZ_GAP_GRID}))
 
 
 def _estilo_input_diario(extra=None) -> dict:
@@ -1746,19 +1807,21 @@ def _grafico_barra_avg_win_loss(media_ganho: float, media_perda: float, tema: st
 
 
 def _card_header_tradezella(titulo: str, valor_str: str, cor_valor=None, grafico=None) -> html.Div:
+    """Card estilo TradeZella (item F) — título em title-case (não caixa
+    alta), valor em fonte sans-serif normal (`FONTS['body']`, NUNCA
+    monospace — diferente da convenção do resto do app), cantos bem
+    arredondados + sombra suave em vez de borda grossa (`_tz_estilo_card`).
+    Conferido contra `image1.png` do docx de referência."""
     conteudo = [
-        html.Div(titulo, style={'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['display'],
-                                 'textTransform': 'uppercase', 'letterSpacing': '0.06em', 'marginBottom': '5px'}),
-        html.Div(valor_str, style={'fontSize': '19px', 'fontWeight': '700', 'fontFamily': FONTS['mono'],
+        html.Div(titulo, style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['body'],
+                                 'marginBottom': '6px'}),
+        html.Div(valor_str, style={'fontSize': '20px', 'fontWeight': '700', 'fontFamily': FONTS['body'],
                                     'color': cor_valor or C['text']}),
     ]
     if grafico is not None:
         conteudo.append(dcc.Graph(figure=grafico, config={'displayModeBar': False},
                                    style={'marginTop': '2px'}))
-    return html.Div(conteudo, style={
-        'background': C['panel'], 'border': f'1px solid {C["border"]}', 'borderRadius': '10px',
-        'padding': '12px 14px', 'flex': '1', 'minWidth': '160px',
-    })
+    return html.Div(conteudo, style=_tz_estilo_card({'flex': '1', 'minWidth': '160px'}))
 
 
 def _cards_header_tradezella(stats: dict, tema: str) -> html.Div:
@@ -1798,23 +1861,33 @@ def _cards_header_tradezella(stats: dict, tema: str) -> html.Div:
     if streak['tipo'] is None:
         streak_str, cor_streak = '—', None
     else:
-        emoji = '🔥' if streak['tipo'] == 'win' else '❄'
         cor_streak = C['green'] if streak['tipo'] == 'win' else C['red']
         rotulo_trades = 'trade' if streak['trades'] == 1 else 'trades'
-        streak_str = f"{emoji} {streak['trades']} {rotulo_trades} ({streak['dias']} dia(s))"
-    card_streak = _card_header_tradezella('Current Streak', streak_str, cor_valor=cor_streak)
+        streak_str = f"{streak['trades']} {rotulo_trades} ({streak['dias']} dia(s))"
+    badge_streak = _tz_badge_icone('🔥' if streak['tipo'] == 'win' else '❄',
+                                    cor_streak or C['border'], tamanho=24) if streak['tipo'] else None
+    card_streak = _card_header_tradezella(
+        'Current Streak',
+        html.Div([badge_streak, html.Span(streak_str, style={'marginLeft': '8px'})],
+                  style={'display': 'flex', 'alignItems': 'center'}) if badge_streak else streak_str,
+        cor_valor=cor_streak,
+    )
 
     return html.Div([card_net_pnl, card_win_pct, card_avg_win_loss, card_profit_factor, card_streak],
-                     style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '14px'})
+                     style={'display': 'flex', 'gap': TZ_GAP_GRID, 'flexWrap': 'wrap', 'marginBottom': TZ_GAP_GRID})
 
 
 def _card_estatistica(titulo: str, valor: str, cor=None) -> html.Div:
+    """Card de detalhe (grupos Quantidade/Taxas/Valores) — mesma linguagem
+    visual TradeZella dos cards do header (title-case, fonte sem
+    monospace, cantos arredondados + sombra), só menor/mais compacto por
+    ser um dado secundário."""
     return html.Div([
-        html.Div(titulo, style={'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['display'],
-                                 'textTransform': 'uppercase', 'letterSpacing': '0.06em', 'marginBottom': '5px'}),
-        html.Div(valor, style={'fontSize': '17px', 'fontWeight': '700', 'fontFamily': FONTS['mono'],
+        html.Div(titulo, style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['body'],
+                                 'marginBottom': '4px'}),
+        html.Div(valor, style={'fontSize': '16px', 'fontWeight': '700', 'fontFamily': FONTS['body'],
                                 'color': cor or C['text']}),
-    ], style={'background': C['bg'], 'border': f'1px solid {C["border"]}', 'borderRadius': '8px',
+    ], style={'background': C['bg'], 'borderRadius': TZ_RAIO_CELULA,
               'padding': '10px 14px', 'minWidth': '120px'})
 
 
@@ -1823,15 +1896,15 @@ def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
         html.Div([
             html.Span(chave.replace('_', ' ').title(), style={'flex': '1', 'fontSize': '12px'}),
             html.Span(str(v['n']), style={'width': '34px', 'textAlign': 'right', 'fontSize': '12px',
-                                           'fontFamily': FONTS['mono']}),
+                                           'fontFamily': FONTS['body']}),
             html.Span(f"R$ {v['saldo']:+.0f}", style={
-                'width': '90px', 'textAlign': 'right', 'fontSize': '12px', 'fontFamily': FONTS['mono'],
+                'width': '90px', 'textAlign': 'right', 'fontSize': '12px', 'fontFamily': FONTS['body'],
                 'color': C['green'] if v['saldo'] > 0 else (C['red'] if v['saldo'] < 0 else C['text2']),
             }),
         ], style={'display': 'flex', 'padding': '4px 0', 'borderBottom': f'1px solid {C["border"]}'})
         for chave, v in dados.items()
     ] or [html.Div('Sem dados.', style={'fontSize': '12px', 'color': C['text2']})]
-    return _bloco_diario(titulo, html.Div(linhas))
+    return _bloco_tradezella(titulo, html.Div(linhas))
 
 
 # ---------------------------------------------------------------------------
@@ -1869,16 +1942,19 @@ def _tabela_melhor_por(titulo: str, dados: dict, rotulos_grupo: dict | None = No
                 html.Span(nome_estrategia, style={'flex': '1.3', 'fontSize': '12px', 'fontWeight': '600'}),
                 html.Span(f"R$ {saldo:+.0f} ({info['n']})", style={
                     'width': '110px', 'textAlign': 'right', 'fontSize': '12px',
-                    'fontFamily': FONTS['mono'], 'color': cor,
+                    'fontFamily': FONTS['body'], 'color': cor,
                 }),
             ], style={'display': 'flex', 'padding': '4px 0', 'borderBottom': f'1px solid {C["border"]}'}))
-    return _bloco_diario(titulo, html.Div(linhas))
+    return _bloco_tradezella(titulo, html.Div(linhas))
 
 
 def _card_estrategia_destaque(titulo: str, emoji: str, info: dict | None, cor_borda: str) -> html.Div:
     """Estratégia Vencedora/Perdedora, destacada de forma ilustrada (pedido
     explícito do docx: "coloque em destaque de forma ilustrativa — por
-    exemplo, um troféu ou medalha")."""
+    exemplo, um troféu ou medalha"). Emoji vira badge circular pequeno
+    (`_tz_badge_icone`) em vez de solto no texto, título em title-case,
+    números em `FONTS['body']` — mesma linguagem visual TradeZella do
+    resto da aba Estatísticas."""
     nomes = _mapa_nomes_estrategias()
     if info is None:
         conteudo = html.Div(f'Amostra insuficiente ainda (mínimo {dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA} trades).',
@@ -1888,20 +1964,19 @@ def _card_estrategia_destaque(titulo: str, emoji: str, info: dict | None, cor_bo
         saldo = info['saldo']
         cor_saldo = C['green'] if saldo > 0 else (C['red'] if saldo < 0 else C['text2'])
         conteudo = html.Div([
-            html.Div(nome, style={'fontSize': '16px', 'fontWeight': '700', 'fontFamily': FONTS['display']}),
+            html.Div(nome, style={'fontSize': '16px', 'fontWeight': '700', 'fontFamily': FONTS['body']}),
             html.Div(f"R$ {saldo:+.2f} em {info['n']} operações", style={
-                'fontSize': '13px', 'fontFamily': FONTS['mono'], 'color': cor_saldo, 'marginTop': '4px',
+                'fontSize': '13px', 'fontFamily': FONTS['body'], 'color': cor_saldo, 'marginTop': '4px',
             }),
         ])
     return html.Div([
         html.Div([
-            html.Span(emoji, style={'fontSize': '26px', 'marginRight': '10px', 'lineHeight': '1'}),
-            html.Span(titulo, style={'fontSize': '11px', 'color': C['text2'], 'textTransform': 'uppercase',
-                                     'letterSpacing': '0.06em', 'fontFamily': FONTS['display']}),
-        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '8px'}),
+            _tz_badge_icone(emoji, f'color-mix(in srgb, {cor_borda} 15%, transparent)'),
+            html.Span(titulo, style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['body'],
+                                     'fontWeight': '600', 'marginLeft': '10px'}),
+        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '10px'}),
         conteudo,
-    ], style={'flex': '1', 'minWidth': '220px', 'padding': '14px', 'background': C['panel'],
-              'border': f'2px solid {cor_borda}', 'borderRadius': '10px'})
+    ], style=_tz_estilo_card({'flex': '1', 'minWidth': '220px'}))
 
 
 def _conteudo_mentor_ia(cache: dict | None) -> html.Div:
@@ -1941,24 +2016,24 @@ def _bloco_mentor_ia() -> html.Div:
     ja_gerou_hoje = bool(cache) and cache.get('data') == hoje
     return html.Div([
         html.Div([
-            html.Span('🧭 Mentor de IA — Evolução Operacional', style={
-                'fontSize': '13px', 'fontWeight': '700', 'fontFamily': FONTS['display'],
+            _tz_badge_icone('🧭', f'color-mix(in srgb, {C["gold"]} 15%, transparent)', tamanho=28),
+            html.Span('Mentor de IA — Evolução Operacional', style={
+                'fontSize': '14px', 'fontWeight': '600', 'fontFamily': FONTS['body'], 'marginLeft': '10px',
             }),
             html.Button(
                 'Gerar nova análise' if ja_gerou_hoje else 'Gerar análise de hoje',
                 id='btn-gerar-mentor-ia', n_clicks=0, style={
                     'background': 'transparent', 'color': C['text2'],
-                    'border': f'1px solid {C["border"]}', 'borderRadius': '6px',
-                    'padding': '5px 12px', 'cursor': 'pointer', 'fontSize': '11px',
+                    'border': f'1px solid {C["border"]}', 'borderRadius': '20px',
+                    'padding': '6px 14px', 'cursor': 'pointer', 'fontSize': '11px',
                     'marginLeft': '14px',
                 }),
-        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '10px'}),
+        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '12px'}),
         dcc.Loading(
             id='loading-mentor-ia', type='dot', color=C['gold'],
             children=html.Div(_conteudo_mentor_ia(cache), id='diario-mentor-ia-conteudo'),
         ),
-    ], style={'padding': '14px', 'background': C['panel'], 'border': f'1px solid {C["border"]}',
-              'borderRadius': '10px', 'marginTop': '14px'})
+    ], style=_tz_estilo_card({'marginTop': TZ_GAP_GRID}))
 
 
 # ---------------------------------------------------------------------------
@@ -2003,8 +2078,31 @@ def _grafico_radar_anticovardia(eixos: dict, tema: str) -> go.Figure:
     return fig
 
 
+def _interpolar_hex(cor_a: str, cor_b: str, t: float) -> str:
+    a, b = cor_a.lstrip('#'), cor_b.lstrip('#')
+    r = round(int(a[0:2], 16) + (int(b[0:2], 16) - int(a[0:2], 16)) * t)
+    g = round(int(a[2:4], 16) + (int(b[2:4], 16) - int(a[2:4], 16)) * t)
+    bl = round(int(a[4:6], 16) + (int(b[4:6], 16) - int(a[4:6], 16)) * t)
+    return f'#{r:02x}{g:02x}{bl:02x}'
+
+
+def _gradiente_score_steps(p: dict, n_estagios: int = 14) -> list:
+    """Degradê vermelho→amarelo→verde em N faixas finas — Plotly não tem
+    gradiente contínuo nativo em `gauge.steps` (só faixas discretas), mas
+    com faixas finas o olho lê como contínuo. Mais fiel à barra real do
+    TradeZella (`image1.png`, gradiente liso) do que 3 faixas grossas."""
+    largura = 100.0 / n_estagios
+    faixas = []
+    for i in range(n_estagios):
+        t = i / (n_estagios - 1)
+        cor = _interpolar_hex(p['red'], p['yellow'], t / 0.5) if t <= 0.5 \
+            else _interpolar_hex(p['yellow'], p['green'], (t - 0.5) / 0.5)
+        faixas.append({'range': [i * largura, (i + 1) * largura], 'color': cor})
+    return faixas
+
+
 def _grafico_barra_score_anticovardia(score: float, tema: str) -> go.Figure:
-    """Barra horizontal com zonas vermelho/amarelo/verde e a posição do
+    """Barra horizontal em degradê vermelho→amarelo→verde com a posição do
     score marcada — mesma leitura visual da barra sob "Your Zella Score"
     no TradeZella (`image1.png`)."""
     p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
@@ -2015,11 +2113,7 @@ def _grafico_barra_score_anticovardia(score: float, tema: str) -> go.Figure:
         gauge={
             'shape': 'bullet',
             'axis': {'range': [0, 100], 'tickfont': {'size': 8, 'color': p['text2']}},
-            'steps': [
-                {'range': [0, 33], 'color': p['red']},
-                {'range': [33, 66], 'color': p['yellow']},
-                {'range': [66, 100], 'color': p['green']},
-            ],
+            'steps': _gradiente_score_steps(p),
             'bar': {'color': p['text'], 'thickness': 0.35},
             'bgcolor': 'rgba(0,0,0,0)', 'borderwidth': 0,
         },
@@ -2034,19 +2128,18 @@ def _bloco_anticovardia_score(tema: str = 'light') -> html.Div:
         return html.Div('Sem trades reais suficientes pra calcular o Anticovardia Score ainda.',
                          style={'fontSize': '12px', 'color': C['text2'], 'marginBottom': '14px'})
     return html.Div([
-        html.Div('ANTICOVARDIA SCORE', style={'fontSize': '11px', 'color': C['text2'],
-                                               'textTransform': 'uppercase', 'letterSpacing': '0.08em',
-                                               'fontFamily': FONTS['display'], 'marginBottom': '6px'}),
+        html.Div('Anticovardia Score', style={'fontSize': '13px', 'color': C['text'],
+                                               'fontWeight': '600', 'fontFamily': FONTS['body'],
+                                               'marginBottom': '8px'}),
         dcc.Graph(figure=_grafico_radar_anticovardia(resultado['eixos'], tema),
                   config={'displayModeBar': False}),
         html.Div(f"Seu Anticovardia Score: {resultado['score']:.1f}", style={
-            'fontSize': '13px', 'fontWeight': '700', 'fontFamily': FONTS['mono'],
-            'color': C['text'], 'marginTop': '4px',
+            'fontSize': '14px', 'fontWeight': '700', 'fontFamily': FONTS['body'],
+            'color': C['text'], 'marginTop': '6px',
         }),
         dcc.Graph(figure=_grafico_barra_score_anticovardia(resultado['score'], tema),
                   config={'displayModeBar': False}),
-    ], style={'padding': '14px', 'background': C['panel'], 'border': f'1px solid {C["border"]}',
-              'borderRadius': '10px', 'marginBottom': '14px', 'maxWidth': '420px'})
+    ], style=_tz_estilo_card({'maxWidth': '420px', 'marginBottom': TZ_GAP_GRID}))
 
 
 def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Div:
@@ -2108,7 +2201,7 @@ def _grafico_evolucao_saldo(stats: dict, tema: str = 'light') -> go.Figure:
         ))
     fig.update_layout(
         paper_bgcolor=p['panel'], plot_bgcolor=p['bg'],
-        font=dict(family=FONTS['mono'], color=p['text2'], size=10),
+        font=dict(family=FONTS['body'], color=p['text2'], size=10),
         margin=dict(l=45, r=10, t=10, b=30), height=200,
         xaxis=dict(showgrid=False, gridcolor=p['border']),
         yaxis=dict(gridcolor=p['border'], gridwidth=0.5, title='R$ acumulado'),
@@ -2121,45 +2214,106 @@ _NOMES_MES = ['', 'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
 _DIAS_SEMANA = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb']
 
 
-def _grade_calendario(por_dia: dict, ano: int, mes: int) -> html.Div:
-    """Grade mensal verde/vermelho/cinza por dia — `html.Div` customizado
-    (mesma razão de `diario_app_98.py::_grade_calendario_98`: sem
-    precedente de Plotly heatmap no projeto, grid casa melhor com o
-    resto da UI dark-cockpit)."""
+# Stats configuráveis por dia no calendário (item F, fase 4,
+# `spec_redesenho_tradezella.md`) — "Ticks" do TradeZella vira "Pontos"
+# aqui (não operamos Forex). Conferido em detalhe contra `image2.png` do
+# docx (anotada, mostra a lista real "Display stats" do produto): Daily
+# P/L É UM TOGGLE de verdade lá (não é fixo como eu tinha assumido antes),
+# então entra na lista igual aos outros — só por padrão vem marcado,
+# porque esconder o R$ da célula sem querer seria uma surpresa ruim.
+# Defaults batem com a referência: R Multiple/Daily P/L/Number of trades/
+# Day Winrate ligados, Ticks (Pontos) desligado.
+_OPCOES_STATS_CALENDARIO = [
+    ('r_multiple', 'R-Multiple'),
+    ('daily_pl', 'Daily P/L'),
+    ('pontos', 'Pontos'),
+    ('n_trades', 'Nº de Trades'),
+    ('winrate', 'Day Winrate'),
+]
+_STATS_CALENDARIO_PADRAO = ['r_multiple', 'daily_pl', 'n_trades', 'winrate']
+
+
+def _grade_calendario(por_dia: dict, detalhe_dias: dict, ano: int, mes: int,
+                       stats_visiveis: list | None = None, tema: str = 'light') -> html.Div:
+    """Grade mensal por dia — `html.Div` customizado (mesma razão de
+    `diario_app_98.py::_grade_calendario_98`: sem precedente de Plotly
+    heatmap no projeto). `detalhe_dias` (`dt.detalhe_dias_calendario`)
+    fornece R-multiple médio/Nº trades/Day Winrate/Pontos por dia — ver
+    `stats_visiveis` (lista de chaves de `_OPCOES_STATS_CALENDARIO`)
+    controlando quais dessas linhas extras aparecem em cada célula. Uma
+    coluna extra por linha de semana soma o saldo + conta os dias operados
+    daquela semana (item F, fase 4: "total semanal na lateral").
+
+    Cor de célula depende do TEMA (item F, redesenho visual TradeZella,
+    conferido nas 3 referências reais do docx): no tema claro
+    (`image1.png`) o TradeZella usa fundo PASTEL + texto escuro; no tema
+    escuro (`image3.png`) usa fundo saturado + texto claro (já bem
+    parecido com o que este calendário sempre teve). Por isso só o tema
+    claro troca de paleta aqui — `TZ_PASTEL_CALENDARIO`."""
+    stats_visiveis = stats_visiveis if stats_visiveis is not None else _STATS_CALENDARIO_PADRAO
+    pastel = TZ_PASTEL_CALENDARIO.get(tema)
     cal = calendar.Calendar(firstweekday=6)  # domingo primeiro
     semanas = cal.monthdayscalendar(ano, mes)
 
     cabecalho = html.Div([
         html.Div(d, style={'flex': '1', 'textAlign': 'center', 'fontSize': '10px',
-                            'color': C['text2'], 'fontFamily': FONTS['display']})
+                            'color': C['text2'], 'fontFamily': FONTS['body']})
         for d in _DIAS_SEMANA
-    ], style={'display': 'flex', 'marginBottom': '4px'})
+    ] + [html.Div('Semana', style={'width': '90px', 'textAlign': 'center', 'fontSize': '10px',
+                                     'color': C['text2'], 'fontFamily': FONTS['body']})],
+        style={'display': 'flex', 'marginBottom': '4px'})
 
     linhas = [cabecalho]
     for semana in semanas:
         celulas = []
+        saldo_semana = 0.0
+        dias_operados_semana = 0
         for dia in semana:
             if dia == 0:
                 celulas.append(html.Div(style={'flex': '1', 'minHeight': '40px', 'margin': '2px'}))
                 continue
             data_iso = f"{ano:04d}-{mes:02d}-{dia:02d}"
             info = por_dia.get(data_iso)
+            detalhe = detalhe_dias.get(data_iso)
             if info is None:
                 bg, cor_texto = C['bg'], C['text2']
             elif info['saldo'] > 0:
-                bg, cor_texto = C['green'], C['bg']
+                bg = pastel['green_bg'] if pastel else C['green']
+                cor_texto = pastel['texto'] if pastel else C['bg']
+                saldo_semana += info['saldo']
+                dias_operados_semana += 1
             elif info['saldo'] < 0:
-                bg, cor_texto = C['red'], C['bg']
+                bg = pastel['red_bg'] if pastel else C['red']
+                cor_texto = pastel['texto'] if pastel else C['bg']
+                saldo_semana += info['saldo']
+                dias_operados_semana += 1
             else:
-                bg, cor_texto = C['border'], C['text2']
-            estilo_celula = {'background': bg, 'border': f'1px solid {C["border"]}', 'borderRadius': '4px',
+                bg = pastel['neutro_bg'] if pastel else C['border']
+                cor_texto = pastel['texto'] if pastel else C['text2']
+                dias_operados_semana += 1
+            estilo_celula = {'background': bg, 'borderRadius': TZ_RAIO_CELULA,
                               'flex': '1', 'minHeight': '40px', 'margin': '2px', 'padding': '4px',
                               'color': cor_texto, 'textAlign': 'center'}
-            conteudo = [
-                html.Div(str(dia), style={'fontSize': '11px'}),
-                html.Div(f"R$ {info['saldo']:+.0f}" if info else '',
-                          style={'fontSize': '10px', 'fontFamily': FONTS['mono']}),
-            ]
+            conteudo = [html.Div(str(dia), style={'fontSize': '11px'})]
+            if info is not None and 'daily_pl' in stats_visiveis:
+                conteudo.append(html.Div(f"R$ {info['saldo']:+.0f}",
+                                          style={'fontSize': '10px', 'fontFamily': FONTS['body'], 'fontWeight': '700'}))
+            if info is not None and detalhe is not None:
+                estilo_extra = {'fontSize': '9px', 'fontFamily': FONTS['body'], 'opacity': '0.85'}
+                if 'n_trades' in stats_visiveis:
+                    conteudo.append(html.Div(f"{detalhe['n']} trade(s)", style=estilo_extra))
+                # R-Multiple e Day Winrate ficam NA MESMA LINHA (conferido em
+                # `image2.png`: "-1.14R, 33.33%" é um texto só, não 2 linhas).
+                partes_linha = []
+                if 'r_multiple' in stats_visiveis:
+                    rm = detalhe['r_multiple_medio']
+                    partes_linha.append(f"{rm:+.2f}R" if rm is not None else '—R')
+                if 'winrate' in stats_visiveis:
+                    partes_linha.append(f"{detalhe['taxa_acerto'] * 100:.1f}%")
+                if partes_linha:
+                    conteudo.append(html.Div(', '.join(partes_linha), style=estilo_extra))
+                if 'pontos' in stats_visiveis:
+                    conteudo.append(html.Div(f"{detalhe['pontos_total']:+.0f}pts", style=estilo_extra))
             if info is not None:
                 # Clicável só quando há operação no dia — navega pro
                 # Histórico já filtrado (ver `clicar_dia_calendario`).
@@ -2167,13 +2321,43 @@ def _grade_calendario(por_dia: dict, ano: int, mes: int) -> html.Div:
                                          n_clicks=0, style={**estilo_celula, 'cursor': 'pointer'}))
             else:
                 celulas.append(html.Div(conteudo, style=estilo_celula))
+        cor_semana = (C['green'] if saldo_semana > 0 else (C['red'] if saldo_semana < 0 else C['text2']))
+        celulas.append(html.Div([
+            html.Div(f"R$ {saldo_semana:+.0f}", style={'fontSize': '11px', 'fontWeight': '700',
+                                                         'fontFamily': FONTS['body'], 'color': cor_semana}),
+            html.Div(f"{dias_operados_semana} dia(s)", style={'fontSize': '9px', 'color': C['text2']}),
+        ], style={'width': '90px', 'minHeight': '40px', 'margin': '2px', 'padding': '4px',
+                  'textAlign': 'center', 'background': C['panel'], 'borderRadius': TZ_RAIO_CELULA,
+                  'boxShadow': TZ_SOMBRA_CARD}))
         linhas.append(html.Div(celulas, style={'display': 'flex'}))
     return html.Div(linhas)
 
 
-def _grade_calendario_anual(por_mes: dict, ano: int) -> html.Div:
+def _conteudo_config_calendario(stats_visiveis: list) -> html.Div:
+    """Painel "Display stats" (item F, fase 4) — mesmo padrão de
+    `_conteudo_checklist_pre_trade` (Checklist de verdade, marcável), só
+    que este PERSISTE a seleção (grava em `store-calendario-stats-
+    visiveis` via `atualizar_stats_visiveis_calendario`), ao contrário do
+    checklist pré-trade que é ritual efêmero de propósito."""
+    return html.Div([
+        html.Div('Stats visíveis por dia', style={'fontSize': '12px', 'fontWeight': '600',
+                                                    'fontFamily': FONTS['body'],
+                                                    'color': C['text'], 'marginBottom': '8px'}),
+        dcc.Checklist(
+            id='diario-cal-config-itens',
+            options=[{'label': rotulo, 'value': chave} for chave, rotulo in _OPCOES_STATS_CALENDARIO],
+            value=stats_visiveis, labelStyle={'display': 'inline-block', 'marginRight': '16px', 'fontSize': '12px',
+                                               'fontFamily': FONTS['body']},
+            inputStyle={'marginRight': '6px'},
+        ),
+    ], style=_tz_estilo_card({'marginBottom': '8px', 'padding': '14px 16px'}))
+
+
+def _grade_calendario_anual(por_mes: dict, ano: int, tema: str = 'light') -> html.Div:
     """Grade 4x3 (um trimestre por linha) com o saldo agregado de cada mês
-    do ano — usada quando o toggle "Ano Corrente" está ligado."""
+    do ano — usada quando o toggle "Ano Corrente" está ligado. Mesma
+    paleta pastel-no-claro/saturado-no-escuro de `_grade_calendario`."""
+    pastel = TZ_PASTEL_CALENDARIO.get(tema)
     linhas = []
     for trimestre in range(4):
         celulas = []
@@ -2183,17 +2367,20 @@ def _grade_calendario_anual(por_mes: dict, ano: int) -> html.Div:
             if info is None:
                 bg, cor_texto = C['bg'], C['text2']
             elif info['saldo'] > 0:
-                bg, cor_texto = C['green'], C['bg']
+                bg = pastel['green_bg'] if pastel else C['green']
+                cor_texto = pastel['texto'] if pastel else C['bg']
             elif info['saldo'] < 0:
-                bg, cor_texto = C['red'], C['bg']
+                bg = pastel['red_bg'] if pastel else C['red']
+                cor_texto = pastel['texto'] if pastel else C['bg']
             else:
-                bg, cor_texto = C['border'], C['text2']
+                bg = pastel['neutro_bg'] if pastel else C['border']
+                cor_texto = pastel['texto'] if pastel else C['text2']
             celulas.append(html.Div([
                 html.Div(_NOMES_MES[mes_num][:3], style={'fontSize': '11px', 'fontWeight': '700'}),
                 html.Div(f"R$ {info['saldo']:+.0f}" if info else '—',
-                          style={'fontSize': '10px', 'fontFamily': FONTS['mono']}),
+                          style={'fontSize': '10px', 'fontFamily': FONTS['body']}),
                 html.Div(f"{info['n']} op." if info else '', style={'fontSize': '9px'}),
-            ], style={'background': bg, 'border': f'1px solid {C["border"]}', 'borderRadius': '4px',
+            ], style={'background': bg, 'borderRadius': TZ_RAIO_CELULA,
                        'flex': '1', 'minHeight': '52px', 'margin': '2px', 'padding': '6px',
                        'color': cor_texto, 'textAlign': 'center'}))
         linhas.append(html.Div(celulas, style={'display': 'flex'}))
@@ -2356,17 +2543,17 @@ def _mini_recorte(titulo: str, dados: dict) -> html.Div:
         html.Div([
             html.Span(str(k).replace('_', ' ').title(), style={'flex': '1', 'fontSize': '11px'}),
             html.Span(str(v['n']), style={'width': '28px', 'textAlign': 'right',
-                                          'fontSize': '11px', 'fontFamily': FONTS['mono']}),
+                                          'fontSize': '11px', 'fontFamily': FONTS['body']}),
             html.Span(f"R$ {v['saldo']:+.0f}", style={
-                'width': '78px', 'textAlign': 'right', 'fontSize': '11px', 'fontFamily': FONTS['mono'],
+                'width': '78px', 'textAlign': 'right', 'fontSize': '11px', 'fontFamily': FONTS['body'],
                 'color': C['green'] if v['saldo'] > 0 else (C['red'] if v['saldo'] < 0 else C['text2']),
             }),
         ], style={'display': 'flex', 'padding': '3px 0'})
         for k, v in dados.items()
     ]
     return html.Div([
-        html.Div(titulo, style={'fontSize': '10px', 'color': C['text2'], 'marginBottom': '3px',
-                                'textTransform': 'uppercase', 'letterSpacing': '0.5px'}),
+        html.Div(titulo, style={'fontSize': '11px', 'color': C['text2'], 'marginBottom': '3px',
+                                'fontWeight': '600'}),
         html.Div(linhas),
     ], style={'flex': '1', 'minWidth': '190px'})
 
@@ -2436,10 +2623,10 @@ def _grupo_cards_estatistica(titulo: str, cards: list) -> html.Div:
     tem seu próprio rótulo e uma borda mais sutil que a dos cards
     individuais, só pra indicar "isto pertence junto"."""
     return html.Div([
-        html.Div(titulo, style={'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['display'],
-                                 'textTransform': 'uppercase', 'letterSpacing': '0.08em', 'marginBottom': '8px'}),
+        html.Div(titulo, style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['body'],
+                                 'fontWeight': '600', 'marginBottom': '10px'}),
         html.Div(cards, style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
-    ], style={'padding': '10px', 'border': f'1px dashed {C["border"]}', 'borderRadius': '10px'})
+    ], style={'padding': '12px', 'borderRadius': TZ_RAIO_CARD, 'background': 'rgba(128,128,128,0.05)'})
 
 
 def _cards_detalhe_estatisticas(stats: dict) -> html.Div:
@@ -2516,7 +2703,7 @@ def _cards_ou_vazio_estatisticas(stats: dict, tema: str = 'light') -> html.Div:
     if stats['num_operacoes']:
         return html.Div([
             _cards_header_tradezella(stats, tema),
-            _bloco_diario('Detalhes', _cards_detalhe_estatisticas(stats)),
+            _bloco_tradezella('Detalhes', _cards_detalhe_estatisticas(stats)),
         ])
     return html.Div('Nenhum trade real neste período.', style={
         'padding': '16px', 'textAlign': 'center', 'color': C['text2'], 'fontSize': '12px',
@@ -2538,7 +2725,7 @@ def _resto_periodo_estatisticas(stats: dict, tema: str = 'light') -> html.Div:
     ALL-TIME, consistentes com o resto daquele painel — só a Evolução de
     Saldo continua reagindo ao seletor de período."""
     return html.Div([
-        _bloco_diario('Evolução de Saldo', dcc.Graph(
+        _bloco_tradezella('Evolução de Saldo', dcc.Graph(
             figure=_grafico_evolucao_saldo(stats, tema), config={'displayModeBar': False},
         )),
     ])
@@ -2576,7 +2763,7 @@ def _bloco_status_badges() -> html.Div:
         badge_ader = html.Span(f"Aderência aos Traçados: {precisos}/{total} trade(s) vistos com precisão pelo motor "
                                 f"(ver coluna no Histórico).", style={'color': C['text']})
 
-    return _bloco_diario('Status', html.Div([
+    return _bloco_tradezella('Status', html.Div([
         html.Div(badge_rec, style={'fontSize': '12px', 'marginBottom': '4px'}),
         html.Div(badge_ader, style={'fontSize': '12px'}),
     ]))
@@ -2605,16 +2792,21 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
     hoje = date.today()
     mes_inicial = f"{hoje.year:04d}-{hoje.month:02d}"
     estilo_botao_nav = {
-        'background': C['panel'], 'color': C['text'], 'border': f'1px solid {C["border"]}',
-        'borderRadius': '4px', 'padding': '2px 10px', 'cursor': 'pointer', 'fontSize': '11px',
+        'background': C['panel'], 'color': C['text'], 'border': 'none',
+        'boxShadow': TZ_SOMBRA_CARD, 'borderRadius': '20px', 'padding': '4px 12px',
+        'cursor': 'pointer', 'fontSize': '11px', 'fontFamily': FONTS['body'],
     }
     return html.Div([
         dcc.Store(id='diario-calendario-mes', data=mes_inicial),
         dcc.Store(id='diario-modo-ano', data=False),
+        # Stats configuráveis por dia no calendário (item F, fase 4) —
+        # persiste entre sessões (mesmo padrão de `store-tema`), já que é
+        # preferência de exibição, não estado de navegação.
+        dcc.Store(id='store-calendario-stats-visiveis', data=_STATS_CALENDARIO_PADRAO, storage_type='local'),
 
         html.Div(id='diario-cards-conteudo'),
 
-        _bloco_diario('Calendário', html.Div([
+        _bloco_tradezella('Calendário', html.Div([
             html.Div([
                 html.Div([
                     html.Button('◀', id='btn-diario-cal-mes-prev', n_clicks=0, style=estilo_botao_nav),
@@ -2636,6 +2828,13 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
                 }),
                 html.Button(html.Div(id='diario-modo-ano-bolinha', style=_estilo_toggle_bolinha(False)),
                             id='btn-diario-modo-ano', n_clicks=0, style=_estilo_toggle_trilho(False)),
+                # Config de stats por dia (item F, fase 4) — botão estático
+                # (mesmo raciocínio de `btn-diario-checklist`: nunca recriado
+                # pela própria callback, só o `children` do painel abaixo
+                # muda) que abre/fecha um `dcc.Checklist`.
+                html.Button('⚙ Stats', id='btn-diario-cal-config', n_clicks=0, style={
+                    **estilo_botao_nav, 'marginLeft': '8px',
+                }),
             ], style={
                 # `flexWrap`: 4 mês + ano viraram grupos separados (feedback
                 # 2026-07-12) — a fileira ficou mais larga que o botão único
@@ -2647,6 +2846,7 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
                 'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'center',
                 'rowGap': '8px', 'marginBottom': '8px',
             }),
+            html.Div(id='diario-cal-config-conteudo'),
             html.Div(id='diario-calendario-grid'),
         ])),
 
@@ -2665,9 +2865,9 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
         # "Análise de Estratégia" (2026-07-30) fica ACIMA de "Confiabilidade
         # por Estratégia", pedido explícito do docx — os dois são ALL-TIME,
         # mesmo recorte (stats_geral/scores computados 1x na entrada da aba).
-        _bloco_diario('Análise de Estratégia', _bloco_analise_estrategia(stats_geral, tema)),
-        _bloco_diario('Confiabilidade por Estratégia',
-                      _tabela_score_confiabilidade(scores, stats_geral['por_estrategia'])),
+        _bloco_tradezella('Análise de Estratégia', _bloco_analise_estrategia(stats_geral, tema)),
+        _bloco_tradezella('Confiabilidade por Estratégia',
+                          _tabela_score_confiabilidade(scores, stats_geral['por_estrategia'])),
 
         _bloco_status_badges(),
     ])
@@ -4368,6 +4568,34 @@ def alternar_modo_ano(n_clicks, modo_atual):
 
 
 @app.callback(
+    Output('diario-cal-config-conteudo', 'children'),
+    Output('btn-diario-cal-config', 'children'),
+    Input('btn-diario-cal-config', 'n_clicks'),
+    State('btn-diario-cal-config', 'children'),
+    State('store-calendario-stats-visiveis', 'data'),
+    prevent_initial_call=True,
+)
+def alternar_config_calendario(n_clicks, rotulo_atual, stats_visiveis):
+    """Abre/fecha o painel "Display stats" do calendário (item F, fase 4)
+    — mesma mecânica do checklist pré-trade: o próprio rótulo do botão é
+    o estado, nunca recriado por esta callback."""
+    if not n_clicks:
+        return no_update, no_update
+    if rotulo_atual == '⚙ Stats':
+        return _conteudo_config_calendario(stats_visiveis or _STATS_CALENDARIO_PADRAO), '✕ Fechar'
+    return None, '⚙ Stats'
+
+
+@app.callback(
+    Output('store-calendario-stats-visiveis', 'data'),
+    Input('diario-cal-config-itens', 'value'),
+    prevent_initial_call=True,
+)
+def atualizar_stats_visiveis_calendario(valores):
+    return valores or []
+
+
+@app.callback(
     Output('diario-cards-conteudo', 'children'),
     Output('diario-calendario-grid', 'children'),
     Output('diario-calendario-label-mes', 'children'),
@@ -4377,9 +4605,10 @@ def alternar_modo_ano(n_clicks, modo_atual):
     Output('diario-resto-periodo-conteudo', 'children'),
     Input('diario-calendario-mes', 'data'),
     Input('diario-modo-ano', 'data'),
+    Input('store-calendario-stats-visiveis', 'data'),
     State('store-tema', 'data'),
 )
-def atualizar_periodo_estatisticas(mes_atual, modo_ano, tema_atual):
+def atualizar_periodo_estatisticas(mes_atual, modo_ano, stats_visiveis, tema_atual):
     """Recalcula estatísticas + calendário a cada troca de mês/ano/toggle —
     ver `diario_app_98.py::atualizar_periodo_estatisticas_98` pro raciocínio
     completo. Só atualiza `children`/`style` de componentes que já existem
@@ -4388,17 +4617,22 @@ def atualizar_periodo_estatisticas(mes_atual, modo_ano, tema_atual):
     resetando (ver comentário lá). Os labels de mês/ano são atualizados
     SEMPRE, independente de `modo_ano` — as setas de mês e ano ficam
     visíveis e funcionais nos dois modos de grade (ver
-    `navegar_calendario_classico`), só a grade abaixo (dias vs meses) muda."""
+    `navegar_calendario_classico`), só a grade abaixo (dias vs meses) muda.
+
+    `store-calendario-stats-visiveis` (item F, fase 4) também é Input —
+    marcar/desmarcar uma stat no calendário precisa remontar a grade na
+    hora, sem esperar trocar de mês."""
     if not mes_atual:
         return (no_update,) * 7
     ano, mes = (int(x) for x in mes_atual.split('-'))
     modo_ano = bool(modo_ano)
     if modo_ano:
         stats = dt.calcular_estatisticas(ano=ano)
-        grade = _grade_calendario_anual(stats['por_mes'], ano)
+        grade = _grade_calendario_anual(stats['por_mes'], ano, tema_atual or 'light')
     else:
         stats = dt.calcular_estatisticas(ano=ano, mes=mes)
-        grade = _grade_calendario(stats['por_dia'], ano, mes)
+        detalhe_dias = dt.detalhe_dias_calendario(ano=ano, mes=mes)
+        grade = _grade_calendario(stats['por_dia'], detalhe_dias, ano, mes, stats_visiveis, tema_atual or 'light')
     return (
         _cards_ou_vazio_estatisticas(stats, tema_atual or 'light'),
         grade,

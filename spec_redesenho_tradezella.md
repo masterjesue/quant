@@ -108,8 +108,17 @@ tooling novo.
    `atualizar_estatisticas` ganharam `tema` (via `State('store-tema',
    'data')`, mesmo padrão já usado em `atualizar_periodo_estatisticas`) pra
    os gráficos novos pegarem a paleta certa.
-4. **Calendário configurável** (stats por dia + toggle) — maior mudança de
-   comportamento existente, fazer depois dos itens 2-3 estarem estáveis.
+4. **✅ CONCLUÍDO (2026-07-30)** — Calendário configurável:
+   `dt.detalhe_dias_calendario` (R-multiple médio/Day Winrate/pontos
+   totais por dia, testado em `testes/teste_calendario_configuravel.py`)
+   + painel "Display stats" (5 checkboxes: R-Multiple/Daily P/L/Pontos/Nº
+   de Trades/Day Winrate — conferido em detalhe contra `image2.png`
+   anotada: Daily P/L É de fato um toggle real no produto, não fixo como
+   eu tinha assumido inicialmente) + coluna de total semanal (saldo + dias
+   operados) por linha do calendário. R-Multiple e Day Winrate ficam NA
+   MESMA linha da célula (ex: "-1.14R, 33.33%"), conferido pixel a pixel
+   contra a referência anotada, não em linhas separadas como eu tinha
+   errado na primeira tentativa. Verificado ao vivo nos dois temas.
 5. **Trade Duration Performance** (scatter) — independente, pode entrar em
    paralelo a qualquer momento depois do item 1.
 6. **Recent Trades condensado** — inclui a correção do Task #29
@@ -167,3 +176,52 @@ tooling novo.
    nunca cresce). Task #29 continua registrado à parte, adiado, sem re-uso
    forçado aqui.
 4. **Ordem de execução**: seguir a ordem de fases já sugerida (1→7) abaixo.
+
+## Fase 2.5 — Redesenho visual fiel ao TradeZella — ✅ CONCLUÍDO (2026-07-30)
+
+Depois das fases 2-4 entregarem DADO/ESTRUTURA reaproveitando o visual
+"cockpit" antigo do Diário, o Jesué apontou (2x) que isso era "adaptar os
+elementos do TradeZella pro nosso UX", não "modelagem fiel" — pediu estudo
+mais detalhado das 3 imagens de referência + pesquisa na internet, e então
+uma reescrita visual de verdade. Plano completo em
+`C:\Users\jesue\.claude\plans\modular-herding-salamander.md` (aprovado via
+ExitPlanMode). Decisão de escopo (AskUserQuestion): **rollout progressivo**
+— (1) aba Estatísticas inteira agora, (2) Diário inteiro depois de
+validado, (3) app inteiro por último. Este item cobre só a etapa (1).
+
+Achados de re-análise das 3 imagens (`image1.png`=claro, `image2.png`=
+calendário escuro anotado, `image3.png`=escuro): cantos bem arredondados
+(~14px cards, ~8px células), sombra suave em vez de borda grossa, números
+em fonte sans-serif normal (nunca monospace — diferente da convenção do
+resto do app), rótulos em title-case (não caixa alta), e — achado mais
+importante — **o calendário usa paleta DIFERENTE por tema**: claro = fundo
+pastel + texto escuro; escuro = fundo saturado + texto claro (o tema
+escuro do TradeZella já parecia com o que o Diário tinha).
+
+Implementado em `diario_app_classico.py` (único arquivo tocado, tokens
+`TZ_*` novos, não mexe em `C`/`PALETA_GAUGE` do resto do app):
+`_tz_estilo_card`/`_tz_badge_icone` (helpers novos), `_bloco_tradezella`
+(equivalente a `_bloco_diario` só pro visual novo — as outras abas do
+Diário continuam com `_bloco_diario`, sem mudança), `_grade_calendario`/
+`_grade_calendario_anual` ganharam paleta pastel-ou-saturada dependente de
+`tema`, e todos os cards/tabelas da aba Estatísticas reescritos pra usar
+os tokens novos.
+
+**Bug real encontrado e corrigido durante a implementação**: badges de
+emoji tentaram usar `_hex_para_rgba(C['green'], 0.15)` — mas `C[...]` são
+strings CSS `var(--x)`, não hex literal (`PALETA_GAUGE[tema][...]` é que é
+hex real) — `_hex_para_rgba` quebrava tentando fatiar `"var(--green)"`
+como hex. Corrigido usando `color-mix(in srgb, {cor} 15%, transparent)`
+(CSS puro, resolvido pelo navegador) em vez de computar em Python — mantém
+a mesma filosofia de reatividade automática de tema que o resto do `C`
+já tem.
+
+Verificado ao vivo no navegador nos dois temas (alternando `store-tema` via
+localStorage, já que o toggle de tema mora no `dashboard.py` pai, não
+dentro do iframe do Diário acessado direto): confirmado via
+`getComputedStyle` que `border-radius: 14px`/`box-shadow` suave/
+`font-family: Inter` aplicam nos cards, calendário mostra
+`rgb(254,226,226)`/`rgb(220,252,231)` (pastel vermelho/verde, tema claro)
+com texto escuro, e `rgb(224,92,92)`/`rgb(46,204,138)` (saturado, tema
+escuro) com texto claro — exatamente como projetado. Suíte completa (14
+suítes) passando + auditoria de acoplamento em 0.

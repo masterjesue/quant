@@ -1358,6 +1358,52 @@ def calcular_score_confiabilidade(df: pd.DataFrame | None = None, min_amostra: i
     return resultado
 
 
+def detalhe_dias_calendario(df: pd.DataFrame | None = None, ano: int | None = None,
+                             mes: int | None = None) -> dict:
+    """Detalhe por dia pro calendário configurável (item F, fase 4,
+    `spec_redesenho_tradezella.md`) — além do saldo que `calcular_estatisticas
+    ()['por_dia']` já dá, calcula R-multiple médio do dia, taxa de acerto do
+    dia (Day Winrate, distinta da taxa de acerto por TRADE) e pontos totais
+    do dia. `ano`/`mes` filtram igual a `calcular_estatisticas`.
+
+    Retorna `{'YYYY-MM-DD': {'n', 'saldo', 'taxa_acerto', 'r_multiple_medio',
+    'pontos_total'}}`. `r_multiple_medio` é `None` quando NENHUM trade do dia
+    tem `stop_pontos` utilizável (ver `r_multiple_trade`) — não confundir com
+    0.0 (que seria um dia real de R-multiple médio zero)."""
+    if df is None:
+        df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)].copy()
+
+    if ano is not None or mes is not None:
+        data_op_dt = pd.to_datetime(reais["data_op"], errors="coerce")
+        mascara = pd.Series(True, index=reais.index)
+        if ano is not None:
+            mascara &= data_op_dt.dt.year == ano
+        if mes is not None:
+            mascara &= data_op_dt.dt.month == mes
+        reais = reais[mascara]
+
+    if reais.empty:
+        return {}
+
+    resultado = {}
+    for data_iso, grupo in reais.groupby("data_op"):
+        saldo = grupo["saldo_operacao_reais"].astype(float)
+        n = len(grupo)
+        n_win = int((saldo > 0).sum())
+        r_multiples_validos = [r for r in (r_multiple_trade(row) for _, row in grupo.iterrows())
+                                if r is not None]
+        resultado[str(data_iso)] = {
+            "n": n,
+            "saldo": float(saldo.sum()),
+            "taxa_acerto": n_win / n if n else 0.0,
+            "r_multiple_medio": (sum(r_multiples_validos) / len(r_multiples_validos)
+                                  if r_multiples_validos else None),
+            "pontos_total": float(grupo["resultado_pontos"].fillna(0).astype(float).sum()),
+        }
+    return resultado
+
+
 # Amostra mínima pra "melhor estratégia por X" e pra Estratégia Vencedora/
 # Perdedora (bloco Análise de Estratégia, 2026-07-30) — mais baixa que
 # SCORE_MIN_AMOSTRA (10) de propósito: um recorte como "melhor estratégia
