@@ -94,8 +94,20 @@ tooling novo.
    com as dimensões e valores corretos, sem erro de console, "Detalhes"
    intacto. Reafirma o achado de ambiente da Fase D: o processo filho
    precisou ser reiniciado pra pegar o código novo (não recarrega sozinho).
-3. **Anticovardia Score** (radar) — precisa da decisão de fórmula abaixo
-   antes de codar.
+3. **✅ CONCLUÍDO (2026-07-30)** — Anticovardia Score: radar hexagonal
+   (`_grafico_radar_anticovardia`, mesmo padrão de `_radar_roda_vida` já
+   usado em Bem-Estar) + barra horizontal com zonas vermelho/amarelo/verde
+   e a posição do score marcada (`_grafico_barra_score_anticovardia`, gauge
+   Plotly `shape='bullet'`). `_bloco_anticovardia_score` no topo de
+   "Análise de Estratégia" (mesma posição de destaque do "Zella score" na
+   referência). Verificado ao vivo: os 6 eixos aparecem com os rótulos
+   certos (Win Rate/Profit Factor/Avg Win-Loss/Recovery Factor/Max
+   Drawdown/Consistency), score real da base = 32.0 (baixo, mas CORRETO —
+   a conta está no negativo no período, então um score baixo é o sinal
+   certo, não um bug). `_construir_diario_estatisticas`/
+   `atualizar_estatisticas` ganharam `tema` (via `State('store-tema',
+   'data')`, mesmo padrão já usado em `atualizar_periodo_estatisticas`) pra
+   os gráficos novos pegarem a paleta certa.
 4. **Calendário configurável** (stats por dia + toggle) — maior mudança de
    comportamento existente, fazer depois dos itens 2-3 estarem estáveis.
 5. **Trade Duration Performance** (scatter) — independente, pode entrar em

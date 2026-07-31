@@ -1961,17 +1961,108 @@ def _bloco_mentor_ia() -> html.Div:
               'borderRadius': '10px', 'marginTop': '14px'})
 
 
-def _bloco_analise_estrategia(stats_geral: dict) -> html.Div:
+# ---------------------------------------------------------------------------
+# Anticovardia Score (item F, fase 3, `spec_redesenho_tradezella.md`) —
+# renomeado do "Zella Score" do TradeZella. Radar hexagonal + barra
+# horizontal de posição, mesmo padrão visual de `_radar_roda_vida`
+# (Bem-Estar), reaproveitado aqui. Dado vem de
+# `dt.calcular_anticovardia_score()` (Fase 1, já testado).
+# ---------------------------------------------------------------------------
+
+_ROTULO_EIXO_ANTICOVARDIA = {
+    'win_rate': 'Win Rate',
+    'profit_factor': 'Profit Factor',
+    'avg_win_loss': 'Avg Win/Loss',
+    'recovery_factor': 'Recovery Factor',
+    'max_drawdown': 'Max Drawdown',
+    'consistencia': 'Consistency',
+}
+# Ordem de exibição no radar — bate com a referência visual do TradeZella
+# (`image1.png` do docx), não com a ordem de inserção do dict Python.
+_ORDEM_EIXOS_ANTICOVARDIA = ['win_rate', 'profit_factor', 'avg_win_loss',
+                             'recovery_factor', 'max_drawdown', 'consistencia']
+
+
+def _grafico_radar_anticovardia(eixos: dict, tema: str) -> go.Figure:
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    categorias = [_ROTULO_EIXO_ANTICOVARDIA[e] for e in _ORDEM_EIXOS_ANTICOVARDIA]
+    valores = [eixos.get(e, 0.0) for e in _ORDEM_EIXOS_ANTICOVARDIA]
+    fig = go.Figure(go.Scatterpolar(r=valores + [valores[0]], theta=categorias + [categorias[0]],
+                                     fill='toself', line=dict(color=p['gold']), fillcolor=p['gold'], opacity=0.5))
+    fig.update_layout(
+        # Mesmo cuidado de `_radar_roda_vida`: `autorange=False` + `tickvals`
+        # explícitos, senão o Plotly quebra a escala com variância baixa.
+        polar=dict(bgcolor='rgba(0,0,0,0)',
+                   radialaxis=dict(visible=True, range=[0, 100], autorange=False,
+                                    tickvals=[0, 20, 40, 60, 80, 100],
+                                    tickfont=dict(size=8, color=p['text2']), gridcolor=p['border']),
+                   angularaxis=dict(tickfont=dict(size=9, color=p['text']), gridcolor=p['border'])),
+        paper_bgcolor='rgba(0,0,0,0)', showlegend=False, margin=dict(l=30, r=30, t=20, b=20),
+        height=280, autosize=True,
+    )
+    return fig
+
+
+def _grafico_barra_score_anticovardia(score: float, tema: str) -> go.Figure:
+    """Barra horizontal com zonas vermelho/amarelo/verde e a posição do
+    score marcada — mesma leitura visual da barra sob "Your Zella Score"
+    no TradeZella (`image1.png`)."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    fig = go.Figure(go.Indicator(
+        mode='gauge+number',
+        value=score,
+        number={'font': {'size': 20, 'color': p['text'], 'family': FONTS['mono']}, 'valueformat': '.1f'},
+        gauge={
+            'shape': 'bullet',
+            'axis': {'range': [0, 100], 'tickfont': {'size': 8, 'color': p['text2']}},
+            'steps': [
+                {'range': [0, 33], 'color': p['red']},
+                {'range': [33, 66], 'color': p['yellow']},
+                {'range': [66, 100], 'color': p['green']},
+            ],
+            'bar': {'color': p['text'], 'thickness': 0.35},
+            'bgcolor': 'rgba(0,0,0,0)', 'borderwidth': 0,
+        },
+    ))
+    fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=10, r=10, t=10, b=10), height=60)
+    return fig
+
+
+def _bloco_anticovardia_score(tema: str = 'light') -> html.Div:
+    resultado = dt.calcular_anticovardia_score()
+    if resultado['score'] is None:
+        return html.Div('Sem trades reais suficientes pra calcular o Anticovardia Score ainda.',
+                         style={'fontSize': '12px', 'color': C['text2'], 'marginBottom': '14px'})
+    return html.Div([
+        html.Div('ANTICOVARDIA SCORE', style={'fontSize': '11px', 'color': C['text2'],
+                                               'textTransform': 'uppercase', 'letterSpacing': '0.08em',
+                                               'fontFamily': FONTS['display'], 'marginBottom': '6px'}),
+        dcc.Graph(figure=_grafico_radar_anticovardia(resultado['eixos'], tema),
+                  config={'displayModeBar': False}),
+        html.Div(f"Seu Anticovardia Score: {resultado['score']:.1f}", style={
+            'fontSize': '13px', 'fontWeight': '700', 'fontFamily': FONTS['mono'],
+            'color': C['text'], 'marginTop': '4px',
+        }),
+        dcc.Graph(figure=_grafico_barra_score_anticovardia(resultado['score'], tema),
+                  config={'displayModeBar': False}),
+    ], style={'padding': '14px', 'background': C['panel'], 'border': f'1px solid {C["border"]}',
+              'borderRadius': '10px', 'marginBottom': '14px', 'maxWidth': '420px'})
+
+
+def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Div:
     """Painel "Análise de Estratégia" — pedido do docx: "junte os blocos Por
     Ativo, Por Janela, Por Sala/Análise e Por Tags Setup/Erro num painel de
     dashboard estatístico, adicionando melhor estratégia por horário/
     direção/ativo/categoria; destaque a Estratégia Vencedora (troféu/
     medalha) e a Perdedora". O Mentor de IA (item D) também vive aqui dentro
     — pedido explícito do docx: "ainda dentro da Análise de Estratégias
-    crie um bloco [do Mentor]"."""
+    crie um bloco [do Mentor]". O Anticovardia Score (item F, fase 3,
+    redesenho TradeZella) entra no topo, mesma lógica de posicionamento
+    proeminente do "Zella score" na referência."""
     analise = dt.analise_estrategia()
     rotulos_janela = {k: _formatar_janela(k) for k in cfg.JANELAS_PREGAO}
     return html.Div([
+        _bloco_anticovardia_score(tema),
         html.Div([
             _card_estrategia_destaque('Estratégia Vencedora', '🏆', analise['vencedora'], C['green']),
             _card_estrategia_destaque('Estratégia Perdedora', '📉', analise['perdedora'], C['red']),
@@ -2491,7 +2582,7 @@ def _bloco_status_badges() -> html.Div:
     ]))
 
 
-def _construir_diario_estatisticas(stats_geral: dict, scores: dict) -> html.Div:
+def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 'light') -> html.Div:
     """Shell montado 1x por ativação da aba — ver
     `diario_app_98.py::_construir_diario98_estatisticas` pro raciocínio
     completo (mesma estrutura, só a casca visual muda).
@@ -2574,7 +2665,7 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict) -> html.Div:
         # "Análise de Estratégia" (2026-07-30) fica ACIMA de "Confiabilidade
         # por Estratégia", pedido explícito do docx — os dois são ALL-TIME,
         # mesmo recorte (stats_geral/scores computados 1x na entrada da aba).
-        _bloco_diario('Análise de Estratégia', _bloco_analise_estrategia(stats_geral)),
+        _bloco_diario('Análise de Estratégia', _bloco_analise_estrategia(stats_geral, tema)),
         _bloco_diario('Confiabilidade por Estratégia',
                       _tabela_score_confiabilidade(scores, stats_geral['por_estrategia'])),
 
@@ -4131,11 +4222,13 @@ def renderizar_overlay_imagem(dados):
 @app.callback(
     Output('diario-estatisticas-conteudo', 'children'),
     Input('store-diario-sub-aba', 'data'),
+    State('store-tema', 'data'),
 )
-def atualizar_estatisticas(sub_aba_ativa):
+def atualizar_estatisticas(sub_aba_ativa, tema_atual):
     if sub_aba_ativa != 'estatisticas':
         return no_update
-    return _construir_diario_estatisticas(dt.calcular_estatisticas(), dt.calcular_score_confiabilidade())
+    return _construir_diario_estatisticas(dt.calcular_estatisticas(), dt.calcular_score_confiabilidade(),
+                                           tema_atual or 'light')
 
 
 @app.callback(
