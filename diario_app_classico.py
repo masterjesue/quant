@@ -1809,8 +1809,17 @@ def _card_header_tradezella(titulo: str, valor_str, cor_valor=None, componente=N
     # quando ele existe.
     conteudo = dmc.Group([texto, componente], justify='space-between', align='center', wrap='nowrap') \
         if componente is not None else texto
+    # `SimpleGrid` estica todo card da linha pra altura do mais alto (o
+    # que tem RingProgress/barra) — sem centralizar verticalmente, um
+    # card só-texto (Saldo Líquido/Sequência Atual) sobrava um vão em
+    # branco embaixo do conteúdo (2026-07-31, 2ª rodada do mesmo
+    # feedback "espaço vazio"). `display:flex` + `justifyContent:center`
+    # no Card centraliza o conteúdo na altura real da linha, qualquer
+    # que seja ela.
     return dmc.Card(conteudo, withBorder=True, shadow='sm', radius='lg', p='lg',
-                     className='tz-card', style={'flex': '1', 'minWidth': '190px'})
+                     className='tz-card',
+                     style={'flex': '1', 'minWidth': '190px', 'height': '100%',
+                            'display': 'flex', 'flexDirection': 'column', 'justifyContent': 'center'})
 
 
 def _cards_header_tradezella(stats: dict, tema: str) -> dmc.SimpleGrid:
@@ -2190,21 +2199,53 @@ def _hex_para_rgba(hex_cor: str, alpha: float) -> str:
     return f'rgba({r},{g},{b},{alpha})'
 
 
+def _segmentos_cor_por_sinal(xs: list, ys: list) -> list:
+    """Quebra a série em segmentos verde (>=0)/vermelho (<0), inserindo um
+    ponto interpolado exatamente no cruzamento de zero — é o que dá o
+    efeito "linha muda de cor exatamente onde cruza o eixo" do equity
+    curve real do TradeZella (2026-07-31, feedback "gráficos não
+    mudaram": o gráfico de Evolução de Saldo era uma linha/preenchimento
+    de UMA cor só, sem essa dualidade)."""
+    xs_num = pd.to_datetime(xs).astype('int64').astype(float)
+    segmentos = []
+    atual_x, atual_y = [xs[0]], [ys[0]]
+    sinal_atual = 'pos' if ys[0] >= 0 else 'neg'
+    for i in range(1, len(ys)):
+        sinal = 'pos' if ys[i] >= 0 else 'neg'
+        if sinal != sinal_atual:
+            y_prev, y_cur = ys[i - 1], ys[i]
+            frac = y_prev / (y_prev - y_cur) if (y_prev - y_cur) != 0 else 0.0
+            x_cruz_num = xs_num[i - 1] + frac * (xs_num[i] - xs_num[i - 1])
+            x_cruz = pd.Timestamp(int(x_cruz_num))
+            atual_x.append(x_cruz); atual_y.append(0.0)
+            segmentos.append((sinal_atual, atual_x, atual_y))
+            atual_x, atual_y = [x_cruz], [0.0]
+            sinal_atual = sinal
+        atual_x.append(xs[i]); atual_y.append(ys[i])
+    segmentos.append((sinal_atual, atual_x, atual_y))
+    return segmentos
+
+
 def _grafico_evolucao_saldo(stats: dict, tema: str = 'light') -> go.Figure:
     p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
     fig = go.Figure()
     if stats['evolucao_data']:
-        fig.add_trace(go.Scatter(
-            x=stats['evolucao_data'], y=stats['evolucao_saldo_acumulado'],
-            mode='lines', line=dict(color=p['gold'], width=2),
-            fill='tozeroy', fillcolor=_hex_para_rgba(p['gold'], 0.08),
-        ))
+        cor_por_sinal = {'pos': p['green'], 'neg': p['red']}
+        for sinal, xs_seg, ys_seg in _segmentos_cor_por_sinal(
+                stats['evolucao_data'], stats['evolucao_saldo_acumulado']):
+            cor = cor_por_sinal[sinal]
+            fig.add_trace(go.Scatter(
+                x=xs_seg, y=ys_seg, mode='lines', line=dict(color=cor, width=2, shape='spline', smoothing=0.3),
+                fill='tozeroy', fillcolor=_hex_para_rgba(cor, 0.15), showlegend=False, hoverinfo='x+y',
+            ))
+        fig.add_hline(y=0, line_width=1, line_color=p['border'])
     fig.update_layout(
-        paper_bgcolor=p['panel'], plot_bgcolor=p['bg'],
+        paper_bgcolor=p['panel'], plot_bgcolor=p['panel'],
         font=dict(family=FONTS['body'], color=p['text2'], size=10),
         margin=dict(l=45, r=10, t=10, b=30), height=200,
         xaxis=dict(showgrid=False, gridcolor=p['border']),
-        yaxis=dict(gridcolor=p['border'], gridwidth=0.5, title='R$ acumulado'),
+        yaxis=dict(showgrid=True, gridcolor=p['border'], gridwidth=0.5, title='R$ acumulado', zeroline=False),
+        hovermode='x unified',
     )
     return fig
 
@@ -2591,9 +2632,19 @@ def _cards_detalhe_estatisticas(stats: dict) -> html.Div:
         _card_estatistica('Seq. Wins', str(stats['maior_sequencia_win'])),
         _card_estatistica('Seq. Losses', str(stats['maior_sequencia_loss'])),
     ])
+    # Taxa de Acerto já aparece no card do header (`_cards_header_tradezella`)
+    # — removida daqui pra não duplicar (2026-07-31, feedback do Jesué).
+    # Fator de Recuperação (saldo total / |drawdown máximo|) — já existia
+    # como eixo normalizado 0-100 do radar Anticovardia Score, mas nunca
+    # aparecia no dashboard em valor cru (2026-07-31, feedback: "parece
+    # ser um indicador novo... adicione-o também no dashboard").
+    fator_recuperacao = stats['fator_recuperacao']
+    fator_recuperacao_str = f"{fator_recuperacao:.2f}" if fator_recuperacao is not None else '—'
     grupo_taxas = _grupo_cards_estatistica('Taxas', [
-        _card_estatistica('Taxa de Acerto', f"{stats['taxa_acerto'] * 100:.1f}%"),
         _card_estatistica('Payoff', payoff_str),
+        _card_estatistica('Fator de Recuperação', fator_recuperacao_str,
+                           cor=(C['green'] if (fator_recuperacao or 0) >= 1
+                                else (C['red'] if fator_recuperacao is not None else None))),
     ])
     grupo_valores = _grupo_cards_estatistica('Valores (R$)', [
         _card_estatistica('Saldo Total', f"R$ {stats['saldo_total']:+.2f}",

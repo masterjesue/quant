@@ -1079,8 +1079,7 @@ def calcular_anticovardia_score(df: pd.DataFrame | None = None) -> dict:
     eixo_avg_win_loss = min((payoff or SCORE_CAP_PAYOFF) / SCORE_CAP_PAYOFF, 1.0) * 100
 
     drawdown = abs(stats["drawdown_maximo_reais"])
-    saldo_total = stats["saldo_total"]
-    recovery_factor = (saldo_total / drawdown) if drawdown else 0.0
+    recovery_factor = stats["fator_recuperacao"] or 0.0
     eixo_recovery = min(max(recovery_factor, 0.0) / ANTICOVARDIA_CAP_RECOVERY, 1.0) * 100
 
     eixo_drawdown = 100.0 - min(drawdown / ANTICOVARDIA_CAP_DRAWDOWN_REAIS * 100, 100.0)
@@ -1157,7 +1156,7 @@ def calcular_estatisticas(
         "maior_sequencia_win": 0, "maior_sequencia_loss": 0,
         "por_ativo": {}, "por_janela": {}, "por_sala": {}, "por_estrategia": {},
         "por_tags_setup_erro": {}, "por_dia": {}, "por_mes": {}, "por_ano": {},
-        "drawdown_maximo_reais": 0.0,
+        "drawdown_maximo_reais": 0.0, "fator_recuperacao": None,
         "evolucao_data": [], "evolucao_saldo_acumulado": [],
     }
     if n == 0:
@@ -1208,6 +1207,11 @@ def calcular_estatisticas(
     # unidade de todo o resto do dict (saldo_total/max_gain/max_loss).
     pico_corrente = evolucao["saldo_acumulado"].cummax()
     drawdown_maximo_reais = float((evolucao["saldo_acumulado"] - pico_corrente).min())
+    # Fator de Recuperação = saldo total / |drawdown máximo| — quantas
+    # vezes o lucro líquido "paga" o pior tombo da conta (usado como um
+    # dos 6 eixos do Anticovardia Score, mas também exposto cru aqui pra
+    # aparecer no dashboard, não só normalizado 0-100 no radar).
+    fator_recuperacao = (float(saldo.sum()) / abs(drawdown_maximo_reais)) if drawdown_maximo_reais else None
 
     return {
         "num_operacoes": n,
@@ -1239,6 +1243,7 @@ def calcular_estatisticas(
         "por_mes": _agrupar_soma_contagem(reais, "mes_op"),
         "por_ano": _agrupar_soma_contagem(reais, "ano_op"),
         "drawdown_maximo_reais": drawdown_maximo_reais,
+        "fator_recuperacao": fator_recuperacao,
         "evolucao_data": evolucao["data_op"].astype(str).tolist(),
         "evolucao_saldo_acumulado": evolucao["saldo_acumulado"].tolist(),
     }
