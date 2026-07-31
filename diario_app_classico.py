@@ -1825,42 +1825,65 @@ def _cards_header_tradezella(stats: dict, tema: str) -> dmc.SimpleGrid:
 
     saldo_total = stats['saldo_total']
     card_net_pnl = _card_header_tradezella(
-        'Net P&L', f"R$ {saldo_total:+.2f}",
+        'Saldo Líquido', f"R$ {saldo_total:+.2f}",
         cor_valor=('green' if saldo_total > 0 else ('red' if saldo_total < 0 else None)),
         animar_numero=True,
     )
 
+    # Anel de 3 seções (Win/Loss/Breakeven), não só um arco verde de % —
+    # bate com o gauge real do TradeZella (`image1.png`: "Trade win %"
+    # mostra um anel segmentado vermelho/azul/verde com as 3 contagens
+    # embaixo, não um arco único de porcentagem).
     win_pct = stats['taxa_acerto'] * 100
     card_win_pct = _card_header_tradezella(
-        'Trade Win %', f"{win_pct:.1f}%",
+        'Taxa de Acerto',
+        html.Div([
+            dmc.Text(f"{win_pct:.1f}%", size='xl', fw=700, className='tz-numero-animado'),
+            dmc.Group([
+                dmc.Text(str(stats['n_loss']), size='xs', c='red', fw=700),
+                dmc.Text(str(stats['n_breakeven']), size='xs', c='dimmed', fw=700),
+                dmc.Text(str(stats['n_win']), size='xs', c='green', fw=700),
+            ], gap=6, mt=2),
+        ]),
         componente=dmc.RingProgress(
             size=70, thickness=7, roundCaps=True,
-            sections=[{'value': win_pct, 'color': 'green'}],
-            label=dmc.Text(f"{win_pct:.0f}%", size='xs', ta='center', fw=700),
+            sections=[
+                {'value': stats['n_loss'] / stats['num_operacoes'] * 100, 'color': 'red'},
+                {'value': stats['n_breakeven'] / stats['num_operacoes'] * 100, 'color': 'gray'},
+                {'value': stats['n_win'] / stats['num_operacoes'] * 100, 'color': 'green'},
+            ] if stats['num_operacoes'] else [],
         ),
     )
 
     payoff = stats['payoff']
-    media_ganho, media_perda = stats['media_ganho_reais'], abs(stats['media_perda_reais'])
-    total_win_loss = media_ganho + media_perda
+    media_ganho, media_perda_abs = stats['media_ganho_reais'], abs(stats['media_perda_reais'])
+    total_win_loss = media_ganho + media_perda_abs
     pct_ganho = (media_ganho / total_win_loss * 100) if total_win_loss else 0
-    card_avg_win_loss = _card_header_tradezella(
-        'Avg Win/Loss', f"{payoff:.2f}" if payoff is not None else '—',
-        componente=html.Div(dmc.ProgressRoot([
+    # Valores em R$ embaixo da barra (verde à esquerda, vermelho à
+    # direita) — bate com o card real do TradeZella, que mostra "$951" e
+    # "-$352" sob os dois lados da barra, não só o número de payoff.
+    barra_avg_win_loss = html.Div([
+        dmc.ProgressRoot([
             dmc.ProgressSection(value=pct_ganho, color='green'),
             dmc.ProgressSection(value=100 - pct_ganho, color='red'),
-        ], size='lg', radius='xl'), style={'width': '90px'}) if total_win_loss else None,
+        ], size='lg', radius='xl'),
+        dmc.Group([
+            dmc.Text(f"R$ +{media_ganho:.0f}", size='xs', c='green', fw=600),
+            dmc.Text(f"R$ -{media_perda_abs:.0f}", size='xs', c='red', fw=600),
+        ], justify='space-between', mt=4),
+    ], style={'width': '120px'}) if total_win_loss else None
+    card_avg_win_loss = _card_header_tradezella(
+        'Ganho/Perda Médio', f"{payoff:.2f}" if payoff is not None else '—',
+        componente=barra_avg_win_loss,
     )
 
     profit_factor = stats['profit_factor']
     pf_normalizado = min(profit_factor or 0, 3.0) / 3.0 * 100
     card_profit_factor = _card_header_tradezella(
-        'Profit Factor', f"{profit_factor:.2f}" if profit_factor is not None else '—',
+        'Fator de Lucro', f"{profit_factor:.2f}" if profit_factor is not None else '—',
         componente=dmc.RingProgress(
             size=70, thickness=7, roundCaps=True,
-            sections=[{'value': pf_normalizado, 'color': 'yellow'}],
-            label=dmc.Text(f"{profit_factor:.1f}" if profit_factor is not None else '—',
-                            size='xs', ta='center', fw=700),
+            sections=[{'value': pf_normalizado, 'color': 'green' if (profit_factor or 0) >= 1 else 'red'}],
         ),
     )
 
@@ -1871,11 +1894,12 @@ def _cards_header_tradezella(stats: dict, tema: str) -> dmc.SimpleGrid:
     else:
         cor_streak = 'green' if streak['tipo'] == 'win' else 'red'
         rotulo_trades = 'trade' if streak['trades'] == 1 else 'trades'
-        streak_str = f"{streak['trades']} {rotulo_trades} ({streak['dias']} dia(s))"
+        rotulo_dias = 'dia' if streak['dias'] == 1 else 'dias'
+        streak_str = f"{streak['trades']} {rotulo_trades} ({streak['dias']} {rotulo_dias})"
         badge_streak = dmc.ThemeIcon(streak['tipo'] == 'win' and '🔥' or '❄',
                                        color=cor_streak, variant='light', radius='xl', size='lg')
     card_streak = _card_header_tradezella(
-        'Current Streak',
+        'Sequência Atual',
         html.Div([badge_streak, html.Span(streak_str, style={'marginLeft': '8px'})],
                   style={'display': 'flex', 'alignItems': 'center'}) if badge_streak else streak_str,
         cor_valor=cor_streak,
@@ -2047,12 +2071,12 @@ def _bloco_mentor_ia() -> dmc.Card:
 # ---------------------------------------------------------------------------
 
 _ROTULO_EIXO_ANTICOVARDIA = {
-    'win_rate': 'Win Rate',
-    'profit_factor': 'Profit Factor',
-    'avg_win_loss': 'Avg Win/Loss',
-    'recovery_factor': 'Recovery Factor',
-    'max_drawdown': 'Max Drawdown',
-    'consistencia': 'Consistency',
+    'win_rate': 'Taxa de Acerto',
+    'profit_factor': 'Fator de Lucro',
+    'avg_win_loss': 'Ganho/Perda Médio',
+    'recovery_factor': 'Fator de Recuperação',
+    'max_drawdown': 'Drawdown Máximo',
+    'consistencia': 'Consistência',
 }
 # Ordem de exibição no radar — bate com a referência visual do TradeZella
 # (`image1.png` do docx), não com a ordem de inserção do dict Python.
@@ -2438,7 +2462,7 @@ def _tabela_score_confiabilidade(scores: dict, saldos_por_estrategia: dict | Non
              'valueFormatter': {'function': "params.data.saldo_label"}, 'cellStyle': _CELL_STYLE_SALDO},
             {'field': 'taxa_acerto', 'headerName': 'Taxa Acerto', 'sortable': True, 'filter': True},
             {'field': 'payoff', 'headerName': 'Payoff', 'sortable': True, 'filter': True},
-            {'field': 'profit_factor', 'headerName': 'Profit Factor', 'sortable': True, 'filter': True},
+            {'field': 'profit_factor', 'headerName': 'Fator de Lucro', 'sortable': True, 'filter': True},
             {'field': 'score', 'headerName': 'Score', 'sortable': True, 'filter': True,
              'valueFormatter': {'function': "params.data.score_label"}, 'cellStyle': _CELL_STYLE_SCORE},
         ],

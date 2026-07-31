@@ -333,3 +333,32 @@ qualquer código; suíte completa de 14 testes + auditoria de acoplamento em
 0; conteúdo real renderizado corretamente nos dois temas; grid
 "Confiabilidade por Estratégia" com dado real; larguras de coluna
 conferidas via `getBoundingClientRect`).
+
+**Tradução + fidelidade visual dos gauges** (2026-07-31, feedback do
+Jesué com 3 screenshots comparando o dashboard aqui contra o TradeZella
+real: "Coloque as métricas do dashboard e do gráfico de score em
+português. Faça os gráficos, barras e elementos visuais idênticos ao
+TradeZella.") —
+
+- Todos os rótulos em inglês trocados por português: os 5 cards do
+  header (`Net P&L`→Saldo Líquido, `Trade Win %`→Taxa de Acerto,
+  `Avg Win/Loss`→Ganho/Perda Médio, `Profit Factor`→Fator de Lucro,
+  `Current Streak`→Sequência Atual), os 6 eixos do radar Anticovardia
+  (`_ROTULO_EIXO_ANTICOVARDIA`) e a coluna solta em inglês na grid de
+  Confiabilidade por Estratégia.
+- Gauge de Taxa de Acerto deixou de ser um arco único verde de % e virou
+  um `dmc.RingProgress` de 3 seções de verdade (vermelho=losses,
+  cinza=breakeven, verde=wins) com as 3 contagens em texto embaixo —
+  bate com o padrão real do TradeZella (anel segmentado + contagens tipo
+  "14/4/17" sob o gauge), confirmado via inspeção do DOM
+  (`getAttribute`/`--curve-color` dos `<circle>` do SVG: 4 círculos no
+  anel de Taxa de Acerto = base + 3 seções, contra 2 círculos = base + 1
+  seção nos anéis de Fator de Lucro/Score, que continuam de seção única).
+- Barra de Ganho/Perda Médio ganhou os valores em R$ (`R$ +68`/`R$ -37`)
+  abaixo dos dois lados coloridos da barra, não só o número de payoff
+  acima — bate com o card real do TradeZella que mostra os dois valores
+  em dólar sob a barra.
+- Verificado ao vivo: `get_page_text` confirma todos os rótulos em
+  português e os valores batendo com `calcular_estatisticas`; nenhum erro
+  no console (nem o já conhecido/inofensivo de parse de cor apareceu
+  desta vez).
