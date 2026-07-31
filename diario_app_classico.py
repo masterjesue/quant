@@ -3096,21 +3096,33 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
 
         # Composição assimétrica real (item F, Fase 2.6 — `dmc.Grid`, não
         # mais uma pilha vertical de blocos full-width): coluna estreita à
-        # esquerda (Evolução de Saldo + Anticovardia Score empilhados),
-        # coluna larga à direita (Calendário) — mesma composição do
-        # Dashboard real do TradeZella (`image1.png` do docx de
-        # referência). O resto do conteúdo exclusivo do Super Quant
-        # (Vencedora/Perdedora, Melhor por X, breakdowns, Confiabilidade,
-        # Mentor de IA) continua existindo, só que ABAIXO deste grid —
-        # decisão do Jesué: "mantenha o que já temos, adicione o que o
-        # TradeZella agrega".
+        # esquerda (Evolução de Saldo, Anticovardia Score, Progress
+        # Tracker, Desempenho por Duração — todos empilhados), coluna
+        # larga à direita (Calendário + Trades Recentes) — mesma
+        # composição do Dashboard real do TradeZella (`image1.png` do docx
+        # de referência). UM ÚNICO grid (2026-07-31, feedback recorrente
+        # de "espaço vazio"): tentativas anteriores usavam grids
+        # SEPARADOS pra cada par de blocos (Evolução+Score / Calendário,
+        # depois Progress Tracker / Trades Recentes) — cada par forçado a
+        # bater altura exata sempre sobrava vão (esticando o menor, se
+        # `align='stretch'`, ou deixando fundo vazio abaixo dele, se
+        # `align='flex-start'`). Empilhar TUDO relacionado numa coluna só
+        # deixa as duas colunas fluírem em alturas totais parecidas — sem
+        # forçar par a par — e ainda aproveita o conteúdo real (Progress
+        # Tracker, Duração da Operação) pra preencher a coluna esquerda em
+        # vez de forçá-la a esticar vazia. O resto do conteúdo exclusivo
+        # do Super Quant (Vencedora/Perdedora, Melhor por X, breakdowns,
+        # Confiabilidade, Mentor de IA) continua existindo, só que ABAIXO
+        # deste grid — decisão do Jesué: "mantenha o que já temos,
+        # adicione o que o TradeZella agrega".
         dmc.Grid([
             dmc.GridCol([
                 html.Div(id='diario-resto-periodo-conteudo'),
                 _bloco_anticovardia_score(tema),
+                _bloco_duracao_performance(tema),
             ], span={'base': 12, 'md': 5}),
             dmc.GridCol(
-                _bloco_tradezella('Calendário', html.Div([
+                html.Div([_bloco_tradezella('Calendário', html.Div([
                     html.Div([
                         html.Div([
                             html.Button('◀', id='btn-diario-cal-mes-prev', n_clicks=0, style=estilo_botao_nav),
@@ -3157,35 +3169,23 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
                     html.Div(id='diario-cal-config-conteudo'),
                     html.Div(id='diario-calendario-grid'),
                 ])),
-                span={'base': 12, 'md': 7},
+                # Trades Recentes (item F, 2026-07-31 — "você não está
+                # mostrando o bloco de trades recentes no dashboard, como
+                # é no TradeZella") + Progress Tracker (item F, fase 7)
+                # empilhados logo abaixo do Calendário nesta MESMA coluna
+                # direita — sempre ALL-TIME (não filtra por período do
+                # calendário acima), mesma convenção de `stats_geral`/
+                # `scores` abaixo. Progress Tracker fica nesta coluna (não
+                # na esquerda, com Duração da Operação) pra equilibrar a
+                # altura total das duas colunas — verificado ao vivo via
+                # `getBoundingClientRect`: as duas fecham a 31px uma da
+                # outra nesta combinação, contra ~586px quando os dois
+                # ficavam juntos na esquerda.
+                _bloco_trades_recentes(tema),
+                _bloco_progress_tracker(stats_geral['por_dia'], tema),
+                ]), span={'base': 12, 'md': 7},
             ),
-        ], gutter='md', mb='md'),
-
-        # Progress Tracker (item F, fase 7) à esquerda + Trades Recentes
-        # (item F) à direita, no mesmo split 5/7 do grid acima (2026-07-31,
-        # feedback: "suba o Progress Tracker, coloque do lado esquerdo dos
-        # Trades Recentes, tire esse espaço vazio abaixo do calendário") —
-        # continua a coluna esquerda visualmente, em vez de deixar um vão
-        # abaixo de Evolução de Saldo/Anticovardia Score enquanto o
-        # Calendário (coluna direita, mais alto) ainda não terminou. Ambos
-        # sempre ALL-TIME (não filtram por período do calendário acima),
-        # mesma convenção de `stats_geral`/`scores` logo abaixo.
-        # `align='flex-start'` (2026-07-31, feedback: "redimensionar os
-        # blocos pra tirar os espaços vazios") — o default do `dmc.Grid`
-        # (`align='stretch'`) força as duas colunas à altura da mais alta;
-        # como Trades Recentes (8 linhas) é bem mais alto que o Progress
-        # Tracker (heatmap compacto + legenda + feedback), o card do
-        # Progress Tracker esticava até a mesma altura, sobrando vão vazio
-        # dentro da própria borda do card. Sem stretch, cada card fica na
-        # sua altura natural — sem vão.
-        dmc.Grid([
-            dmc.GridCol(_bloco_progress_tracker(stats_geral['por_dia'], tema), span={'base': 12, 'md': 5}),
-            dmc.GridCol(_bloco_trades_recentes(tema), span={'base': 12, 'md': 7}),
         ], gutter='md', mb='md', align='flex-start'),
-
-        # Trade Duration Performance (item F, fase 5, `spec_redesenho_
-        # tradezella.md`) — independente do resto, entra a qualquer momento.
-        _bloco_duracao_performance(tema),
 
         # `stats_geral` é o SEM filtro de período (ver a chamada em
         # `montar_sub_aba_diario`), igual ao `scores` — os dois lados da
