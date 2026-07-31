@@ -2334,13 +2334,37 @@ def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Di
     # metade da linha em branco quando o card vizinho era mais estreito.
     #
     # Detalhes (Melhor por X + Por Ativo/Janela/Sala/Tags) recolhidos por
-    # padrão dentro de `dmc.Collapse` (2026-07-31, feedback: "deixe
-    # Vencedora/Perdedora e Mentor de IA visíveis, o resto contraído,
-    # clicando numa seta") — só Vencedora/Perdedora e Mentor de IA ficam
-    # sempre visíveis. Botão estático (nunca recriado pela própria
-    # callback, mesmo cuidado de `btn-diario-cal-config`): o próprio
-    # `children` do botão guarda o estado (seta ▼/▲), não precisa de
-    # `dcc.Store` extra.
+    # padrão (2026-07-31, feedback: "deixe Vencedora/Perdedora e Mentor de
+    # IA visíveis, o resto contraído, clicando numa seta") — só Vencedora/
+    # Perdedora e Mentor de IA ficam sempre visíveis. `dmc.Collapse`
+    # testado primeiro e DESCARTADO: reproduzido em isolamento (app Dash
+    # mínimo, só um botão + Collapse) que o `opened` setado por callback
+    # NUNCA sai de `height:0/display:none` — bug real da combinação DMC/
+    # Dash deste projeto, não erro de uso. Troca pro padrão já PROVADO
+    # neste arquivo (`alternar_modo_ano`/`btn-diario-cal-config`): conteúdo
+    # sempre presente no DOM, só o `style` (`display`) alterna — nenhuma
+    # medição de altura envolvida, não pode falhar do mesmo jeito. Botão
+    # estático (nunca recriado pela própria callback): o `children` do
+    # botão guarda o estado (seta ▼/▲).
+    detalhes = html.Div([
+        dmc.SimpleGrid([
+            _tabela_melhor_por('Melhor por Horário', analise['melhor_por_janela'], rotulos_janela),
+            _tabela_melhor_por('Melhor por Direção', analise['melhor_por_direcao'], _ROTULO_DIRECAO_OPERACAO),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
+            _tabela_melhor_por('Melhor por Ativo', analise['melhor_por_ativo']),
+            _tabela_melhor_por('Melhor por Categoria', analise['melhor_por_categoria'],
+                               dt.ROTULO_CATEGORIA_ESTRATEGIA),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
+            _bloco_breakdown_diario('Por Ativo', stats_geral['por_ativo']),
+            _bloco_breakdown_diario('Por Janela', stats_geral['por_janela']),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
+            _bloco_breakdown_diario('Por Sala/Análise', stats_geral['por_sala']),
+            _bloco_breakdown_diario('Por Tags Setup/Erro', stats_geral['por_tags_setup_erro']),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+    ], id='colapso-analise-estrategia-detalhes', style={'display': 'none'})
     return html.Div([
         dmc.SimpleGrid([
             _card_estrategia_destaque('Estratégia Vencedora', '🏆', analise['vencedora'], 'green'),
@@ -2348,25 +2372,7 @@ def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Di
         ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
         dmc.Button('▼ Ver detalhes', id='btn-analise-estrategia-detalhes', n_clicks=0,
                    variant='subtle', color='gray', size='xs', mb='sm'),
-        dmc.Collapse([
-            dmc.SimpleGrid([
-                _tabela_melhor_por('Melhor por Horário', analise['melhor_por_janela'], rotulos_janela),
-                _tabela_melhor_por('Melhor por Direção', analise['melhor_por_direcao'], _ROTULO_DIRECAO_OPERACAO),
-            ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
-            dmc.SimpleGrid([
-                _tabela_melhor_por('Melhor por Ativo', analise['melhor_por_ativo']),
-                _tabela_melhor_por('Melhor por Categoria', analise['melhor_por_categoria'],
-                                   dt.ROTULO_CATEGORIA_ESTRATEGIA),
-            ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
-            dmc.SimpleGrid([
-                _bloco_breakdown_diario('Por Ativo', stats_geral['por_ativo']),
-                _bloco_breakdown_diario('Por Janela', stats_geral['por_janela']),
-            ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
-            dmc.SimpleGrid([
-                _bloco_breakdown_diario('Por Sala/Análise', stats_geral['por_sala']),
-                _bloco_breakdown_diario('Por Tags Setup/Erro', stats_geral['por_tags_setup_erro']),
-            ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
-        ], id='colapso-analise-estrategia-detalhes', opened=False),
+        detalhes,
         _bloco_mentor_ia(),
     ])
 
@@ -4865,7 +4871,7 @@ def alternar_config_calendario(n_clicks, rotulo_atual, stats_visiveis):
 
 
 @app.callback(
-    Output('colapso-analise-estrategia-detalhes', 'opened'),
+    Output('colapso-analise-estrategia-detalhes', 'style'),
     Output('btn-analise-estrategia-detalhes', 'children'),
     Input('btn-analise-estrategia-detalhes', 'n_clicks'),
     State('btn-analise-estrategia-detalhes', 'children'),
@@ -4874,13 +4880,16 @@ def alternar_config_calendario(n_clicks, rotulo_atual, stats_visiveis):
 def alternar_detalhes_analise_estrategia(n_clicks, rotulo_atual):
     """Abre/fecha os detalhes de "Análise de Estratégia" (2026-07-31,
     feedback: "deixe Vencedora/Perdedora e Mentor de IA visíveis, o resto
-    contraído") — mesma mecânica de `alternar_config_calendario`: o
-    próprio rótulo do botão (seta ▼/▲) é o estado."""
+    contraído") — mesma mecânica de `alternar_config_calendario`/
+    `alternar_modo_ano`: o próprio rótulo do botão (seta ▼/▲) é o estado,
+    só o `style` (`display`) alterna, conteúdo sempre presente no DOM
+    (ver docstring de `_bloco_analise_estrategia` — `dmc.Collapse` tem bug
+    real de não abrir via callback nesta versão, descartado)."""
     if not n_clicks:
         return no_update, no_update
     if rotulo_atual == '▼ Ver detalhes':
-        return True, '▲ Ocultar detalhes'
-    return False, '▼ Ver detalhes'
+        return {'display': 'block'}, '▲ Ocultar detalhes'
+    return {'display': 'none'}, '▼ Ver detalhes'
 
 
 @app.callback(
