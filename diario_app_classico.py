@@ -2097,12 +2097,36 @@ def _grafico_radar_anticovardia(eixos: dict, tema: str) -> go.Figure:
     p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
     categorias = [_ROTULO_EIXO_ANTICOVARDIA[e] for e in _ORDEM_EIXOS_ANTICOVARDIA]
     valores = [eixos.get(e, 0.0) for e in _ORDEM_EIXOS_ANTICOVARDIA]
-    fig = go.Figure(go.Scatterpolar(r=valores + [valores[0]], theta=categorias + [categorias[0]],
-                                     fill='toself', line=dict(color=p['gold']), fillcolor=p['gold'], opacity=0.5))
+    r_fechado = valores + [valores[0]]
+    theta_fechado = categorias + [categorias[0]]
+
+    fig = go.Figure()
+    # `go.Scatterpolar` não suporta `fillgradient` nativo (só o Scatter
+    # cartesiano suporta — ver `_grafico_evolucao_saldo`), então o efeito
+    # de gradiente pedido (2026-07-31: "apenas aplique o gradiente")
+    # é simulado com N cópias do mesmo polígono encolhidas em direção ao
+    # centro, cada uma com opacidade baixa constante — a sobreposição das
+    # camadas cria um centro mais saturado que se dilui em direção à
+    # borda, visualmente equivalente a um gradiente radial. Só a camada
+    # externa (escala 1.0, os valores reais) tem contorno/hover; as
+    # internas são só preenchimento decorativo.
+    n_camadas = 8
+    for i in range(n_camadas, 0, -1):
+        escala = i / n_camadas
+        externa = i == n_camadas
+        fig.add_trace(go.Scatterpolar(
+            r=[v * escala for v in r_fechado], theta=theta_fechado,
+            fill='toself', fillcolor=_hex_para_rgba(p['gold'], 0.10),
+            line=dict(width=2 if externa else 0, color=p['gold']),
+            showlegend=False, hoverinfo='r+theta' if externa else 'skip',
+        ))
     fig.update_layout(
         # Mesmo cuidado de `_radar_roda_vida`: `autorange=False` + `tickvals`
         # explícitos, senão o Plotly quebra a escala com variância baixa.
-        polar=dict(bgcolor='rgba(0,0,0,0)',
+        # `gridshape='linear'` (2026-07-31, feedback: "deixe o gráfico
+        # quadrado/hexagonal ao invés de redondo") troca o grid circular
+        # padrão por um polígono reto nos mesmos 6 eixos.
+        polar=dict(bgcolor='rgba(0,0,0,0)', gridshape='linear',
                    radialaxis=dict(visible=True, range=[0, 100], autorange=False,
                                     tickvals=[0, 20, 40, 60, 80, 100],
                                     tickfont=dict(size=8, color=p['text2']), gridcolor=p['border']),
@@ -2113,35 +2137,55 @@ def _grafico_radar_anticovardia(eixos: dict, tema: str) -> go.Figure:
     return fig
 
 
+def _barra_anticovardia_score(score: float, tema: str = 'light') -> html.Div:
+    """Barra de gradiente 0-100 (vermelho→amarelo→verde) com marcador na
+    posição do score — o TradeZella mostra o Zella Score como BARRA
+    horizontal degradê, não anel (2026-07-31, feedback: "O Anticovardia
+    Score é em barra, e não em círculo"). Sem componente DMC pronto pra
+    isso (`RingProgress` é círculo; `ProgressRoot` não faz gradiente
+    contínuo nem marcador de posição livre) — construído com CSS puro
+    (`linear-gradient` + marcador posicionado via `left: calc(pct% - r)`),
+    mesmo padrão de outros widgets sem equivalente pronto no projeto."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    pct = max(0.0, min(score, 100.0))
+    cor_marcador = p['red'] if score < 33 else (p['yellow'] if score < 66 else p['green'])
+    return html.Div([
+        html.Div(html.Div(style={
+            'position': 'absolute', 'left': f'calc({pct}% - 8px)', 'top': '-4px',
+            'width': '16px', 'height': '16px', 'borderRadius': '50%',
+            'background': cor_marcador, 'border': f"2px solid {p['panel']}",
+            'boxShadow': '0 1px 3px rgba(0,0,0,0.35)',
+        }), style={
+            'position': 'relative', 'height': '8px', 'borderRadius': '4px',
+            'background': f"linear-gradient(to right, {p['red']}, {p['yellow']}, {p['green']})",
+        }),
+        html.Div([
+            html.Span(str(v), style={'fontSize': '10px', 'color': p['text2'], 'fontFamily': FONTS['body']})
+            for v in (0, 20, 40, 60, 80, 100)
+        ], style={'display': 'flex', 'justifyContent': 'space-between', 'marginTop': '6px'}),
+    ], style={'width': '100%', 'padding': '8px 4px 0 4px'})
+
+
 def _bloco_anticovardia_score(tema: str = 'light') -> dmc.Card:
     """Anticovardia Score — `dmc.Card` real com o radar Plotly (sem
-    equivalente DMC pronto, mantido) + um `dmc.RingProgress` GRANDE pro
-    score final (item F, Fase 2.6 — substitui a barra horizontal `bullet`
-    do Plotly, que não anima: o RingProgress do DMC anima o preenchimento
-    de verdade quando o valor muda). Cor do anel reflete a zona do score
-    (vermelho <33, amarelo 33-66, verde >66), mesma leitura da barra
-    degradê anterior, só que como componente real."""
+    equivalente DMC pronto, mantido) + a barra degradê
+    `_barra_anticovardia_score` pro score final (item F — TradeZella usa
+    barra, não anel/círculo, ver docstring da barra)."""
     resultado = dt.calcular_anticovardia_score()
     if resultado['score'] is None:
         return dmc.Card('Sem trades reais suficientes pra calcular o Anticovardia Score ainda.',
                          withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', w='100%',
                          style={'fontSize': '12px', 'color': C['text2']})
     score = resultado['score']
-    cor_score = 'red' if score < 33 else ('yellow' if score < 66 else 'green')
     return dmc.Card([
         dmc.Text('Anticovardia Score', size='sm', fw=600, mb='sm'),
         dcc.Graph(figure=_grafico_radar_anticovardia(resultado['eixos'], tema),
                   config={'displayModeBar': False, 'responsive': True}, style={'width': '100%'}),
+        _barra_anticovardia_score(score, tema),
         dmc.Group([
-            dmc.RingProgress(
-                size=110, thickness=10, roundCaps=True,
-                sections=[{'value': score, 'color': cor_score}],
-                label=dmc.Text(f"{score:.0f}", size='lg', fw=700, ta='center',
-                                className='tz-numero-animado'),
-            ),
             dmc.Text(f"Seu Anticovardia Score: {score:.1f}", size='sm', fw=700,
                       className='tz-numero-animado'),
-        ], justify='center', mt='sm'),
+        ], justify='flex-start', mt='sm'),
     ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
 
 
@@ -2283,9 +2327,19 @@ def _grafico_evolucao_saldo(stats: dict, tema: str = 'light') -> go.Figure:
         for sinal, xs_seg, ys_seg in _segmentos_cor_por_sinal(
                 stats['evolucao_data'], stats['evolucao_saldo_acumulado']):
             cor = cor_por_sinal[sinal]
+            extremo = max(ys_seg) if sinal == 'pos' else min(ys_seg)
             fig.add_trace(go.Scatter(
                 x=xs_seg, y=ys_seg, mode='lines', line=dict(color=cor, width=2, shape='spline', smoothing=0.3),
-                fill='tozeroy', fillcolor=_hex_para_rgba(cor, 0.15), showlegend=False, hoverinfo='x+y',
+                # Gradiente vertical de verdade (`fillgradient`, Plotly
+                # nativo — 2026-07-31, feedback "aplique o gradiente em
+                # todos os gráficos do dashboard"): transparente na linha
+                # de zero, cor sólida no pico/vale do segmento — igual ao
+                # "mountain chart" real do TradeZella (verde sólido no
+                # topo esmaecendo pra branco perto do eixo).
+                fill='tozeroy', fillcolor=_hex_para_rgba(cor, 0.15),
+                fillgradient=dict(type='vertical', start=0, stop=extremo,
+                                   colorscale=[[0, _hex_para_rgba(cor, 0.0)], [1, _hex_para_rgba(cor, 0.45)]]),
+                showlegend=False, hoverinfo='x+y',
             ))
         fig.add_hline(y=0, line_width=1, line_color=p['border'])
     fig.update_layout(
