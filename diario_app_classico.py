@@ -1926,7 +1926,7 @@ def _card_estatistica(titulo: str, valor: str, cor=None) -> dmc.Paper:
     return dmc.Paper([
         dmc.Text(titulo, size='xs', c='dimmed'),
         dmc.Text(valor, size='md', fw=700, **({'c': cor} if cor else {})),
-    ], radius='md', p='sm', withBorder=True, style={'minWidth': '120px'})
+    ], radius='md', p='sm', withBorder=True, style={'minWidth': '120px', 'flex': '1'})
 
 
 def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
@@ -2799,18 +2799,27 @@ def _detalhe_estrategia_expandido(tag: str) -> html.Div:
               'borderLeft': f'2px solid {C["gold"]}', 'marginBottom': '6px'})
 
 
-def _grupo_cards_estatistica(titulo: str, cards: list) -> html.Div:
+def _grupo_cards_estatistica(titulo: str, cards: list, crescer: bool = False) -> html.Div:
     """Um grupo rotulado de cards (2026-07-30, feedback: "está meio bagunçado,
     aleatório. Agrupe as quantidades de operações, taxas e valores em blocos
     diferentes") — antes os 15 cards eram uma única fileira sem nenhuma
     ordem lógica visível (contagem, R$ e % intercalados). Agora cada grupo
     tem seu próprio rótulo e uma borda mais sutil que a dos cards
-    individuais, só pra indicar "isto pertence junto"."""
+    individuais, só pra indicar "isto pertence junto".
+
+    `crescer=True` (2026-07-31, feedback: "redimensionar os blocos pra
+    tirar os espaços vazios" — o grupo "Taxas" com só 2 cards ficava bem
+    mais estreito que "Quantidade" ao lado, sobrando um vão vazio até a
+    borda direita do container) — faz o grupo crescer (`flex: 1`) pra
+    preencher o espaço que sobra na linha, e os cards dentro dele (já
+    `flex: 1` em `_card_estatistica`) se espalham por essa largura extra
+    em vez de ficarem colados à esquerda."""
     return html.Div([
         html.Div(titulo, style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['body'],
                                  'fontWeight': '600', 'marginBottom': '10px'}),
         html.Div(cards, style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
-    ], style={'padding': '12px', 'borderRadius': TZ_RAIO_CARD, 'background': 'rgba(128,128,128,0.05)'})
+    ], style={'padding': '12px', 'borderRadius': TZ_RAIO_CARD, 'background': 'rgba(128,128,128,0.05)',
+              **({'flex': '1', 'minWidth': '240px'} if crescer else {})})
 
 
 def _cards_detalhe_estatisticas(stats: dict) -> html.Div:
@@ -2842,7 +2851,7 @@ def _cards_detalhe_estatisticas(stats: dict) -> html.Div:
         _card_estatistica('Fator de Recuperação', fator_recuperacao_str,
                            cor=(C['green'] if (fator_recuperacao or 0) >= 1
                                 else (C['red'] if fator_recuperacao is not None else None))),
-    ])
+    ], crescer=True)
     grupo_valores = _grupo_cards_estatistica('Valores (R$)', [
         _card_estatistica('Saldo Total', f"R$ {stats['saldo_total']:+.2f}",
                            cor=C['green'] if stats['saldo_total'] > 0 else C['red']),
@@ -3161,10 +3170,18 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
         # Calendário (coluna direita, mais alto) ainda não terminou. Ambos
         # sempre ALL-TIME (não filtram por período do calendário acima),
         # mesma convenção de `stats_geral`/`scores` logo abaixo.
+        # `align='flex-start'` (2026-07-31, feedback: "redimensionar os
+        # blocos pra tirar os espaços vazios") — o default do `dmc.Grid`
+        # (`align='stretch'`) força as duas colunas à altura da mais alta;
+        # como Trades Recentes (8 linhas) é bem mais alto que o Progress
+        # Tracker (heatmap compacto + legenda + feedback), o card do
+        # Progress Tracker esticava até a mesma altura, sobrando vão vazio
+        # dentro da própria borda do card. Sem stretch, cada card fica na
+        # sua altura natural — sem vão.
         dmc.Grid([
             dmc.GridCol(_bloco_progress_tracker(stats_geral['por_dia'], tema), span={'base': 12, 'md': 5}),
             dmc.GridCol(_bloco_trades_recentes(tema), span={'base': 12, 'md': 7}),
-        ], gutter='md', mb='md'),
+        ], gutter='md', mb='md', align='flex-start'),
 
         # Trade Duration Performance (item F, fase 5, `spec_redesenho_
         # tradezella.md`) — independente do resto, entra a qualquer momento.
