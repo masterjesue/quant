@@ -1070,6 +1070,31 @@ def trades_recentes(n: int = 8, df: pd.DataFrame | None = None) -> list[dict]:
     return linhas
 
 
+def dados_duracao_performance(df: pd.DataFrame | None = None) -> list[dict]:
+    """Duração × resultado de cada trade real (item F, fase 5 — "Trade
+    Duration Performance" do TradeZella, scatter duração × P&L). Só
+    trades com AMBOS os timestamps preenchidos (`duracao_minutos_trade`
+    retorna `None` senão) — boa parte da base real não tem os dois, então
+    este gráfico nasce com amostra parcial, não 100% dos trades (mesma
+    ressalva já documentada em `duracao_minutos_trade`)."""
+    if df is None:
+        df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)]
+    linhas = []
+    for _, row in reais.iterrows():
+        duracao = duracao_minutos_trade(row)
+        if duracao is None:
+            continue
+        linhas.append({
+            "duracao_minutos": duracao,
+            "saldo_operacao_reais": float(row["saldo_operacao_reais"]) if pd.notna(row["saldo_operacao_reais"]) else 0.0,
+            "ativo": row["ativo"],
+            "tipo_operacao": row["tipo_operacao"],
+            "data_op": str(row["data_op"]),
+        })
+    return linhas
+
+
 # Caps do Anticovardia Score (item F, redesenho TradeZella) — primeiro
 # palpite, mesmo espírito de SCORE_CAP_*/SCORE_PESO_* acima: ajustar depois
 # de ver o número real na tela. CAP_DRAWDOWN é em R$ FIXO, não em % do pico

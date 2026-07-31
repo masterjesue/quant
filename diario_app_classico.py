@@ -28,7 +28,7 @@ import base64
 import calendar
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -2237,6 +2237,55 @@ def _bloco_trades_recentes(tema: str = 'light') -> dmc.Card:
     ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
 
 
+def _grafico_duracao_performance(tema: str = 'light') -> go.Figure:
+    """Scatter Duração × Resultado (item F, fase 5 — "Trade Duration
+    Performance" do TradeZella). Um ponto por trade real com os dois
+    timestamps preenchidos (`dt.dados_duracao_performance` — boa parte da
+    base não tem, amostra parcial por natureza), cor por sinal do saldo
+    (verde ganho/vermelho perda), eixo X em minutos, eixo Y em R$."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    linhas = dt.dados_duracao_performance()
+    fig = go.Figure()
+    if linhas:
+        duracoes = [t['duracao_minutos'] for t in linhas]
+        saldos = [t['saldo_operacao_reais'] for t in linhas]
+        cores = [p['green'] if s > 0 else (p['red'] if s < 0 else p['text2']) for s in saldos]
+        textos = [f"{t['ativo']} · {_ROTULO_DIRECAO_OPERACAO.get(t['tipo_operacao'], t['tipo_operacao'])} · {t['data_op']}"
+                  for t in linhas]
+        fig.add_trace(go.Scatter(
+            x=duracoes, y=saldos, mode='markers',
+            marker=dict(color=cores, size=8, opacity=0.75, line=dict(width=1, color=p['panel'])),
+            text=textos, hovertemplate='%{text}<br>Duração: %{x:.0f} min<br>Resultado: R$ %{y:.2f}<extra></extra>',
+        ))
+        fig.add_hline(y=0, line_width=1, line_color=p['border'])
+    fig.update_layout(
+        paper_bgcolor=p['panel'], plot_bgcolor=p['panel'],
+        font=dict(family=FONTS['body'], color=p['text2'], size=10),
+        margin=dict(l=45, r=10, t=10, b=35), height=260,
+        xaxis=dict(showgrid=True, gridcolor=p['border'], gridwidth=0.5, title='Duração (minutos)'),
+        yaxis=dict(showgrid=True, gridcolor=p['border'], gridwidth=0.5, title='R$', zeroline=False),
+    )
+    return fig
+
+
+def _bloco_duracao_performance(tema: str = 'light') -> dmc.Card:
+    """Card "Desempenho por Duração da Operação" (item F, fase 5) — só
+    aparece com conteúdo real; card informativo quando não há amostra
+    (a maioria dos trades antigos não tem os 2 timestamps)."""
+    linhas = dt.dados_duracao_performance()
+    if not linhas:
+        return dmc.Card(
+            'Sem trades reais com horário de entrada/saída registrado ainda '
+            '(precisa dos dois timestamps preenchidos).',
+            withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', w='100%',
+            className='tz-card', style={'fontSize': '12px', 'color': C['text2']})
+    return dmc.Card([
+        dmc.Text('Desempenho por Duração da Operação', size='sm', fw=600, mb='sm'),
+        dcc.Graph(figure=_grafico_duracao_performance(tema),
+                  config={'displayModeBar': False, 'responsive': True}, style={'width': '100%'}),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
 def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Div:
     """Painel "Análise de Estratégia" — pedido do docx: "junte os blocos Por
     Ativo, Por Janela, Por Sala/Análise e Por Tags Setup/Erro num painel de
@@ -2869,6 +2918,86 @@ def _bloco_status_badges() -> html.Div:
     ]))
 
 
+def _opacidade_progress_tracker(n: int) -> float:
+    """Bucket de intensidade do Progress Tracker — 0 trades = célula vazia,
+    escala até 1.0 (calibrado contra o limiar de overtrading já documentado
+    no estudo de estratégias vencedoras: 5+ trades/dia é o ponto onde os
+    dias começam a virar prejuízo)."""
+    if n <= 0:
+        return 0.0
+    if n <= 2:
+        return 0.25
+    if n <= 4:
+        return 0.5
+    if n <= 6:
+        return 0.75
+    return 1.0
+
+
+def _bloco_progress_tracker(por_dia: dict, tema: str = 'light') -> dmc.Card:
+    """Progress Tracker (item F, fase 7, `spec_redesenho_tradezella.md`) —
+    heatmap estilo GitHub contribution graph, últimas 52 semanas terminando
+    hoje. Intensidade = Nº de trades operados naquele dia (decisão do
+    Jesué, 2026-07-30: "analise o padrão do TradeZella e implemente da
+    mesma forma" — usa `por_dia['n']`, que já existe em
+    `calcular_estatisticas`, em vez de inventar uma leitura de disciplina/
+    aderência sem regra formal cadastrada — mesma cautela já documentada em
+    `calcular_score_confiabilidade`)."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    hoje = date.today()
+    # Python: segunda=0..domingo=6 -> aqui queremos domingo=0..sábado=6
+    # (primeiro dia da semana = domingo, mesma convenção do resto do Diário).
+    indice_domingo = (hoje.weekday() + 1) % 7
+    domingo_atual = hoje - timedelta(days=indice_domingo)
+    n_semanas = 52
+    domingo_inicio = domingo_atual - timedelta(weeks=n_semanas - 1)
+
+    def _cor_celula(n: int) -> str:
+        op = _opacidade_progress_tracker(n)
+        return _hex_para_rgba(p['green'], op) if op > 0 else 'rgba(128,128,128,0.08)'
+
+    colunas_semana, rotulos_mes = [], []
+    mes_ja_rotulado = None
+    for semana in range(n_semanas):
+        domingo_semana = domingo_inicio + timedelta(weeks=semana)
+        celulas = []
+        rotulo_mes = ''
+        for offset in range(7):
+            dia = domingo_semana + timedelta(days=offset)
+            if dia > hoje:
+                celulas.append(html.Div(style={'width': '11px', 'height': '11px'}))
+                continue
+            n = por_dia.get(dia.isoformat(), {}).get('n', 0)
+            celulas.append(html.Div(title=f"{dia.strftime('%d/%m/%Y')}: {n} trade(s)", style={
+                'width': '11px', 'height': '11px', 'borderRadius': '2px', 'background': _cor_celula(n),
+            }))
+            if dia.day <= 7 and dia.month != mes_ja_rotulado:
+                rotulo_mes = _NOMES_MES[dia.month][:3]
+                mes_ja_rotulado = dia.month
+        rotulos_mes.append(rotulo_mes)
+        colunas_semana.append(html.Div(celulas, style={'display': 'flex', 'flexDirection': 'column', 'gap': '2px'}))
+
+    linha_meses = html.Div([
+        html.Div(rotulo, style={'width': '11px', 'fontSize': '9px', 'color': p['text2'], 'flexShrink': '0'})
+        for rotulo in rotulos_mes
+    ], style={'display': 'flex', 'gap': '2px', 'marginBottom': '4px'})
+
+    legenda = html.Div([
+        html.Span('Menos', style={'fontSize': '10px', 'color': p['text2'], 'marginRight': '6px'}),
+        *[html.Div(style={'width': '11px', 'height': '11px', 'borderRadius': '2px', 'marginRight': '3px',
+                           'background': (_hex_para_rgba(p['green'], op) if op > 0 else 'rgba(128,128,128,0.08)')})
+          for op in (0.0, 0.25, 0.5, 0.75, 1.0)],
+        html.Span('Mais', style={'fontSize': '10px', 'color': p['text2'], 'marginLeft': '3px'}),
+    ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '8px'})
+
+    return dmc.Card([
+        dmc.Text('Progress Tracker', size='sm', fw=600, mb='sm'),
+        html.Div([linha_meses, html.Div(colunas_semana, style={'display': 'flex', 'gap': '2px'})],
+                  style={'overflowX': 'auto', 'paddingBottom': '4px'}),
+        legenda,
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
 def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 'light') -> html.Div:
     """Shell montado 1x por ativação da aba — ver
     `diario_app_98.py::_construir_diario98_estatisticas` pro raciocínio
@@ -2979,6 +3108,10 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
         # mesma convenção de `stats_geral`/`scores` logo abaixo.
         _bloco_trades_recentes(tema),
 
+        # Trade Duration Performance (item F, fase 5, `spec_redesenho_
+        # tradezella.md`) — independente do resto, entra a qualquer momento.
+        _bloco_duracao_performance(tema),
+
         # `stats_geral` é o SEM filtro de período (ver a chamada em
         # `montar_sub_aba_diario`), igual ao `scores` — os dois lados da
         # tabela fundida precisam falar do mesmo recorte.
@@ -2989,6 +3122,12 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
         _bloco_tradezella('Análise de Estratégia', _bloco_analise_estrategia(stats_geral, tema)),
         _bloco_tradezella('Confiabilidade por Estratégia',
                           _tabela_score_confiabilidade(scores, stats_geral['por_estrategia'])),
+
+        # Progress Tracker (item F, fase 7 — por último, decisão já tomada:
+        # intensidade = Nº de trades/dia, ver docstring de
+        # `_bloco_progress_tracker`) usa `por_dia` de `stats_geral`
+        # (ALL-TIME, já calculado acima).
+        _bloco_progress_tracker(stats_geral['por_dia'], tema),
 
         _bloco_status_badges(),
     ])
