@@ -119,11 +119,17 @@ tooling novo.
    MESMA linha da célula (ex: "-1.14R, 33.33%"), conferido pixel a pixel
    contra a referência anotada, não em linhas separadas como eu tinha
    errado na primeira tentativa. Verificado ao vivo nos dois temas.
-5. **Trade Duration Performance** (scatter) — independente, pode entrar em
-   paralelo a qualquer momento depois do item 1.
-6. **Recent Trades condensado** — inclui a correção do Task #29
-   (`dash_table.DataTable`), maior escopo técnico da lista.
-7. **Progress Tracker** — por último, só depois de decidida a métrica.
+5. **✅ CONCLUÍDO (2026-07-31)** — **Trade Duration Performance** (scatter):
+   `dt.dados_duracao_performance()` (só trades com os 2 timestamps
+   preenchidos) + `_grafico_duracao_performance`/`_bloco_duracao_performance`
+   em `diario_app_classico.py`, logo abaixo de Trades Recentes.
+6. **✅ CONCLUÍDO (2026-07-31)** — **Recent Trades condensado**
+   (`_bloco_trades_recentes`/`dt.trades_recentes`) — mantido SEPARADO do
+   Task #29, sem paginação, N mais recentes por `data_op`+`id_trade`.
+7. **✅ CONCLUÍDO (2026-07-31)** — **Progress Tracker**: heatmap estilo
+   GitHub contribution graph (`_bloco_progress_tracker`), 52 semanas,
+   intensidade = Nº de trades/dia (`por_dia['n']`, decisão já registrada
+   acima — sem inventar métrica de disciplina).
 
 ## Decisões do Jesué (2026-07-30)
 
