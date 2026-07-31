@@ -1127,6 +1127,48 @@ def feedback_progress_tracker(por_dia: dict) -> dict:
             "pct_overtrading": pct_overtrading, "acao_texto": acao, "cor_acao": cor}
 
 
+def evolucao_metricas_expandida(df: pd.DataFrame | None = None,
+                                 ano: int | None = None, mes: int | None = None) -> dict:
+    """Evolução dia-a-dia (janela EXPANSIVA — cada ponto usa todos os
+    trades até aquele dia inclusive, dentro do recorte ano/mês) de Payoff/
+    Fator de Recuperação/Expectativa — pro mini-gráfico + variação % dos
+    cards de "Detalhes" (2026-07-31, pedido: "esse mini gráfico, e a
+    setinha indicando a % de aumento ou de queda... adicione nas taxas e
+    também na expectativa"). Não é um valor POR dia, é o agregado
+    recalculado a cada dia novo — mostra como a métrica convergiu conforme
+    mais trades entraram na base. `ano`/`mes` seguem a MESMA convenção de
+    `calcular_estatisticas` (mesmo recorte do período selecionado no
+    calendário), pra sparkline e número grande sempre falarem do mesmo
+    período. `saldo_total` não precisa disso — já usa
+    `stats['evolucao_saldo_acumulado']`, que já é expansivo."""
+    if df is None:
+        df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)].copy()
+    if ano is not None or mes is not None:
+        data_op_dt = pd.to_datetime(reais["data_op"], errors="coerce")
+        mascara = pd.Series(True, index=reais.index)
+        if ano is not None:
+            mascara &= data_op_dt.dt.year == ano
+        if mes is not None:
+            mascara &= data_op_dt.dt.month == mes
+        reais = reais[mascara]
+    if reais.empty:
+        return {"datas": [], "payoff": [], "fator_recuperacao": [], "expectativa": []}
+
+    reais = reais.copy()
+    reais["data_op"] = pd.to_datetime(reais["data_op"])
+    dias = sorted(reais["data_op"].dt.date.unique())
+    datas, payoff, fator_recuperacao, expectativa = [], [], [], []
+    for dia in dias:
+        ate_aqui = reais[reais["data_op"].dt.date <= dia]
+        stats = calcular_estatisticas(df=ate_aqui)
+        datas.append(dia.isoformat())
+        payoff.append(stats["payoff"])
+        fator_recuperacao.append(stats["fator_recuperacao"])
+        expectativa.append(stats["expectativa"])
+    return {"datas": datas, "payoff": payoff, "fator_recuperacao": fator_recuperacao, "expectativa": expectativa}
+
+
 def feedback_duracao_performance(linhas: list[dict]) -> dict:
     """Veredito DINÂMICO pro card Desempenho por Duração da Operação (item
     F) — compara duração média dos trades vencedores x perdedores (mesmo

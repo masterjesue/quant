@@ -1833,10 +1833,32 @@ def _cards_header_tradezella(stats: dict, tema: str) -> dmc.SimpleGrid:
     p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
 
     saldo_total = stats['saldo_total']
+    # Sparkline + seta de variação % (2026-07-31, pedido: "esse mini
+    # gráfico, e a setinha indicando a % de aumento ou de queda... quero
+    # que adicione isso... no Saldo Líquido") — reaproveita
+    # `evolucao_saldo_acumulado` (já expansivo, já calculado por
+    # `calcular_estatisticas`), sem precisar de dado novo. `valor_str`
+    # composto (não string simples) — perde `animar_numero` (mesma
+    # ressalva já documentada em `_card_header_tradezella` pra conteúdo
+    # composto, mesmo padrão já usado no Current Streak).
+    evolucao_saldo = stats['evolucao_saldo_acumulado']
+    pct_saldo, direcao_saldo = _variacao_percentual(evolucao_saldo)
+    cor_seta_saldo = 'green' if direcao_saldo == 'up' else ('red' if direcao_saldo == 'down' else 'gray')
+    seta_saldo = '▲' if direcao_saldo == 'up' else ('▼' if direcao_saldo == 'down' else '—')
+    texto_variacao_saldo = f"{seta_saldo} {abs(pct_saldo):.1f}%" if pct_saldo is not None else seta_saldo
+    componente_saldo = None
+    if len([v for v in evolucao_saldo if v is not None]) >= 2:
+        componente_saldo = dcc.Graph(
+            figure=_grafico_sparkline(evolucao_saldo, tema, direcao_saldo),
+            config={'displayModeBar': False}, style={'width': '70px', 'height': '48px'})
     card_net_pnl = _card_header_tradezella(
-        'Saldo Líquido', f"R$ {saldo_total:+.2f}",
-        cor_valor=('green' if saldo_total > 0 else ('red' if saldo_total < 0 else None)),
-        animar_numero=True,
+        'Saldo Líquido',
+        html.Div([
+            dmc.Text(f"R$ {saldo_total:+.2f}", size='xl', fw=700, className='tz-numero-animado',
+                      **({'c': 'green' if saldo_total > 0 else 'red'} if saldo_total != 0 else {})),
+            dmc.Text(texto_variacao_saldo, size='xs', fw=600, c=cor_seta_saldo, mt=2),
+        ]),
+        componente=componente_saldo,
     )
 
     # Anel de 3 seções (Win/Loss/Breakeven), não só um arco verde de % —
@@ -1927,6 +1949,87 @@ def _card_estatistica(titulo: str, valor: str, cor=None) -> dmc.Paper:
         dmc.Text(titulo, size='xs', c='dimmed'),
         dmc.Text(valor, size='md', fw=700, **({'c': cor} if cor else {})),
     ], radius='md', p='sm', withBorder=True, style={'minWidth': '120px', 'flex': '1'})
+
+
+def _variacao_percentual(valores: list) -> tuple:
+    """Variação % entre os 2 últimos pontos NÃO-`None` de uma série
+    expansiva (2026-07-31, pedido: "mini gráfico, e a setinha indicando a
+    % de aumento ou de queda, geralmente usado nas grades de cotações").
+    `None` quando há menos de 2 pontos válidos ou o ponto anterior é ~0
+    (percentual sobre uma base perto de zero não tem leitura estável —
+    nunca fabrica um número aqui). Direção usa o SINAL do delta bruto
+    (`atual - anterior`), não do valor em si — funciona igual pra métricas
+    que cruzam zero (Saldo Líquido, Fator de Recuperação)."""
+    validos = [v for v in valores if v is not None]
+    if len(validos) < 2:
+        return None, 'flat'
+    anterior, atual = validos[-2], validos[-1]
+    delta = atual - anterior
+    direcao = 'up' if delta > 1e-9 else ('down' if delta < -1e-9 else 'flat')
+    if abs(anterior) < 1e-9:
+        return None, direcao
+    return delta / abs(anterior) * 100, direcao
+
+
+def _grafico_sparkline(valores: list, tema: str, direcao: str) -> go.Figure:
+    """Mini-gráfico de linha, sem eixos/grade — mesmo padrão visual de
+    grade de cotações (2026-07-31). Cor segue a direção (verde=subiu,
+    vermelho=desceu, cinza=estável), igual à leitura de
+    `_variacao_percentual`."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    cor = p['green'] if direcao == 'up' else (p['red'] if direcao == 'down' else p['text2'])
+    validos = [v for v in valores if v is not None]
+    fig = go.Figure(go.Scatter(
+        x=list(range(len(validos))), y=validos, mode='lines',
+        line=dict(color=cor, width=2, shape='spline', smoothing=0.3),
+        fill='tozeroy', fillcolor=_hex_para_rgba(cor, 0.15),
+    ))
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=0, r=0, t=4, b=4),
+        xaxis=dict(visible=False, fixedrange=True), yaxis=dict(visible=False, fixedrange=True),
+        showlegend=False,
+    )
+    return fig
+
+
+def _card_com_sparkline(titulo: str, valor_str: str, valores_serie: list, tema: str,
+                          cor_valor=None, destaque: bool = False) -> dmc.Card:
+    """Card com mini-gráfico (sparkline) + variação % com seta, estilo
+    "grade de cotações" (2026-07-31, pedido: "esse mini gráfico, e a
+    setinha indicando a % de aumento ou de queda... adicione isso em
+    alguns blocos"). `valores_serie`: pontos recentes da métrica (pode ter
+    `None` nos primeiros dias, ex: Payoff antes do 1º trade perdedor) —
+    variação calculada só sobre os pontos válidos.
+
+    `destaque=True` (pedido: "quero dar mais destaque para a expectativa")
+    aumenta fonte/padding e usa `w='100%'` em vez de dividir espaço com
+    vizinhos — usado só pelo card de Expectativa."""
+    pct, direcao = _variacao_percentual(valores_serie)
+    cor_seta = 'green' if direcao == 'up' else ('red' if direcao == 'down' else 'gray')
+    seta = '▲' if direcao == 'up' else ('▼' if direcao == 'down' else '—')
+    texto_variacao = f"{seta} {abs(pct):.1f}%" if pct is not None else seta
+    tem_grafico = len([v for v in valores_serie if v is not None]) >= 2
+
+    texto = html.Div([
+        dmc.Text(titulo, size='xs' if not destaque else 'sm', c='dimmed'),
+        dmc.Text(valor_str, size='md' if not destaque else 'xl', fw=700,
+                  **({'c': cor_valor} if cor_valor else {})),
+        dmc.Text(texto_variacao, size='xs', fw=600, c=cor_seta, mt=2),
+    ])
+    if tem_grafico:
+        altura = 44 if not destaque else 60
+        grafico = dcc.Graph(
+            figure=_grafico_sparkline(valores_serie, tema, direcao),
+            config={'displayModeBar': False},
+            style={'width': f'{altura + 20}px', 'height': f'{altura}px'},
+        )
+        conteudo = dmc.Group([grafico, texto], gap='sm', wrap='nowrap', justify='space-between')
+    else:
+        conteudo = texto
+    return dmc.Paper(conteudo, radius='md', p='sm', withBorder=True,
+                      style={'minWidth': '190px' if destaque else '160px', 'flex': '1',
+                             **({'width': '100%'} if destaque else {})})
 
 
 def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
@@ -2822,13 +2925,20 @@ def _grupo_cards_estatistica(titulo: str, cards: list, crescer: bool = False) ->
               **({'flex': '1', 'minWidth': '240px'} if crescer else {})})
 
 
-def _cards_detalhe_estatisticas(stats: dict) -> html.Div:
+def _cards_detalhe_estatisticas(stats: dict, tema: str = 'light',
+                                  ano: int | None = None, mes: int | None = None) -> html.Div:
     """Grupos Quantidade/Taxas/Valores (nome antigo: `_cards_estatisticas`) —
     demovidos pra bloco secundário "Detalhes" quando o header estilo
     TradeZella (`_cards_header_tradezella`) entrou (item F, fase 2,
     2026-07-30). Nenhum dado foi descartado: Wins/Losses/Breakeven/
     Sequências/Max Gain-Loss/Drawdown/Ganho-Perda Total continuam aqui,
-    só não fazem mais parte do header principal."""
+    só não fazem mais parte do header principal.
+
+    `ano`/`mes` (2026-07-31) seguem o MESMO recorte de período já usado
+    em `stats` (calendário) — passados adiante pra
+    `dt.evolucao_metricas_expandida` pra sparkline e número grande sempre
+    falarem do mesmo período."""
+    evolucao = dt.evolucao_metricas_expandida(ano=ano, mes=mes)
     payoff_str = f"{stats['payoff']:.2f}" if stats['payoff'] is not None else '—'
     grupo_quantidade = _grupo_cards_estatistica('Quantidade', [
         _card_estatistica('Operações', str(stats['num_operacoes'])),
@@ -2840,22 +2950,23 @@ def _cards_detalhe_estatisticas(stats: dict) -> html.Div:
     ])
     # Taxa de Acerto já aparece no card do header (`_cards_header_tradezella`)
     # — removida daqui pra não duplicar (2026-07-31, feedback do Jesué).
-    # Fator de Recuperação (saldo total / |drawdown máximo|) — já existia
-    # como eixo normalizado 0-100 do radar Anticovardia Score, mas nunca
-    # aparecia no dashboard em valor cru (2026-07-31, feedback: "parece
-    # ser um indicador novo... adicione-o também no dashboard").
+    # Payoff/Fator de Recuperação ganham sparkline + variação % (2026-07-31,
+    # pedido: "esse mini gráfico, e a setinha... adicione nas taxas").
     fator_recuperacao = stats['fator_recuperacao']
-    fator_recuperacao_str = f"{fator_recuperacao:.2f}" if fator_recuperacao is not None else '—'
     grupo_taxas = _grupo_cards_estatistica('Taxas', [
-        _card_estatistica('Payoff', payoff_str),
-        _card_estatistica('Fator de Recuperação', fator_recuperacao_str,
-                           cor=(C['green'] if (fator_recuperacao or 0) >= 1
-                                else (C['red'] if fator_recuperacao is not None else None))),
+        _card_com_sparkline('Payoff', payoff_str, evolucao['payoff'], tema),
+        _card_com_sparkline('Fator de Recuperação',
+                             f"{fator_recuperacao:.2f}" if fator_recuperacao is not None else '—',
+                             evolucao['fator_recuperacao'], tema,
+                             cor_valor=('green' if (fator_recuperacao or 0) >= 1
+                                        else ('red' if fator_recuperacao is not None else None))),
     ], crescer=True)
+    # Saldo Total removido (2026-07-31, feedback: "remova o Saldo Total dos
+    # Detalhes - é a mesma informação repetida" — já é o card "Saldo
+    # Líquido" do header). Expectativa também sai daqui: vira card
+    # PRÓPRIO em destaque logo abaixo (mesmo feedback: "quero dar mais
+    # destaque para a expectativa, é um dos principais indicadores").
     grupo_valores = _grupo_cards_estatistica('Valores (R$)', [
-        _card_estatistica('Saldo Total', f"R$ {stats['saldo_total']:+.2f}",
-                           cor=C['green'] if stats['saldo_total'] > 0 else C['red']),
-        _card_estatistica('Expectativa', f"R$ {stats['expectativa']:+.2f}"),
         # Ganho Total/Perda Total (2026-07-30, feedback: "está faltando") —
         # soma de todos os vencedores/perdedores, ao lado de Max Gain/Max Loss
         # (melhor/pior trade ÚNICO) pra não confundir os dois.
@@ -2865,9 +2976,17 @@ def _cards_detalhe_estatisticas(stats: dict) -> html.Div:
         _card_estatistica('Max Loss', f"R$ {stats['max_loss']:+.2f}", cor=C['red']),
         _card_estatistica('Drawdown Máx.', f"R$ {stats['drawdown_maximo_reais']:+.2f}",
                            cor=C['red'] if stats['drawdown_maximo_reais'] < 0 else None),
-    ])
-    return html.Div([grupo_quantidade, grupo_taxas, grupo_valores],
-                     style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginBottom': '16px'})
+    ], crescer=True)
+    card_expectativa = _card_com_sparkline(
+        'Expectativa Matemática', f"R$ {stats['expectativa']:+.2f}", evolucao['expectativa'], tema,
+        cor_valor=('green' if stats['expectativa'] > 0 else ('red' if stats['expectativa'] < 0 else None)),
+        destaque=True)
+    return html.Div([
+        card_expectativa,
+        html.Div([grupo_quantidade, grupo_taxas],
+                  style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginTop': '12px'}),
+        html.Div([grupo_valores], style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginTop': '12px'}),
+    ], style={'marginBottom': '16px'})
 
 
 _TOGGLE_LARGURA = 42
@@ -2902,11 +3021,12 @@ def _estilo_toggle_bolinha(ativo: bool) -> dict:
     }
 
 
-def _cards_ou_vazio_estatisticas(stats: dict, tema: str = 'light') -> html.Div:
+def _cards_ou_vazio_estatisticas(stats: dict, tema: str = 'light',
+                                   ano: int | None = None, mes: int | None = None) -> html.Div:
     if stats['num_operacoes']:
         return html.Div([
             _cards_header_tradezella(stats, tema),
-            _bloco_tradezella('Detalhes', _cards_detalhe_estatisticas(stats)),
+            _bloco_tradezella('Detalhes', _cards_detalhe_estatisticas(stats, tema, ano=ano, mes=mes)),
         ])
     return html.Div('Nenhum trade real neste período.', style={
         'padding': '16px', 'textAlign': 'center', 'color': C['text2'], 'fontSize': '12px',
@@ -4957,7 +5077,7 @@ def atualizar_periodo_estatisticas(mes_atual, modo_ano, stats_visiveis, tema_atu
         detalhe_dias = dt.detalhe_dias_calendario(ano=ano, mes=mes)
         grade = _grade_calendario(stats['por_dia'], detalhe_dias, ano, mes, stats_visiveis, tema_atual or 'light')
     return (
-        _cards_ou_vazio_estatisticas(stats, tema_atual or 'light'),
+        _cards_ou_vazio_estatisticas(stats, tema_atual or 'light', ano=ano, mes=None if modo_ano else mes),
         grade,
         _NOMES_MES[mes],
         str(ano),
