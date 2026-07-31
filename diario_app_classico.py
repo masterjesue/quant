@@ -2268,6 +2268,29 @@ def _grafico_duracao_performance(tema: str = 'light') -> go.Figure:
     return fig
 
 
+def _bloco_o_que_fazer(descricao: str, resultado: dict) -> html.Div:
+    """"O que fazer com isso" (2026-07-31, pedido: "coloque um feedback
+    dinâmico e uma descrição... o nosso famoso 'o que fazer com isso'") —
+    mesmo padrão já estabelecido em `dashboard.py::_balao_big_players` pros
+    velocímetros do hero: descrição FIXA do que o gráfico mostra +
+    veredito DINÂMICO calculado do dado real (`resultado`, de
+    `dt.feedback_progress_tracker`/`dt.feedback_duracao_performance`), não
+    um texto genérico igual sempre."""
+    if not resultado.get('tem_dado'):
+        corpo = html.Div(resultado.get('mensagem', 'Sem dado suficiente ainda.'),
+                          style={'fontSize': '11px', 'color': C['text2'], 'lineHeight': '1.5'})
+    else:
+        corpo = html.Div([
+            html.Span('O que fazer: ', style={'fontWeight': '700', 'color': C['text']}),
+            html.Span(resultado['acao_texto'], style={'color': C.get(resultado.get('cor_acao'), C['text2'])}),
+        ], style={'fontSize': '11px', 'lineHeight': '1.5'})
+    return html.Div([
+        html.Div(descricao, style={'fontSize': '11px', 'color': C['text2'], 'lineHeight': '1.5', 'marginBottom': '6px'}),
+        corpo,
+    ], style={'marginTop': '10px', 'paddingTop': '10px', 'borderTop': f"1px solid {C['border']}",
+              'fontFamily': FONTS['body']})
+
+
 def _bloco_duracao_performance(tema: str = 'light') -> dmc.Card:
     """Card "Desempenho por Duração da Operação" (item F, fase 5) — só
     aparece com conteúdo real; card informativo quando não há amostra
@@ -2283,6 +2306,10 @@ def _bloco_duracao_performance(tema: str = 'light') -> dmc.Card:
         dmc.Text('Desempenho por Duração da Operação', size='sm', fw=600, mb='sm'),
         dcc.Graph(figure=_grafico_duracao_performance(tema),
                   config={'displayModeBar': False, 'responsive': True}, style={'width': '100%'}),
+        _bloco_o_que_fazer(
+            'Cada ponto é um trade real (só os com horário de entrada e saída '
+            'registrados): duração em minutos no eixo X, resultado em R$ no eixo Y.',
+            dt.feedback_duracao_performance(linhas)),
     ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
 
 
@@ -2305,28 +2332,41 @@ def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Di
     # os elementos") — SimpleGrid divide a linha em células IGUAIS de
     # verdade; um `dmc.Card` dentro de flexbox não estica sozinho e deixava
     # metade da linha em branco quando o card vizinho era mais estreito.
+    #
+    # Detalhes (Melhor por X + Por Ativo/Janela/Sala/Tags) recolhidos por
+    # padrão dentro de `dmc.Collapse` (2026-07-31, feedback: "deixe
+    # Vencedora/Perdedora e Mentor de IA visíveis, o resto contraído,
+    # clicando numa seta") — só Vencedora/Perdedora e Mentor de IA ficam
+    # sempre visíveis. Botão estático (nunca recriado pela própria
+    # callback, mesmo cuidado de `btn-diario-cal-config`): o próprio
+    # `children` do botão guarda o estado (seta ▼/▲), não precisa de
+    # `dcc.Store` extra.
     return html.Div([
         dmc.SimpleGrid([
             _card_estrategia_destaque('Estratégia Vencedora', '🏆', analise['vencedora'], 'green'),
             _card_estrategia_destaque('Estratégia Perdedora', '📉', analise['perdedora'], 'red'),
         ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
-        dmc.SimpleGrid([
-            _tabela_melhor_por('Melhor por Horário', analise['melhor_por_janela'], rotulos_janela),
-            _tabela_melhor_por('Melhor por Direção', analise['melhor_por_direcao'], _ROTULO_DIRECAO_OPERACAO),
-        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
-        dmc.SimpleGrid([
-            _tabela_melhor_por('Melhor por Ativo', analise['melhor_por_ativo']),
-            _tabela_melhor_por('Melhor por Categoria', analise['melhor_por_categoria'],
-                               dt.ROTULO_CATEGORIA_ESTRATEGIA),
-        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
-        dmc.SimpleGrid([
-            _bloco_breakdown_diario('Por Ativo', stats_geral['por_ativo']),
-            _bloco_breakdown_diario('Por Janela', stats_geral['por_janela']),
-        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
-        dmc.SimpleGrid([
-            _bloco_breakdown_diario('Por Sala/Análise', stats_geral['por_sala']),
-            _bloco_breakdown_diario('Por Tags Setup/Erro', stats_geral['por_tags_setup_erro']),
-        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.Button('▼ Ver detalhes', id='btn-analise-estrategia-detalhes', n_clicks=0,
+                   variant='subtle', color='gray', size='xs', mb='sm'),
+        dmc.Collapse([
+            dmc.SimpleGrid([
+                _tabela_melhor_por('Melhor por Horário', analise['melhor_por_janela'], rotulos_janela),
+                _tabela_melhor_por('Melhor por Direção', analise['melhor_por_direcao'], _ROTULO_DIRECAO_OPERACAO),
+            ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+            dmc.SimpleGrid([
+                _tabela_melhor_por('Melhor por Ativo', analise['melhor_por_ativo']),
+                _tabela_melhor_por('Melhor por Categoria', analise['melhor_por_categoria'],
+                                   dt.ROTULO_CATEGORIA_ESTRATEGIA),
+            ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+            dmc.SimpleGrid([
+                _bloco_breakdown_diario('Por Ativo', stats_geral['por_ativo']),
+                _bloco_breakdown_diario('Por Janela', stats_geral['por_janela']),
+            ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+            dmc.SimpleGrid([
+                _bloco_breakdown_diario('Por Sala/Análise', stats_geral['por_sala']),
+                _bloco_breakdown_diario('Por Tags Setup/Erro', stats_geral['por_tags_setup_erro']),
+            ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        ], id='colapso-analise-estrategia-detalhes', opened=False),
         _bloco_mentor_ia(),
     ])
 
@@ -2995,6 +3035,10 @@ def _bloco_progress_tracker(por_dia: dict, tema: str = 'light') -> dmc.Card:
         html.Div([linha_meses, html.Div(colunas_semana, style={'display': 'flex', 'gap': '2px'})],
                   style={'overflowX': 'auto', 'paddingBottom': '4px'}),
         legenda,
+        _bloco_o_que_fazer(
+            'Cada célula é um dia — quanto mais escura, mais trades reais você operou nele. '
+            'Últimas 52 semanas até hoje.',
+            dt.feedback_progress_tracker(por_dia)),
     ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
 
 
@@ -3102,11 +3146,19 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
             ),
         ], gutter='md', mb='md'),
 
-        # Trades Recentes (item F, 2026-07-31 — "você não está mostrando o
-        # bloco de trades recentes no dashboard, como é no TradeZella")
-        # sempre ALL-TIME (não filtra por período do calendário acima),
+        # Progress Tracker (item F, fase 7) à esquerda + Trades Recentes
+        # (item F) à direita, no mesmo split 5/7 do grid acima (2026-07-31,
+        # feedback: "suba o Progress Tracker, coloque do lado esquerdo dos
+        # Trades Recentes, tire esse espaço vazio abaixo do calendário") —
+        # continua a coluna esquerda visualmente, em vez de deixar um vão
+        # abaixo de Evolução de Saldo/Anticovardia Score enquanto o
+        # Calendário (coluna direita, mais alto) ainda não terminou. Ambos
+        # sempre ALL-TIME (não filtram por período do calendário acima),
         # mesma convenção de `stats_geral`/`scores` logo abaixo.
-        _bloco_trades_recentes(tema),
+        dmc.Grid([
+            dmc.GridCol(_bloco_progress_tracker(stats_geral['por_dia'], tema), span={'base': 12, 'md': 5}),
+            dmc.GridCol(_bloco_trades_recentes(tema), span={'base': 12, 'md': 7}),
+        ], gutter='md', mb='md'),
 
         # Trade Duration Performance (item F, fase 5, `spec_redesenho_
         # tradezella.md`) — independente do resto, entra a qualquer momento.
@@ -3122,12 +3174,6 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
         _bloco_tradezella('Análise de Estratégia', _bloco_analise_estrategia(stats_geral, tema)),
         _bloco_tradezella('Confiabilidade por Estratégia',
                           _tabela_score_confiabilidade(scores, stats_geral['por_estrategia'])),
-
-        # Progress Tracker (item F, fase 7 — por último, decisão já tomada:
-        # intensidade = Nº de trades/dia, ver docstring de
-        # `_bloco_progress_tracker`) usa `por_dia` de `stats_geral`
-        # (ALL-TIME, já calculado acima).
-        _bloco_progress_tracker(stats_geral['por_dia'], tema),
 
         _bloco_status_badges(),
     ])
@@ -4816,6 +4862,25 @@ def alternar_config_calendario(n_clicks, rotulo_atual, stats_visiveis):
     if rotulo_atual == '⚙ Stats':
         return _conteudo_config_calendario(stats_visiveis or _STATS_CALENDARIO_PADRAO), '✕ Fechar'
     return None, '⚙ Stats'
+
+
+@app.callback(
+    Output('colapso-analise-estrategia-detalhes', 'opened'),
+    Output('btn-analise-estrategia-detalhes', 'children'),
+    Input('btn-analise-estrategia-detalhes', 'n_clicks'),
+    State('btn-analise-estrategia-detalhes', 'children'),
+    prevent_initial_call=True,
+)
+def alternar_detalhes_analise_estrategia(n_clicks, rotulo_atual):
+    """Abre/fecha os detalhes de "Análise de Estratégia" (2026-07-31,
+    feedback: "deixe Vencedora/Perdedora e Mentor de IA visíveis, o resto
+    contraído") — mesma mecânica de `alternar_config_calendario`: o
+    próprio rótulo do botão (seta ▼/▲) é o estado."""
+    if not n_clicks:
+        return no_update, no_update
+    if rotulo_atual == '▼ Ver detalhes':
+        return True, '▲ Ocultar detalhes'
+    return False, '▼ Ver detalhes'
 
 
 @app.callback(

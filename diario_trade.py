@@ -1095,6 +1095,66 @@ def dados_duracao_performance(df: pd.DataFrame | None = None) -> list[dict]:
     return linhas
 
 
+def feedback_progress_tracker(por_dia: dict) -> dict:
+    """Veredito DINÂMICO pro card Progress Tracker (item F, 2026-07-31,
+    pedido: "coloque um feedback dinâmico... o nosso famoso 'o que fazer
+    com isso'") — mesmo padrão já usado em `dashboard.py::
+    _balao_big_players` pros velocímetros do hero (fato calculado do dado
+    real, não texto genérico fixo). Limiar de overtrading (5+ trades/dia)
+    é o mesmo já usado em `_opacidade_progress_tracker`/no estudo de
+    estratégias vencedoras."""
+    hoje = date.today()
+    limite = (hoje - timedelta(days=29)).isoformat()
+    hoje_str = hoje.isoformat()
+    dias_no_periodo = {d: info for d, info in por_dia.items() if limite <= d <= hoje_str}
+    if not dias_no_periodo:
+        return {"tem_dado": False, "mensagem": "Sem trades reais nos últimos 30 dias."}
+    dias_operados = len(dias_no_periodo)
+    dias_overtrading = sum(1 for info in dias_no_periodo.values() if info["n"] >= 5)
+    pct_overtrading = dias_overtrading / dias_operados * 100
+    if pct_overtrading >= 30:
+        acao = (f"{dias_overtrading} de {dias_operados} dias operados nos últimos 30 dias tiveram 5+ trades "
+                f"({pct_overtrading:.0f}%) — overtrading recorrente, considere um limite diário de operações.")
+        cor = "red"
+    elif dias_overtrading > 0:
+        acao = (f"{dias_overtrading} de {dias_operados} dias operados nos últimos 30 dias tiveram 5+ trades "
+                f"— pontual, mas vale observar se vira padrão.")
+        cor = "yellow"
+    else:
+        acao = f"Nenhum dia com 5+ trades nos últimos {dias_operados} dias operados — frequência sob controle."
+        cor = "green"
+    return {"tem_dado": True, "dias_operados": dias_operados, "dias_overtrading": dias_overtrading,
+            "pct_overtrading": pct_overtrading, "acao_texto": acao, "cor_acao": cor}
+
+
+def feedback_duracao_performance(linhas: list[dict]) -> dict:
+    """Veredito DINÂMICO pro card Desempenho por Duração da Operação (item
+    F) — compara duração média dos trades vencedores x perdedores (mesmo
+    espírito de `feedback_progress_tracker`, calculado do dado real de
+    `dados_duracao_performance`, não texto fixo)."""
+    if not linhas:
+        return {"tem_dado": False, "mensagem": "Sem trades com os 2 horários registrados ainda."}
+    vencedores = [t["duracao_minutos"] for t in linhas if t["saldo_operacao_reais"] > 0]
+    perdedores = [t["duracao_minutos"] for t in linhas if t["saldo_operacao_reais"] < 0]
+    if not vencedores or not perdedores:
+        return {"tem_dado": False, "mensagem": "Amostra insuficiente pra comparar vencedores x perdedores ainda."}
+    media_venc = sum(vencedores) / len(vencedores)
+    media_perd = sum(perdedores) / len(perdedores)
+    if media_perd > media_venc * 1.3:
+        acao = (f"Perdas duram em média {media_perd:.0f} min contra {media_venc:.0f} min nos ganhos — "
+                f"sinal de segurar trade perdedor esperando reverter. Considere um stop de tempo.")
+        cor = "red"
+    elif media_venc > media_perd * 1.3:
+        acao = (f"Ganhos duram em média {media_venc:.0f} min contra {media_perd:.0f} min nas perdas — "
+                f"padrão saudável (corta perda rápido, deixa ganho correr).")
+        cor = "green"
+    else:
+        acao = f"Duração média parecida entre ganhos ({media_venc:.0f} min) e perdas ({media_perd:.0f} min) — sem sinal claro aqui."
+        cor = "yellow"
+    return {"tem_dado": True, "media_vencedores": media_venc, "media_perdedores": media_perd,
+            "acao_texto": acao, "cor_acao": cor}
+
+
 # Caps do Anticovardia Score (item F, redesenho TradeZella) — primeiro
 # palpite, mesmo espírito de SCORE_CAP_*/SCORE_PESO_* acima: ajustar depois
 # de ver o número real na tela. CAP_DRAWDOWN é em R$ FIXO, não em % do pico
