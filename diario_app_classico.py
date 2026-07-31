@@ -2145,6 +2145,55 @@ def _bloco_anticovardia_score(tema: str = 'light') -> dmc.Card:
     ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
 
 
+def _bloco_trades_recentes(tema: str = 'light') -> dmc.Card:
+    """Trades Recentes (item F — bloco condensado que faltava, 2026-07-31:
+    "você não está mostrando o bloco de trades recentes no dashboard,
+    como é no TradeZella"). Lista os últimos `dt.trades_recentes` trades
+    reais num formato compacto (data/ativo/direção/estratégia/R-múltiplo/
+    resultado) — prévia rápida, não substitui o Histórico (que tem
+    filtro completo + edição)."""
+    linhas = dt.trades_recentes(n=8)
+    if not linhas:
+        return dmc.Card('Nenhum trade real lançado ainda.', withBorder=True, shadow='sm',
+                         radius='lg', p='lg', mb='md', w='100%', className='tz-card',
+                         style={'fontSize': '12px', 'color': C['text2']})
+    nomes_estrategias = _mapa_nomes_estrategias()
+
+    def _celula(conteudo, largura, alinhar='left'):
+        return html.Div(conteudo, style={'width': largura, 'textAlign': alinhar, 'flexShrink': '0'})
+
+    cabecalho = dmc.Group([
+        _celula(dmc.Text('Data', size='xs', c='dimmed'), '70px'),
+        _celula(dmc.Text('Ativo', size='xs', c='dimmed'), '55px'),
+        _celula(dmc.Text('Direção', size='xs', c='dimmed'), '65px'),
+        dmc.Text('Estratégia', size='xs', c='dimmed', style={'flex': '1'}),
+        _celula(dmc.Text('R-Múltiplo', size='xs', c='dimmed'), '80px', 'right'),
+        _celula(dmc.Text('Resultado', size='xs', c='dimmed'), '90px', 'right'),
+    ], wrap='nowrap', gap='xs', style={'padding': '0 4px 6px 4px'})
+
+    linhas_ui = [cabecalho]
+    for t in linhas:
+        saldo = t['saldo_operacao_reais']
+        cor_saldo = 'green' if saldo > 0 else ('red' if saldo < 0 else 'dimmed')
+        r_mult = t['r_multiple']
+        direcao_label = _ROTULO_DIRECAO_OPERACAO.get(t['tipo_operacao'], t['tipo_operacao'])
+        cor_direcao = 'blue' if t['tipo_operacao'] == 'long' else 'grape'
+        nome_estrategia = nomes_estrategias.get(t['estrategia'], t['estrategia']) if t['estrategia'] else '—'
+        linhas_ui.append(dmc.Group([
+            _celula(dmc.Text(t['data_op'], size='xs'), '70px'),
+            _celula(dmc.Text(t['ativo'], size='xs', fw=600), '55px'),
+            _celula(dmc.Badge(direcao_label, color=cor_direcao, variant='light', size='sm'), '65px'),
+            dmc.Text(nome_estrategia, size='xs', c='dimmed', truncate=True, style={'flex': '1'}),
+            _celula(dmc.Text(f"{r_mult:+.2f}R" if r_mult is not None else '—', size='xs'), '80px', 'right'),
+            _celula(dmc.Text(f"R$ {saldo:+.2f}", size='xs', fw=700, c=cor_saldo), '90px', 'right'),
+        ], wrap='nowrap', gap='xs', style={'padding': '6px 4px', 'borderTop': f"1px solid {C['border']}"}))
+
+    return dmc.Card([
+        dmc.Text('Trades Recentes', size='sm', fw=600, mb='sm'),
+        html.Div(linhas_ui),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
 def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Div:
     """Painel "Análise de Estratégia" — pedido do docx: "junte os blocos Por
     Ativo, Por Janela, Por Sala/Análise e Por Tags Setup/Erro num painel de
@@ -2870,6 +2919,12 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
                 span={'base': 12, 'md': 7},
             ),
         ], gutter='md', mb='md'),
+
+        # Trades Recentes (item F, 2026-07-31 — "você não está mostrando o
+        # bloco de trades recentes no dashboard, como é no TradeZella")
+        # sempre ALL-TIME (não filtra por período do calendário acima),
+        # mesma convenção de `stats_geral`/`scores` logo abaixo.
+        _bloco_trades_recentes(tema),
 
         # `stats_geral` é o SEM filtro de período (ver a chamada em
         # `montar_sub_aba_diario`), igual ao `scores` — os dois lados da

@@ -1033,6 +1033,43 @@ def duracao_minutos_trade(trade) -> float | None:
     return (pd.Timestamp(saida) - pd.Timestamp(entrada)).total_seconds() / 60.0
 
 
+def trades_recentes(n: int = 8, df: pd.DataFrame | None = None) -> list[dict]:
+    """Os N trades reais mais recentes (bloco "Trades Recentes" do
+    dashboard, item F — espelha a lista condensada equivalente do
+    TradeZella, 2026-07-31: "você não está mostrando o bloco de trades
+    recentes"). Só trades reais (`is_simulated=False`), mesma convenção
+    do resto do módulo de estatísticas.
+
+    Ordena por `data_op` e desempata por `id_trade` (monotônico na ordem
+    de registro) — não há timestamp de execução confiável em ~100% da
+    base (`datetime_entrada`/`datetime_saida` faltam em boa parte dos
+    trades antigos, ver `duracao_minutos_trade`), então isto é a melhor
+    aproximação de "ordem cronológica real" disponível sem exigir dado
+    que a maioria dos trades não tem."""
+    if df is None:
+        df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)].copy()
+    if reais.empty:
+        return []
+    reais = reais.sort_values(["data_op", "id_trade"], ascending=[False, False]).head(n)
+
+    linhas = []
+    for _, row in reais.iterrows():
+        tags = row.get("estrategia_tags")
+        primeira_tag = tags[0] if hasattr(tags, "__iter__") and not isinstance(tags, str) and len(tags) > 0 else None
+        linhas.append({
+            "id_trade": int(row["id_trade"]),
+            "data_op": str(row["data_op"]),
+            "ativo": row["ativo"],
+            "tipo_operacao": row["tipo_operacao"],
+            "saldo_operacao_reais": float(row["saldo_operacao_reais"]) if pd.notna(row["saldo_operacao_reais"]) else 0.0,
+            "estrategia": primeira_tag,
+            "r_multiple": r_multiple_trade(row),
+            "duracao_minutos": duracao_minutos_trade(row),
+        })
+    return linhas
+
+
 # Caps do Anticovardia Score (item F, redesenho TradeZella) — primeiro
 # palpite, mesmo espírito de SCORE_CAP_*/SCORE_PESO_* acima: ajustar depois
 # de ver o número real na tela. CAP_DRAWDOWN é em R$ FIXO, não em % do pico
