@@ -1,0 +1,40 @@
+/* Micro-interações do redesenho TradeZella (item F, Fase 2.6,
+   `spec_redesenho_tradezella.md`) — escopado à aba Estatísticas (classe
+   `.tz-card`, só usada pelos componentes DMC dessa aba). Não mexe no
+   resto do app. */
+
+.tz-card {
+  transition: transform 150ms ease, box-shadow 150ms ease;
+  animation: tz-fade-in-up 300ms ease both;
+}
+
+.tz-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+/* Fade-in escalonado — cada card na ordem em que aparece no DOM entra um
+   pouco depois do anterior (efeito "dashboard carregando"). Cobre até 12
+   cards visíveis por vez, suficiente pro header (5) + blocos abaixo. */
+.tz-card:nth-of-type(1) { animation-delay: 0ms; }
+.tz-card:nth-of-type(2) { animation-delay: 40ms; }
+.tz-card:nth-of-type(3) { animation-delay: 80ms; }
+.tz-card:nth-of-type(4) { animation-delay: 120ms; }
+.tz-card:nth-of-type(5) { animation-delay: 160ms; }
+.tz-card:nth-of-type(6) { animation-delay: 200ms; }
+.tz-card:nth-of-type(7) { animation-delay: 240ms; }
+.tz-card:nth-of-type(8) { animation-delay: 280ms; }
+.tz-card:nth-of-type(9) { animation-delay: 320ms; }
+.tz-card:nth-of-type(10) { animation-delay: 360ms; }
+.tz-card:nth-of-type(11) { animation-delay: 400ms; }
+.tz-card:nth-of-type(12) { animation-delay: 440ms; }
+
+@keyframes tz-fade-in-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* Número animável (count-up) — ver assets/tradezella_ux.js */
+.tz-numero-animado {
+  font-variant-numeric: tabular-nums;
+}

@@ -35,8 +35,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 import json
 import logging
 
+# dash-mantine-components 2.x exige React 18 fixado ANTES de `dash.Dash(...)`
+# ser instanciado (item F, redesenho TradeZella — "tipo de biblioteca", não só
+# cor/fonte) — ver `spec_redesenho_tradezella.md` Fase 2.6.
+from dash import _dash_renderer
+_dash_renderer._set_react_version('18.2.0')
+
 import dash
 from dash import ALL, dcc, html, Input, Output, State, callback_context, no_update
+import dash_mantine_components as dmc
+import dash_ag_grid as dag
 import flask
 import numpy as np
 import pandas as pd
@@ -464,20 +472,24 @@ def _bloco_diario(titulo, children) -> html.Div:
     })
 
 
-def _bloco_tradezella(titulo, children) -> html.Div:
-    """Equivalente a `_bloco_diario`, só que no visual do redesenho
-    TradeZella (item F, etapa 1 do rollout: só a aba Estatísticas por
-    enquanto) — cantos bem arredondados, sombra suave em vez de borda
-    grossa, rótulo em title-case sem caixa alta. NÃO substitui
-    `_bloco_diario` (as outras abas do Diário continuam com ele, sem
-    mudança, até a próxima etapa do rollout)."""
-    return html.Div([
-        html.Div(titulo, style={
-            'fontSize': '13px', 'color': C['text'], 'fontFamily': FONTS['body'],
-            'fontWeight': '600', 'marginBottom': '12px',
-        }),
+def _bloco_tradezella(titulo, children) -> dmc.Card:
+    """Equivalente a `_bloco_diario`, só que `dmc.Card` real (item F, Fase
+    2.6 — não mais `html.Div` com sombra pintada à mão) usado em TODA a
+    aba Estatísticas (rollout progressivo: só aqui por enquanto, decisão
+    do Jesué). NÃO substitui `_bloco_diario` (as outras abas do Diário
+    continuam com ele, sem mudança, até a próxima etapa do rollout).
+
+    `w='100%'` (2026-07-31, feedback do Jesué: "não gosto desses espaços
+    vazios") — `dmc.Card` não estica sozinho pra preencher o container
+    (diferente de um `html.Div` de bloco comum), deixando espaço morto à
+    direita quando usado sozinho numa linha. Quando usado EM PAR (ex:
+    "Melhor por Horário"/"Melhor por Direção"), o par inteiro precisa estar
+    dentro de um `dmc.SimpleGrid` (não `display:flex` cru) pra cada card
+    ocupar sua célula por igual — ver `_bloco_analise_estrategia`."""
+    return dmc.Card([
+        dmc.Text(titulo, size='sm', fw=600, mb='md'),
         children,
-    ], style=_tz_estilo_card({'marginBottom': TZ_GAP_GRID}))
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
 
 
 def _estilo_input_diario(extra=None) -> dict:
@@ -1762,110 +1774,106 @@ def _conteudo_detalhe_trade(id_trade: int) -> html.Div | None:
 # "Detalhes" logo abaixo — nenhum dado é descartado, só reorganizado).
 # ---------------------------------------------------------------------------
 
-def _grafico_gauge(valor: float, maximo: float, cor_arco: str, tema: str,
-                    sufixo: str = '', casas: int = 0) -> go.Figure:
-    """Gauge circular pequeno (Win%/Profit Factor) — mesmo padrão de
-    `_grafico_evolucao_saldo`/`_radar_roda_vida`: `paper_bgcolor`/cor via
-    `PALETA_GAUGE[tema]`, sem reatividade a troca de tema depois de
-    renderizado (limitação já aceita e documentada em `assets/tema.js`)."""
-    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
-    fig = go.Figure(go.Indicator(
-        mode='gauge+number',
-        value=valor,
-        number={'suffix': sufixo, 'font': {'size': 18, 'color': p['text'], 'family': FONTS['mono']},
-                'valueformat': f'.{casas}f'},
-        gauge={
-            'axis': {'range': [0, maximo], 'visible': False},
-            'bar': {'color': cor_arco, 'thickness': 0.85},
-            'bgcolor': p['border'], 'borderwidth': 0,
-        },
-    ))
-    fig.update_layout(
-        paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=6, r=6, t=6, b=0), height=70,
-    )
-    return fig
+def _card_header_tradezella(titulo: str, valor_str, cor_valor=None, componente=None,
+                              animar_numero: bool = False) -> dmc.Card:
+    """Card estilo TradeZella (item F, Fase 2.6 — `dmc.Card` real, não
+    `html.Div` com sombra pintada à mão): elevação nativa (`shadow`/
+    `withBorder`), cantos arredondados via `radius`, hover embutido do
+    componente. `componente`, se passado, é um objeto DMC animável de
+    verdade (`dmc.RingProgress`/`dmc.ProgressRoot`), nunca mais um
+    `dcc.Graph` Plotly estático pra esse papel.
+
+    `animar_numero=True` marca o valor com a classe `tz-numero-animado`
+    (`assets/tradezella_ux.js` conta de 0 até o valor real ao montar) — só
+    seguro pra `valor_str` de STRING simples (nunca quando `valor_str` é
+    um componente composto, tipo o badge+texto do Current Streak: o JS
+    reescreve `el.textContent`, o que apagaria filhos não-texto)."""
+    # `c=None` quebra o parser de cor do Mantine no navegador (Python
+    # `None` vira JSON `null`, e `typeof null === 'object'` em JS — o
+    # parser só aceita string ou `undefined`) — só passa `c` quando há
+    # cor de verdade, mesmo cuidado em `_card_estatistica` logo abaixo.
+    kwargs_valor = {'c': cor_valor} if cor_valor else {}
+    if animar_numero:
+        kwargs_valor['className'] = 'tz-numero-animado'
+    texto = html.Div([
+        dmc.Text(titulo, size='sm', c='dimmed'),
+        dmc.Text(valor_str, size='xl', fw=700, **kwargs_valor),
+    ])
+    # Gráfico ao LADO do número, não embaixo (2026-07-31, feedback do
+    # Jesué: "não gosto desses espaços vazios") — um `dmc.RingProgress` de
+    # 70px embaixo de um texto de ~30px deixava um vão vazio à direita
+    # dele; lado a lado (`dmc.Group justify='space-between'`) usa a
+    # largura do card por inteiro, sem sobra. Cards sem gráfico (Net P&L/
+    # Current Streak) ficam só com `texto`, sem vão nenhum — `align=
+    # 'center'` centraliza verticalmente contra a altura do gráfico
+    # quando ele existe.
+    conteudo = dmc.Group([texto, componente], justify='space-between', align='center', wrap='nowrap') \
+        if componente is not None else texto
+    return dmc.Card(conteudo, withBorder=True, shadow='sm', radius='lg', p='lg',
+                     className='tz-card', style={'flex': '1', 'minWidth': '190px'})
 
 
-def _grafico_barra_avg_win_loss(media_ganho: float, media_perda: float, tema: str) -> go.Figure:
-    """Barra horizontal divergente (Avg Win/Loss) — verde estendendo pra
-    direita (ganho médio), vermelho pra esquerda (perda média), a partir do
-    zero. Mesma leitura visual do card equivalente no TradeZella
-    (`image1.png` do docx de referência)."""
-    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
-    fig = go.Figure()
-    fig.add_trace(go.Bar(x=[media_ganho], y=[''], orientation='h', marker_color=p['green'],
-                          text=[f"R$ {media_ganho:+.0f}"], textposition='outside'))
-    fig.add_trace(go.Bar(x=[media_perda], y=[''], orientation='h', marker_color=p['red'],
-                          text=[f"R$ {media_perda:+.0f}"], textposition='outside'))
-    fig.update_layout(
-        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', showlegend=False,
-        barmode='overlay', margin=dict(l=6, r=6, t=6, b=6), height=50,
-        font=dict(family=FONTS['mono'], color=p['text2'], size=10),
-        xaxis=dict(visible=False), yaxis=dict(visible=False),
-    )
-    return fig
-
-
-def _card_header_tradezella(titulo: str, valor_str: str, cor_valor=None, grafico=None) -> html.Div:
-    """Card estilo TradeZella (item F) — título em title-case (não caixa
-    alta), valor em fonte sans-serif normal (`FONTS['body']`, NUNCA
-    monospace — diferente da convenção do resto do app), cantos bem
-    arredondados + sombra suave em vez de borda grossa (`_tz_estilo_card`).
-    Conferido contra `image1.png` do docx de referência."""
-    conteudo = [
-        html.Div(titulo, style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['body'],
-                                 'marginBottom': '6px'}),
-        html.Div(valor_str, style={'fontSize': '20px', 'fontWeight': '700', 'fontFamily': FONTS['body'],
-                                    'color': cor_valor or C['text']}),
-    ]
-    if grafico is not None:
-        conteudo.append(dcc.Graph(figure=grafico, config={'displayModeBar': False},
-                                   style={'marginTop': '2px'}))
-    return html.Div(conteudo, style=_tz_estilo_card({'flex': '1', 'minWidth': '160px'}))
-
-
-def _cards_header_tradezella(stats: dict, tema: str) -> html.Div:
-    """5 cards ao estilo TradeZella (item F, fase 2): Net P&L / Trade Win% /
-    Avg Win-Loss / Profit Factor / Current Streak. Reage ao MESMO período
-    que o resto do bloco de estatísticas (mês/ano selecionado no
-    calendário) — EXCETO Current Streak, que é deliberadamente ALL-TIME
-    (`dt.sequencia_atual()` sem filtro): um streak "atual" cortado no limite
-    do mês selecionado não faz sentido conceitual (um streak real de 3
-    trades pode atravessar a virada do mês)."""
+def _cards_header_tradezella(stats: dict, tema: str) -> dmc.SimpleGrid:
+    """5 cards ao estilo TradeZella (item F): Net P&L / Trade Win% / Avg
+    Win-Loss / Profit Factor / Current Streak — `dmc.SimpleGrid` real (não
+    `html.Div` com `display:flex` manual) pra responsividade nativa.
+    Current Streak é deliberadamente ALL-TIME (`dt.sequencia_atual()` sem
+    filtro): um streak "atual" cortado no limite do mês selecionado não
+    faz sentido conceitual (um streak real de 3 trades pode atravessar a
+    virada do mês)."""
     p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
 
     saldo_total = stats['saldo_total']
     card_net_pnl = _card_header_tradezella(
         'Net P&L', f"R$ {saldo_total:+.2f}",
-        cor_valor=(C['green'] if saldo_total > 0 else (C['red'] if saldo_total < 0 else None)),
+        cor_valor=('green' if saldo_total > 0 else ('red' if saldo_total < 0 else None)),
+        animar_numero=True,
     )
 
     win_pct = stats['taxa_acerto'] * 100
     card_win_pct = _card_header_tradezella(
         'Trade Win %', f"{win_pct:.1f}%",
-        grafico=_grafico_gauge(win_pct, 100, p['green'], tema, sufixo='%'),
+        componente=dmc.RingProgress(
+            size=70, thickness=7, roundCaps=True,
+            sections=[{'value': win_pct, 'color': 'green'}],
+            label=dmc.Text(f"{win_pct:.0f}%", size='xs', ta='center', fw=700),
+        ),
     )
 
+    payoff = stats['payoff']
+    media_ganho, media_perda = stats['media_ganho_reais'], abs(stats['media_perda_reais'])
+    total_win_loss = media_ganho + media_perda
+    pct_ganho = (media_ganho / total_win_loss * 100) if total_win_loss else 0
     card_avg_win_loss = _card_header_tradezella(
-        'Avg Win/Loss', f"{stats['payoff']:.2f}" if stats['payoff'] is not None else '—',
-        grafico=_grafico_barra_avg_win_loss(stats['media_ganho_reais'], stats['media_perda_reais'], tema),
+        'Avg Win/Loss', f"{payoff:.2f}" if payoff is not None else '—',
+        componente=html.Div(dmc.ProgressRoot([
+            dmc.ProgressSection(value=pct_ganho, color='green'),
+            dmc.ProgressSection(value=100 - pct_ganho, color='red'),
+        ], size='lg', radius='xl'), style={'width': '90px'}) if total_win_loss else None,
     )
 
     profit_factor = stats['profit_factor']
+    pf_normalizado = min(profit_factor or 0, 3.0) / 3.0 * 100
     card_profit_factor = _card_header_tradezella(
         'Profit Factor', f"{profit_factor:.2f}" if profit_factor is not None else '—',
-        grafico=_grafico_gauge(min(profit_factor or 0, 3.0), 3.0, p['gold'], tema, casas=2),
+        componente=dmc.RingProgress(
+            size=70, thickness=7, roundCaps=True,
+            sections=[{'value': pf_normalizado, 'color': 'yellow'}],
+            label=dmc.Text(f"{profit_factor:.1f}" if profit_factor is not None else '—',
+                            size='xs', ta='center', fw=700),
+        ),
     )
 
     streak = dt.sequencia_atual()
     if streak['tipo'] is None:
         streak_str, cor_streak = '—', None
+        badge_streak = None
     else:
-        cor_streak = C['green'] if streak['tipo'] == 'win' else C['red']
+        cor_streak = 'green' if streak['tipo'] == 'win' else 'red'
         rotulo_trades = 'trade' if streak['trades'] == 1 else 'trades'
         streak_str = f"{streak['trades']} {rotulo_trades} ({streak['dias']} dia(s))"
-    badge_streak = _tz_badge_icone('🔥' if streak['tipo'] == 'win' else '❄',
-                                    cor_streak or C['border'], tamanho=24) if streak['tipo'] else None
+        badge_streak = dmc.ThemeIcon(streak['tipo'] == 'win' and '🔥' or '❄',
+                                       color=cor_streak, variant='light', radius='xl', size='lg')
     card_streak = _card_header_tradezella(
         'Current Streak',
         html.Div([badge_streak, html.Span(streak_str, style={'marginLeft': '8px'})],
@@ -1873,22 +1881,19 @@ def _cards_header_tradezella(stats: dict, tema: str) -> html.Div:
         cor_valor=cor_streak,
     )
 
-    return html.Div([card_net_pnl, card_win_pct, card_avg_win_loss, card_profit_factor, card_streak],
-                     style={'display': 'flex', 'gap': TZ_GAP_GRID, 'flexWrap': 'wrap', 'marginBottom': TZ_GAP_GRID})
+    return dmc.SimpleGrid(
+        [card_net_pnl, card_win_pct, card_avg_win_loss, card_profit_factor, card_streak],
+        cols={'base': 1, 'sm': 2, 'lg': 5}, spacing='md', mb='md',
+    )
 
 
-def _card_estatistica(titulo: str, valor: str, cor=None) -> html.Div:
-    """Card de detalhe (grupos Quantidade/Taxas/Valores) — mesma linguagem
-    visual TradeZella dos cards do header (title-case, fonte sem
-    monospace, cantos arredondados + sombra), só menor/mais compacto por
-    ser um dado secundário."""
-    return html.Div([
-        html.Div(titulo, style={'fontSize': '11px', 'color': C['text2'], 'fontFamily': FONTS['body'],
-                                 'marginBottom': '4px'}),
-        html.Div(valor, style={'fontSize': '16px', 'fontWeight': '700', 'fontFamily': FONTS['body'],
-                                'color': cor or C['text']}),
-    ], style={'background': C['bg'], 'borderRadius': TZ_RAIO_CELULA,
-              'padding': '10px 14px', 'minWidth': '120px'})
+def _card_estatistica(titulo: str, valor: str, cor=None) -> dmc.Paper:
+    """Card de detalhe (grupos Quantidade/Taxas/Valores) — `dmc.Paper`
+    real (item F, Fase 2.6) em vez de `html.Div` com fundo pintado."""
+    return dmc.Paper([
+        dmc.Text(titulo, size='xs', c='dimmed'),
+        dmc.Text(valor, size='md', fw=700, **({'c': cor} if cor else {})),
+    ], radius='md', p='sm', withBorder=True, style={'minWidth': '120px'})
 
 
 def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
@@ -1948,44 +1953,47 @@ def _tabela_melhor_por(titulo: str, dados: dict, rotulos_grupo: dict | None = No
     return _bloco_tradezella(titulo, html.Div(linhas))
 
 
-def _card_estrategia_destaque(titulo: str, emoji: str, info: dict | None, cor_borda: str) -> html.Div:
+def _card_estrategia_destaque(titulo: str, emoji: str, info: dict | None, cor_dmc: str) -> dmc.Card:
     """Estratégia Vencedora/Perdedora, destacada de forma ilustrada (pedido
     explícito do docx: "coloque em destaque de forma ilustrativa — por
-    exemplo, um troféu ou medalha"). Emoji vira badge circular pequeno
-    (`_tz_badge_icone`) em vez de solto no texto, título em title-case,
-    números em `FONTS['body']` — mesma linguagem visual TradeZella do
-    resto da aba Estatísticas."""
+    exemplo, um troféu ou medalha"). `dmc.Card` + `dmc.ThemeIcon` real
+    (item F, Fase 2.6) — `cor_dmc` é um nome de cor Mantine ('green'/
+    'red'), não mais a string CSS var `C[...]` usada antes."""
     nomes = _mapa_nomes_estrategias()
     if info is None:
-        conteudo = html.Div(f'Amostra insuficiente ainda (mínimo {dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA} trades).',
-                            style={'color': C['text2'], 'fontSize': '12px'})
+        conteudo = dmc.Text(f'Amostra insuficiente ainda (mínimo {dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA} trades).',
+                             size='sm', c='dimmed')
     else:
         nome = nomes.get(info['estrategia'], str(info['estrategia']).replace('_', ' ').title())
         saldo = info['saldo']
-        cor_saldo = C['green'] if saldo > 0 else (C['red'] if saldo < 0 else C['text2'])
+        cor_saldo = 'green' if saldo > 0 else ('red' if saldo < 0 else 'dimmed')
         conteudo = html.Div([
-            html.Div(nome, style={'fontSize': '16px', 'fontWeight': '700', 'fontFamily': FONTS['body']}),
-            html.Div(f"R$ {saldo:+.2f} em {info['n']} operações", style={
-                'fontSize': '13px', 'fontFamily': FONTS['body'], 'color': cor_saldo, 'marginTop': '4px',
-            }),
+            dmc.Text(nome, size='lg', fw=700),
+            dmc.Text(f"R$ {saldo:+.2f} em {info['n']} operações", size='sm', c=cor_saldo, mt=4),
         ])
-    return html.Div([
-        html.Div([
-            _tz_badge_icone(emoji, f'color-mix(in srgb, {cor_borda} 15%, transparent)'),
-            html.Span(titulo, style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['body'],
-                                     'fontWeight': '600', 'marginLeft': '10px'}),
-        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '10px'}),
+    return dmc.Card([
+        dmc.Group([
+            dmc.ThemeIcon(emoji, color=cor_dmc, variant='light', radius='xl', size='lg'),
+            dmc.Text(titulo, size='sm', fw=600, c='dimmed'),
+        ], mb='sm'),
         conteudo,
-    ], style=_tz_estilo_card({'flex': '1', 'minWidth': '220px'}))
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', className='tz-card',
+       style={'flex': '1', 'minWidth': '220px'})
 
 
 def _conteudo_mentor_ia(cache: dict | None) -> html.Div:
-    """Corpo do bloco Mentor de IA — texto cacheado (se houver) ou aviso de
-    que ainda não foi gerado. Usado tanto no render inicial quanto como
-    retorno da callback, pra manter os dois caminhos idênticos."""
+    """Corpo do bloco Mentor de IA — texto cacheado (se houver) ou
+    `dmc.Skeleton` (placeholder cinza pulsante — item F, Fase 2.6, real
+    componente de loading em vez de só texto estático) quando ainda não
+    foi gerado. Usado tanto no render inicial quanto como retorno da
+    callback, pra manter os dois caminhos idênticos."""
     if not cache or not cache.get('texto'):
-        return html.Div('Ainda não gerada. Clique em "Gerar análise de hoje".',
-                        style={'fontSize': '12px', 'color': C['text2']})
+        return html.Div([
+            dmc.Skeleton(height=12, width='90%', mb='xs'),
+            dmc.Skeleton(height=12, width='75%', mb='xs'),
+            dmc.Skeleton(height=12, width='60%'),
+            dmc.Text('Ainda não gerada. Clique em "Gerar análise de hoje".', size='xs', c='dimmed', mt='sm'),
+        ])
     gerado_em = cache.get('gerado_em', '')
     try:
         horario = datetime.fromisoformat(gerado_em).strftime('%d/%m %H:%M')
@@ -1993,18 +2001,17 @@ def _conteudo_mentor_ia(cache: dict | None) -> html.Div:
         horario = gerado_em
     return html.Div([
         dcc.Markdown(cache['texto'], style={'fontSize': '13px', 'lineHeight': '1.6'}),
-        html.Div(f"Gerado em {horario} · {cache.get('modelo_usado', '')} · "
-                 f"{cache.get('tokens_usados', 0)} tokens",
-                 style={'fontSize': '10px', 'color': C['text2'], 'marginTop': '8px'}),
+        dmc.Text(f"Gerado em {horario} · {cache.get('modelo_usado', '')} · "
+                 f"{cache.get('tokens_usados', 0)} tokens", size='xs', c='dimmed', mt='sm'),
     ])
 
 
-def _bloco_mentor_ia() -> html.Div:
+def _bloco_mentor_ia() -> dmc.Card:
     """Mentor de IA — análise retrospectiva diária (item D, "upgrade
     diario.docx", 2026-07-30): curva de aprendizagem, evolução operacional/
     estratégica, próximos passos, tom DIRETO e objetivo. Reusa o MESMO hub
     Gemini/OpenRouter do chat (`ai_analyst._despachar_para_modelo`), nunca
-    uma chamada própria.
+    uma chamada própria. `dmc.Card`/`dmc.Button` reais (item F, Fase 2.6).
 
     Cadência de 1x/dia é só uma SUGESTÃO da UI (rótulo do botão muda pra
     "Gerar nova análise" depois da 1ª geração do dia) — nunca um bloqueio,
@@ -2014,26 +2021,21 @@ def _bloco_mentor_ia() -> html.Div:
     cache = ai_analyst.carregar_analise_diaria()
     hoje = date.today().isoformat()
     ja_gerou_hoje = bool(cache) and cache.get('data') == hoje
-    return html.Div([
-        html.Div([
-            _tz_badge_icone('🧭', f'color-mix(in srgb, {C["gold"]} 15%, transparent)', tamanho=28),
-            html.Span('Mentor de IA — Evolução Operacional', style={
-                'fontSize': '14px', 'fontWeight': '600', 'fontFamily': FONTS['body'], 'marginLeft': '10px',
-            }),
-            html.Button(
+    return dmc.Card([
+        dmc.Group([
+            dmc.ThemeIcon('🧭', color='yellow', variant='light', radius='xl', size='lg'),
+            dmc.Text('Mentor de IA — Evolução Operacional', size='sm', fw=600),
+            dmc.Button(
                 'Gerar nova análise' if ja_gerou_hoje else 'Gerar análise de hoje',
-                id='btn-gerar-mentor-ia', n_clicks=0, style={
-                    'background': 'transparent', 'color': C['text2'],
-                    'border': f'1px solid {C["border"]}', 'borderRadius': '20px',
-                    'padding': '6px 14px', 'cursor': 'pointer', 'fontSize': '11px',
-                    'marginLeft': '14px',
-                }),
-        ], style={'display': 'flex', 'alignItems': 'center', 'marginBottom': '12px'}),
+                id='btn-gerar-mentor-ia', n_clicks=0, variant='light', color='gray',
+                size='xs', radius='xl', ml='auto',
+            ),
+        ], mb='md'),
         dcc.Loading(
             id='loading-mentor-ia', type='dot', color=C['gold'],
             children=html.Div(_conteudo_mentor_ia(cache), id='diario-mentor-ia-conteudo'),
         ),
-    ], style=_tz_estilo_card({'marginTop': TZ_GAP_GRID}))
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mt='md', className='tz-card')
 
 
 # ---------------------------------------------------------------------------
@@ -2078,68 +2080,36 @@ def _grafico_radar_anticovardia(eixos: dict, tema: str) -> go.Figure:
     return fig
 
 
-def _interpolar_hex(cor_a: str, cor_b: str, t: float) -> str:
-    a, b = cor_a.lstrip('#'), cor_b.lstrip('#')
-    r = round(int(a[0:2], 16) + (int(b[0:2], 16) - int(a[0:2], 16)) * t)
-    g = round(int(a[2:4], 16) + (int(b[2:4], 16) - int(a[2:4], 16)) * t)
-    bl = round(int(a[4:6], 16) + (int(b[4:6], 16) - int(a[4:6], 16)) * t)
-    return f'#{r:02x}{g:02x}{bl:02x}'
-
-
-def _gradiente_score_steps(p: dict, n_estagios: int = 14) -> list:
-    """Degradê vermelho→amarelo→verde em N faixas finas — Plotly não tem
-    gradiente contínuo nativo em `gauge.steps` (só faixas discretas), mas
-    com faixas finas o olho lê como contínuo. Mais fiel à barra real do
-    TradeZella (`image1.png`, gradiente liso) do que 3 faixas grossas."""
-    largura = 100.0 / n_estagios
-    faixas = []
-    for i in range(n_estagios):
-        t = i / (n_estagios - 1)
-        cor = _interpolar_hex(p['red'], p['yellow'], t / 0.5) if t <= 0.5 \
-            else _interpolar_hex(p['yellow'], p['green'], (t - 0.5) / 0.5)
-        faixas.append({'range': [i * largura, (i + 1) * largura], 'color': cor})
-    return faixas
-
-
-def _grafico_barra_score_anticovardia(score: float, tema: str) -> go.Figure:
-    """Barra horizontal em degradê vermelho→amarelo→verde com a posição do
-    score marcada — mesma leitura visual da barra sob "Your Zella Score"
-    no TradeZella (`image1.png`)."""
-    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
-    fig = go.Figure(go.Indicator(
-        mode='gauge+number',
-        value=score,
-        number={'font': {'size': 20, 'color': p['text'], 'family': FONTS['mono']}, 'valueformat': '.1f'},
-        gauge={
-            'shape': 'bullet',
-            'axis': {'range': [0, 100], 'tickfont': {'size': 8, 'color': p['text2']}},
-            'steps': _gradiente_score_steps(p),
-            'bar': {'color': p['text'], 'thickness': 0.35},
-            'bgcolor': 'rgba(0,0,0,0)', 'borderwidth': 0,
-        },
-    ))
-    fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=10, r=10, t=10, b=10), height=60)
-    return fig
-
-
-def _bloco_anticovardia_score(tema: str = 'light') -> html.Div:
+def _bloco_anticovardia_score(tema: str = 'light') -> dmc.Card:
+    """Anticovardia Score — `dmc.Card` real com o radar Plotly (sem
+    equivalente DMC pronto, mantido) + um `dmc.RingProgress` GRANDE pro
+    score final (item F, Fase 2.6 — substitui a barra horizontal `bullet`
+    do Plotly, que não anima: o RingProgress do DMC anima o preenchimento
+    de verdade quando o valor muda). Cor do anel reflete a zona do score
+    (vermelho <33, amarelo 33-66, verde >66), mesma leitura da barra
+    degradê anterior, só que como componente real."""
     resultado = dt.calcular_anticovardia_score()
     if resultado['score'] is None:
-        return html.Div('Sem trades reais suficientes pra calcular o Anticovardia Score ainda.',
-                         style={'fontSize': '12px', 'color': C['text2'], 'marginBottom': '14px'})
-    return html.Div([
-        html.Div('Anticovardia Score', style={'fontSize': '13px', 'color': C['text'],
-                                               'fontWeight': '600', 'fontFamily': FONTS['body'],
-                                               'marginBottom': '8px'}),
+        return dmc.Card('Sem trades reais suficientes pra calcular o Anticovardia Score ainda.',
+                         withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', w='100%',
+                         style={'fontSize': '12px', 'color': C['text2']})
+    score = resultado['score']
+    cor_score = 'red' if score < 33 else ('yellow' if score < 66 else 'green')
+    return dmc.Card([
+        dmc.Text('Anticovardia Score', size='sm', fw=600, mb='sm'),
         dcc.Graph(figure=_grafico_radar_anticovardia(resultado['eixos'], tema),
-                  config={'displayModeBar': False}),
-        html.Div(f"Seu Anticovardia Score: {resultado['score']:.1f}", style={
-            'fontSize': '14px', 'fontWeight': '700', 'fontFamily': FONTS['body'],
-            'color': C['text'], 'marginTop': '6px',
-        }),
-        dcc.Graph(figure=_grafico_barra_score_anticovardia(resultado['score'], tema),
-                  config={'displayModeBar': False}),
-    ], style=_tz_estilo_card({'maxWidth': '420px', 'marginBottom': TZ_GAP_GRID}))
+                  config={'displayModeBar': False, 'responsive': True}, style={'width': '100%'}),
+        dmc.Group([
+            dmc.RingProgress(
+                size=110, thickness=10, roundCaps=True,
+                sections=[{'value': score, 'color': cor_score}],
+                label=dmc.Text(f"{score:.0f}", size='lg', fw=700, ta='center',
+                                className='tz-numero-animado'),
+            ),
+            dmc.Text(f"Seu Anticovardia Score: {score:.1f}", size='sm', fw=700,
+                      className='tz-numero-animado'),
+        ], justify='center', mt='sm'),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
 
 
 def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Div:
@@ -2150,33 +2120,39 @@ def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Di
     medalha) e a Perdedora". O Mentor de IA (item D) também vive aqui dentro
     — pedido explícito do docx: "ainda dentro da Análise de Estratégias
     crie um bloco [do Mentor]". O Anticovardia Score (item F, fase 3,
-    redesenho TradeZella) entra no topo, mesma lógica de posicionamento
-    proeminente do "Zella score" na referência."""
+    redesenho TradeZella) NÃO mora mais aqui dentro — migrou pra coluna
+    esquerda do grid assimétrico em `_construir_diario_estatisticas` (Fase
+    2.6: composição real de página, não pilha vertical única — ver
+    `spec_redesenho_tradezella.md`)."""
     analise = dt.analise_estrategia()
     rotulos_janela = {k: _formatar_janela(k) for k in cfg.JANELAS_PREGAO}
+    # `dmc.SimpleGrid` em vez de `html.Div(display:flex)` cru (2026-07-31,
+    # feedback do Jesué: "não gosto desses espaços vazios, organize melhor
+    # os elementos") — SimpleGrid divide a linha em células IGUAIS de
+    # verdade; um `dmc.Card` dentro de flexbox não estica sozinho e deixava
+    # metade da linha em branco quando o card vizinho era mais estreito.
     return html.Div([
-        _bloco_anticovardia_score(tema),
-        html.Div([
-            _card_estrategia_destaque('Estratégia Vencedora', '🏆', analise['vencedora'], C['green']),
-            _card_estrategia_destaque('Estratégia Perdedora', '📉', analise['perdedora'], C['red']),
-        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap', 'marginBottom': '14px'}),
-        html.Div([
+        dmc.SimpleGrid([
+            _card_estrategia_destaque('Estratégia Vencedora', '🏆', analise['vencedora'], 'green'),
+            _card_estrategia_destaque('Estratégia Perdedora', '📉', analise['perdedora'], 'red'),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
             _tabela_melhor_por('Melhor por Horário', analise['melhor_por_janela'], rotulos_janela),
             _tabela_melhor_por('Melhor por Direção', analise['melhor_por_direcao'], _ROTULO_DIRECAO_OPERACAO),
-        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
-        html.Div([
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
             _tabela_melhor_por('Melhor por Ativo', analise['melhor_por_ativo']),
             _tabela_melhor_por('Melhor por Categoria', analise['melhor_por_categoria'],
                                dt.ROTULO_CATEGORIA_ESTRATEGIA),
-        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
-        html.Div([
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
             _bloco_breakdown_diario('Por Ativo', stats_geral['por_ativo']),
             _bloco_breakdown_diario('Por Janela', stats_geral['por_janela']),
-        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
-        html.Div([
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
             _bloco_breakdown_diario('Por Sala/Análise', stats_geral['por_sala']),
             _bloco_breakdown_diario('Por Tags Setup/Erro', stats_geral['por_tags_setup_erro']),
-        ], style={'display': 'flex', 'gap': '14px', 'flexWrap': 'wrap'}),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
         _bloco_mentor_ia(),
     ])
 
@@ -2387,150 +2363,96 @@ def _grade_calendario_anual(por_mes: dict, ano: int, tema: str = 'light') -> htm
     return html.Div(linhas)
 
 
-_COR_SCORE_CONFIABILIDADE = {'alto': 'green', 'medio': 'yellow', 'baixo': 'red'}
+def _linhas_grid_confiabilidade(scores: dict, saldos_por_estrategia: dict) -> list:
+    """`rowData` do AG Grid "Confiabilidade por Estratégia" (item F, Fase
+    2.6 — `dag.AgGrid` real substitui a `html.Table` montada linha a
+    linha à mão: sort/filter/resize NATIVOS do componente, nada de
+    callback própria pra ordenar coluna — `ordenar_confiabilidade_
+    estrategia`/`store-ordenacao-estrategia` foram removidos, o grid faz
+    isso sozinho no cliente).
 
-
-def _faixa_score(score: float) -> str:
-    if score >= 70:
-        return 'alto'
-    if score >= 40:
-        return 'medio'
-    return 'baixo'
-
-
-# Colunas ordenáveis do bloco Confiabilidade por Estratégia (2026-07-30,
-# "upgrade diario.docx": "adicionar classificação crescente/decrescente por
-# coluna, como no Excel"). Ordem = ordem visual das colunas na tabela.
-_CAMPOS_ORDENAVEIS_CONFIABILIDADE = [
-    ('nome', 'Estratégia'), ('categoria', 'Categoria'), ('n', 'N'), ('saldo', 'Saldo'),
-    ('taxa_acerto', 'Taxa Acerto'), ('payoff', 'Payoff'),
-    ('profit_factor', 'Profit Factor'), ('score', 'Score'),
-]
-
-
-def _valor_ordenacao_confiabilidade(item, saldos_por_estrategia: dict, campo: str):
-    tag, v = item
-    if campo == 'nome':
-        return _mapa_nomes_estrategias().get(tag, tag)
-    if campo == 'categoria':
-        return _mapa_categorias_estrategias().get(tag, '—')
-    if campo == 'saldo':
-        return saldos_por_estrategia.get(tag, {}).get('saldo', 0.0)
-    valor = v.get(campo)
-    return valor if valor is not None else -1
-
-
-def _rotulo_cabecalho_ordenavel(rotulo: str, campo: str, ordenacao: dict | None) -> str:
-    if not ordenacao or ordenacao.get('campo') != campo:
-        return rotulo
-    return rotulo + (' ▼' if ordenacao.get('direcao') == 'desc' else ' ▲')
-
-
-def _linhas_confiabilidade_estrategia(scores: dict, saldos_por_estrategia: dict, ordenacao: dict | None) -> list:
-    """Constrói só as `html.Tr` do corpo (par resumo+detalhe por estratégia)
-    — extraído pra ser reaproveitado tanto na montagem inicial quanto pelo
-    clique de ordenar coluna (`ordenar_confiabilidade_estrategia`), que
-    reescreve SÓ este corpo, nunca o cabeçalho (ver o raciocínio completo em
-    `_tabela_score_confiabilidade`)."""
+    `tag` fica no dict (coluna oculta, `hide: True` no columnDef) pra
+    identificar a linha clicada e buscar `_detalhe_estrategia_expandido`."""
     nomes = _mapa_nomes_estrategias()
     categorias = _mapa_categorias_estrategias()
-    campo = (ordenacao or {}).get('campo') or 'saldo'
-    direcao = (ordenacao or {}).get('direcao') or 'desc'
-    linhas_ordenadas = sorted(
-        scores.items(),
-        key=lambda item: (item[1]['n'] > 0, _valor_ordenacao_confiabilidade(item, saldos_por_estrategia, campo)),
-        reverse=(direcao == 'desc'),
-    )
-
     linhas = []
-    for tag, v in linhas_ordenadas:
-        if v['n'] == 0:
-            score_cel = _td_diario('sem dados', extra={'color': C['text2']})
-        elif not v['amostra_suficiente']:
-            score_cel = _td_diario(f"amostra insuficiente (n={v['n']})", extra={'color': C['text2']})
-        else:
-            chave_cor = _COR_SCORE_CONFIABILIDADE[_faixa_score(v['score'])]
-            score_cel = _td_diario(f"{v['score']:.0f}", extra={'color': C.get(chave_cor, C['text2']), 'fontWeight': '700'})
-
+    for tag, v in scores.items():
         saldo = saldos_por_estrategia.get(tag, {}).get('saldo')
-        cor_saldo = C['text2'] if not saldo else (C['green'] if saldo > 0 else C['red'])
-        seta = html.Button('▶', id={'type': 'diario-btn-expandir-estrategia', 'index': tag},
-                           n_clicks=0, style={
-                               'background': 'transparent', 'color': C['text2'],
-                               'border': f'1px solid {C["border"]}', 'borderRadius': '4px',
-                               'padding': '0 7px', 'cursor': 'pointer', 'fontSize': '10px',
-                           }) if v['n'] else ''
-        linhas.append(html.Tr([
-            _td_diario(seta),
-            _td_diario(nomes.get(tag, tag.replace('_', ' ').title())),
-            _td_diario(categorias.get(tag, '—'), extra={'color': C['text2']}),
-            _td_diario(str(v['n'])),
-            _td_diario(f"R$ {saldo:+.0f}" if saldo is not None else '—',
-                       extra={'color': cor_saldo, 'fontWeight': '700'}),
-            _td_diario(f"{v['taxa_acerto'] * 100:.1f}%" if v['taxa_acerto'] is not None else '—'),
-            _td_diario(f"{v['payoff']:.2f}" if v['payoff'] is not None else '—'),
-            _td_diario(f"{v['profit_factor']:.2f}" if v['profit_factor'] is not None else '—'),
-            score_cel,
-        ]))
-        linhas.append(html.Tr(
-            html.Td(html.Div(id={'type': 'diario-detalhe-estrategia', 'index': tag}),
-                    colSpan=9, style={'padding': '0', 'border': 'none'})
-        ))
+        if v['n'] == 0:
+            score_label = 'sem dados'
+        elif not v['amostra_suficiente']:
+            score_label = f"amostra insuficiente (n={v['n']})"
+        else:
+            score_label = f"{v['score']:.0f}"
+        linhas.append({
+            'tag': tag,
+            'nome': nomes.get(tag, tag.replace('_', ' ').title()),
+            'categoria': categorias.get(tag, '—'),
+            'n': v['n'],
+            'saldo': saldo if saldo is not None else 0.0,
+            'saldo_label': f"R$ {saldo:+.0f}" if saldo is not None else '—',
+            'taxa_acerto': f"{v['taxa_acerto'] * 100:.1f}%" if v['taxa_acerto'] is not None else '—',
+            'payoff': f"{v['payoff']:.2f}" if v['payoff'] is not None else '—',
+            'profit_factor': f"{v['profit_factor']:.2f}" if v['profit_factor'] is not None else '—',
+            'score': v['score'] if v['score'] is not None else -1,
+            'score_label': score_label,
+        })
     return linhas
 
 
-def _tabela_score_confiabilidade(scores: dict, saldos_por_estrategia: dict | None = None,
-                                  ordenacao: dict | None = None) -> html.Div:
+# `cellStyle` como função JS (dash-ag-grid aceita `{"function": "<corpo JS>"}`
+# em vez de um dict fixo — precisa ser JS porque a cor depende do VALOR da
+# célula, calculado no navegador a cada render/sort/filter, não em Python).
+_CELL_STYLE_SALDO = {'function': "params.value > 0 ? {'color': 'var(--green)', 'fontWeight': 700} "
+                                  ": params.value < 0 ? {'color': 'var(--red)', 'fontWeight': 700} : null"}
+_CELL_STYLE_SCORE = {'function': "params.value >= 70 ? {'color': 'var(--green)', 'fontWeight': 700} "
+                                  ": params.value >= 40 ? {'color': 'var(--yellow)', 'fontWeight': 700} "
+                                  ": params.value >= 0 ? {'color': 'var(--red)', 'fontWeight': 700} : null"}
+
+
+def _tabela_score_confiabilidade(scores: dict, saldos_por_estrategia: dict | None = None) -> html.Div:
     """Bloco único "Confiabilidade por Estratégia" — fusão do antigo "Score
     de Confiabilidade" com o breakdown "Por Estratégia" (pedido do Jesué em
     2026-07-30: "junte o score de confiabilidade e a seção 'Por Estratégia'
-    no mesmo bloco, coloque uma seta no canto da linha para expandir os
-    detalhes"), com colunas ordenáveis (mesmo pedido: "adicionar
-    classificação crescente/decrescente por coluna, como no Excel").
+    no mesmo bloco"), agora como `dag.AgGrid` real (item F, Fase 2.6):
+    sort/filter/resize de coluna nativos do componente (clique no
+    cabeçalho ordena, sem callback Python nenhuma pra isso), clique numa
+    linha abre o detalhe abaixo do grid (`atualizar_detalhe_estrategia_grid`).
 
     Eram dois painéis lendo VOCABULÁRIOS diferentes — o score varria a lista
     de bootstrap congelada no código e o breakdown varria o cadastro
     editável — então mostravam nomes diferentes para os mesmos trades. Ver
-    `dt._tags_para_pontuar` para a correção da causa raiz; aqui o efeito é
-    que a coluna Saldo (que só existia no breakdown) e as métricas de
-    qualidade (que só existiam no score) passam a viver na mesma linha.
-
-    Duas regras de "nunca recriar o componente que dispara sua própria
-    callback" convivem aqui, cada uma resolvida diferente:
-      - a seta ▶/▼ de expandir: o BOTÃO é estático, só o `children` de uma
-        linha IRMÃ muda (ver `alternar_detalhe_estrategia`).
-      - os cabeçalhos de ordenação: o clique é tratado por
-        `ordenar_confiabilidade_estrategia`, que reescreve APENAS o
-        `<tbody>` (`diario-corpo-confiabilidade-estrategia`) e o TEXTO
-        (não o componente) dos botões de cabeçalho via `Output(...,
-        ALL, 'children')` — muda a seta ▲/▼ do cabeçalho sem nunca
-        recriar o `html.Button` que a callback ouve, o que preservaria
-        `n_clicks` intacto mesmo se dependêssemos dele (aqui nem
-        dependemos: o estado de ordenação mora inteiro em
-        `store-ordenacao-estrategia`)."""
+    `dt._tags_para_pontuar` para a correção da causa raiz."""
     saldos_por_estrategia = saldos_por_estrategia or {}
+    linhas = _linhas_grid_confiabilidade(scores, saldos_por_estrategia)
 
-    def cabecalho_ordenavel(rotulo: str, campo: str) -> html.Th:
-        return html.Th(html.Button(
-            _rotulo_cabecalho_ordenavel(rotulo, campo, ordenacao),
-            id={'type': 'diario-btn-sort-estrategia', 'campo': campo}, n_clicks=0, style={
-                'background': 'transparent', 'border': 'none', 'padding': '0',
-                'color': C['text2'], 'fontSize': '11px', 'fontWeight': '700',
-                'cursor': 'pointer', 'whiteSpace': 'nowrap',
-            }), style={'textAlign': 'left', 'padding': '6px 10px'})
-
-    cabecalho = html.Tr(
-        [html.Th('', style={'padding': '6px 10px'})]
-        + [cabecalho_ordenavel(rotulo, campo) for campo, rotulo in _CAMPOS_ORDENAVEIS_CONFIABILIDADE]
+    grid = dag.AgGrid(
+        id='grid-confiabilidade-estrategia',
+        rowData=linhas,
+        columnDefs=[
+            {'field': 'tag', 'hide': True},
+            {'field': 'nome', 'headerName': 'Estratégia', 'sortable': True, 'filter': True, 'flex': 2},
+            {'field': 'categoria', 'headerName': 'Categoria', 'sortable': True, 'filter': True},
+            {'field': 'n', 'headerName': 'N', 'sortable': True, 'filter': True, 'maxWidth': 90},
+            {'field': 'saldo', 'headerName': 'Saldo', 'sortable': True, 'filter': True,
+             'valueFormatter': {'function': "params.data.saldo_label"}, 'cellStyle': _CELL_STYLE_SALDO},
+            {'field': 'taxa_acerto', 'headerName': 'Taxa Acerto', 'sortable': True, 'filter': True},
+            {'field': 'payoff', 'headerName': 'Payoff', 'sortable': True, 'filter': True},
+            {'field': 'profit_factor', 'headerName': 'Profit Factor', 'sortable': True, 'filter': True},
+            {'field': 'score', 'headerName': 'Score', 'sortable': True, 'filter': True,
+             'valueFormatter': {'function': "params.data.score_label"}, 'cellStyle': _CELL_STYLE_SCORE},
+        ],
+        defaultColDef={'resizable': True, 'sortable': True, 'flex': 1},
+        dashGridOptions={'domLayout': 'autoHeight', 'animateRows': True},
+        columnSize='responsiveSizeToFit',
+        className='ag-theme-alpine',
+        style={'width': '100%'},
     )
-    linhas = _linhas_confiabilidade_estrategia(scores, saldos_por_estrategia, ordenacao)
     return html.Div([
-        html.Div('Só trades reais (o simulador não entra). Clique numa coluna pra ordenar; '
-                 'a seta abre o detalhe do setup.',
-                 style={'fontSize': '11px', 'color': C['text2'], 'marginBottom': '8px'}),
-        html.Table([html.Thead(cabecalho),
-                    html.Tbody(linhas, id='diario-corpo-confiabilidade-estrategia')],
-                   style={'width': '100%', 'borderCollapse': 'collapse'}),
+        dmc.Text('Só trades reais (o simulador não entra). Clique numa coluna pra ordenar/filtrar; '
+                 'clique numa linha pra ver o detalhe do setup.', size='xs', c='dimmed', mb='sm'),
+        grid,
+        html.Div(id='diario-detalhe-estrategia-selecionada', style={'marginTop': '12px'}),
     ])
 
 
@@ -2726,7 +2648,8 @@ def _resto_periodo_estatisticas(stats: dict, tema: str = 'light') -> html.Div:
     Saldo continua reagindo ao seletor de período."""
     return html.Div([
         _bloco_tradezella('Evolução de Saldo', dcc.Graph(
-            figure=_grafico_evolucao_saldo(stats, tema), config={'displayModeBar': False},
+            figure=_grafico_evolucao_saldo(stats, tema), config={'displayModeBar': False, 'responsive': True},
+            style={'width': '100%'},
         )),
     ])
 
@@ -2806,62 +2729,77 @@ def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 
 
         html.Div(id='diario-cards-conteudo'),
 
-        _bloco_tradezella('Calendário', html.Div([
-            html.Div([
-                html.Div([
-                    html.Button('◀', id='btn-diario-cal-mes-prev', n_clicks=0, style=estilo_botao_nav),
-                    html.Span(_NOMES_MES[hoje.month], id='diario-calendario-label-mes', style={
-                        'margin': '0 8px', 'fontSize': '12px', 'fontFamily': FONTS['display'], 'fontWeight': '700',
+        # Composição assimétrica real (item F, Fase 2.6 — `dmc.Grid`, não
+        # mais uma pilha vertical de blocos full-width): coluna estreita à
+        # esquerda (Evolução de Saldo + Anticovardia Score empilhados),
+        # coluna larga à direita (Calendário) — mesma composição do
+        # Dashboard real do TradeZella (`image1.png` do docx de
+        # referência). O resto do conteúdo exclusivo do Super Quant
+        # (Vencedora/Perdedora, Melhor por X, breakdowns, Confiabilidade,
+        # Mentor de IA) continua existindo, só que ABAIXO deste grid —
+        # decisão do Jesué: "mantenha o que já temos, adicione o que o
+        # TradeZella agrega".
+        dmc.Grid([
+            dmc.GridCol([
+                html.Div(id='diario-resto-periodo-conteudo'),
+                _bloco_anticovardia_score(tema),
+            ], span={'base': 12, 'md': 5}),
+            dmc.GridCol(
+                _bloco_tradezella('Calendário', html.Div([
+                    html.Div([
+                        html.Div([
+                            html.Button('◀', id='btn-diario-cal-mes-prev', n_clicks=0, style=estilo_botao_nav),
+                            html.Span(_NOMES_MES[hoje.month], id='diario-calendario-label-mes', style={
+                                'margin': '0 8px', 'fontSize': '12px', 'fontFamily': FONTS['display'],
+                                'fontWeight': '700',
+                            }),
+                            html.Button('▶', id='btn-diario-cal-mes-next', n_clicks=0, style=estilo_botao_nav),
+                        ], style={'display': 'flex', 'alignItems': 'center', 'marginRight': '16px'}),
+                        html.Div([
+                            html.Button('◀', id='btn-diario-cal-ano-prev', n_clicks=0, style=estilo_botao_nav),
+                            html.Span(str(hoje.year), id='diario-calendario-label-ano', style={
+                                'margin': '0 8px', 'fontSize': '12px', 'fontFamily': FONTS['display'],
+                                'fontWeight': '700',
+                            }),
+                            html.Button('▶', id='btn-diario-cal-ano-next', n_clicks=0, style=estilo_botao_nav),
+                        ], style={'display': 'flex', 'alignItems': 'center'}),
+                        html.Span('Ano Inteiro', style={
+                            'marginLeft': 'auto', 'marginRight': '8px', 'fontSize': '11px', 'color': C['text2'],
+                            'fontFamily': FONTS['display'],
+                        }),
+                        html.Button(html.Div(id='diario-modo-ano-bolinha', style=_estilo_toggle_bolinha(False)),
+                                    id='btn-diario-modo-ano', n_clicks=0, style=_estilo_toggle_trilho(False)),
+                        # Config de stats por dia (item F, fase 4) — botão
+                        # estático (mesmo raciocínio de `btn-diario-
+                        # checklist`: nunca recriado pela própria callback,
+                        # só o `children` do painel abaixo muda) que
+                        # abre/fecha um `dcc.Checklist`.
+                        html.Button('⚙ Stats', id='btn-diario-cal-config', n_clicks=0, style={
+                            **estilo_botao_nav, 'marginLeft': '8px',
+                        }),
+                    ], style={
+                        # `flexWrap`: 4 mês + ano viraram grupos separados
+                        # (feedback 2026-07-12) — a fileira ficou mais larga
+                        # que o botão único de antes e, sem wrap, estourava a
+                        # largura do iframe do Diário (dashboard.py embute em
+                        # 100% de largura), forçando scroll horizontal que
+                        # por sua vez empurrava a página inteira a precisar
+                        # de scroll vertical também. Com wrap, em telas
+                        # estreitas o toggle só desce pra 2ª linha.
+                        'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'center',
+                        'rowGap': '8px', 'marginBottom': '8px',
                     }),
-                    html.Button('▶', id='btn-diario-cal-mes-next', n_clicks=0, style=estilo_botao_nav),
-                ], style={'display': 'flex', 'alignItems': 'center', 'marginRight': '16px'}),
-                html.Div([
-                    html.Button('◀', id='btn-diario-cal-ano-prev', n_clicks=0, style=estilo_botao_nav),
-                    html.Span(str(hoje.year), id='diario-calendario-label-ano', style={
-                        'margin': '0 8px', 'fontSize': '12px', 'fontFamily': FONTS['display'], 'fontWeight': '700',
-                    }),
-                    html.Button('▶', id='btn-diario-cal-ano-next', n_clicks=0, style=estilo_botao_nav),
-                ], style={'display': 'flex', 'alignItems': 'center'}),
-                html.Span('Ano Inteiro', style={
-                    'marginLeft': 'auto', 'marginRight': '8px', 'fontSize': '11px', 'color': C['text2'],
-                    'fontFamily': FONTS['display'],
-                }),
-                html.Button(html.Div(id='diario-modo-ano-bolinha', style=_estilo_toggle_bolinha(False)),
-                            id='btn-diario-modo-ano', n_clicks=0, style=_estilo_toggle_trilho(False)),
-                # Config de stats por dia (item F, fase 4) — botão estático
-                # (mesmo raciocínio de `btn-diario-checklist`: nunca recriado
-                # pela própria callback, só o `children` do painel abaixo
-                # muda) que abre/fecha um `dcc.Checklist`.
-                html.Button('⚙ Stats', id='btn-diario-cal-config', n_clicks=0, style={
-                    **estilo_botao_nav, 'marginLeft': '8px',
-                }),
-            ], style={
-                # `flexWrap`: 4 mês + ano viraram grupos separados (feedback
-                # 2026-07-12) — a fileira ficou mais larga que o botão único
-                # de antes e, sem wrap, estourava a largura do iframe do
-                # Diário (dashboard.py embute em 100% de largura), forçando
-                # scroll horizontal que por sua vez empurrava a página
-                # inteira a precisar de scroll vertical também. Com wrap,
-                # em telas estreitas o toggle só desce pra 2ª linha.
-                'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'center',
-                'rowGap': '8px', 'marginBottom': '8px',
-            }),
-            html.Div(id='diario-cal-config-conteudo'),
-            html.Div(id='diario-calendario-grid'),
-        ])),
-
-        html.Div(id='diario-resto-periodo-conteudo'),
+                    html.Div(id='diario-cal-config-conteudo'),
+                    html.Div(id='diario-calendario-grid'),
+                ])),
+                span={'base': 12, 'md': 7},
+            ),
+        ], gutter='md', mb='md'),
 
         # `stats_geral` é o SEM filtro de período (ver a chamada em
         # `montar_sub_aba_diario`), igual ao `scores` — os dois lados da
         # tabela fundida precisam falar do mesmo recorte.
         #
-        # `store-ordenacao-estrategia` reseta pro default (None = Saldo
-        # decrescente) toda vez que a aba Estatísticas remonta — mesmo
-        # padrão de outros Stores por-sub-aba deste arquivo (ex:
-        # store-em-andamento-ids-conhecidos), aceitável porque entrar na aba
-        # é ação deliberada e rara, não um evento repetitivo.
-        dcc.Store(id='store-ordenacao-estrategia', data=None),
         # "Análise de Estratégia" (2026-07-30) fica ACIMA de "Confiabilidade
         # por Estratégia", pedido explícito do docx — os dois são ALL-TIME,
         # mesmo recorte (stats_geral/scores computados 1x na entrada da aba).
@@ -3370,7 +3308,13 @@ def _servir_imagem_diario(nome_arquivo):
     return flask.send_from_directory(cfg.PASTA_DIARIO_IMAGENS, nome_arquivo)
 
 
-app.layout = html.Div([
+# dmc.MantineProvider precisa envolver a árvore inteira do app pra CSS
+# vars/contexto do React funcionarem (item F, Fase 2.6 — componentes DMC
+# usados dentro da aba Estatísticas, ver mais abaixo). `defaultColorScheme`
+# fica em 'light' por padrão — a troca real de tema já é 100% feita via CSS
+# vars (`C`/`assets/tema.js`); o DMC só precisa não brigar com isso (ver
+# `_bridge_tema_mantine` callback client-side logo abaixo do layout).
+app.layout = dmc.MantineProvider(id='mantine-provider-diario', defaultColorScheme='light', children=html.Div([
     html.Link(rel='stylesheet',
               href='https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;500&display=swap'),
 
@@ -3460,7 +3404,7 @@ app.layout = html.Div([
 ], style={
     'padding': '8px', 'fontFamily': FONTS['body'], 'background': C['bg'], 'color': C['text'],
     'minHeight': '100vh', 'boxSizing': 'border-box',
-})
+}))
 
 
 # Tema claro/escuro (2026-07-17) — aplica o tema recebido do pai (ou o
@@ -3478,6 +3422,17 @@ app.clientside_callback(
     }
     """,
     Output('store-tema-dummy', 'data'),
+    Input('store-tema', 'data'),
+)
+
+# Ponte DMC (item F, Fase 2.6) — `dmc.MantineProvider` tem sistema de tema
+# PRÓPRIO (`forceColorScheme`), independente do `C`/CSS vars já existente.
+# Sem isso, componentes DMC (Card/RingProgress/Tooltip/AgGrid) ficariam
+# sempre no esquema default enquanto o resto da página troca por CSS var —
+# os dois sistemas precisam ouvir o MESMO `store-tema`.
+app.clientside_callback(
+    "function(tema) { return tema || 'light'; }",
+    Output('mantine-provider-diario', 'forceColorScheme'),
     Input('store-tema', 'data'),
 )
 
@@ -4190,69 +4145,24 @@ def gerar_mentor_ia(n_clicks):
 
 
 @app.callback(
-    Output({'type': 'diario-detalhe-estrategia', 'index': dash.MATCH}, 'children'),
-    Output({'type': 'diario-btn-expandir-estrategia', 'index': dash.MATCH}, 'children'),
-    Input({'type': 'diario-btn-expandir-estrategia', 'index': dash.MATCH}, 'n_clicks'),
-    State({'type': 'diario-btn-expandir-estrategia', 'index': dash.MATCH}, 'children'),
-    State({'type': 'diario-btn-expandir-estrategia', 'index': dash.MATCH}, 'id'),
+    Output('diario-detalhe-estrategia-selecionada', 'children'),
+    Input('grid-confiabilidade-estrategia', 'cellClicked'),
     prevent_initial_call=True,
 )
-def alternar_detalhe_estrategia(n_clicks, seta_atual, id_componente):
-    """Seta da linha de "Confiabilidade por Estratégia" (2026-07-30) —
-    mesma mecânica de `alternar_detalhe_historico`: a seta É o estado (▶
-    fechado / ▼ aberto), sem `dcc.Store` por linha, e a callback só escreve
-    numa linha IRMÃ (nunca recria o próprio botão, o que zeraria
-    `n_clicks`)."""
-    if not n_clicks:
-        return no_update, no_update
-    if seta_atual == '▶':
-        return _detalhe_estrategia_expandido(id_componente['index']), '▼'
-    return None, '▶'
-
-
-@app.callback(
-    Output('diario-corpo-confiabilidade-estrategia', 'children'),
-    Output({'type': 'diario-btn-sort-estrategia', 'campo': ALL}, 'children'),
-    Output('store-ordenacao-estrategia', 'data'),
-    Input({'type': 'diario-btn-sort-estrategia', 'campo': ALL}, 'n_clicks'),
-    State({'type': 'diario-btn-sort-estrategia', 'campo': ALL}, 'id'),
-    State('store-ordenacao-estrategia', 'data'),
-    prevent_initial_call=True,
-)
-def ordenar_confiabilidade_estrategia(n_clicks_lista, ids_cabecalho, ordenacao_atual):
-    """Clique num cabeçalho de "Confiabilidade por Estratégia" ordena por
-    aquela coluna; clicar de novo no MESMO cabeçalho inverte a direção
-    (como no Excel — pedido do Jesué em 2026-07-30).
-
-    Reescreve o `<tbody>` (`diario-corpo-confiabilidade-estrategia`) inteiro
-    — NUNCA os botões de cabeçalho que disparam esta callback. A seta ▲/▼
-    do cabeçalho ativo muda pelo segundo Output (`children` de texto via
-    `ALL`, na MESMA ordem de `ids_cabecalho`, que é como o Dash exige a
-    resposta de um Output `ALL` — ver `destacar_imagem_principal` pro mesmo
-    padrão já usado neste arquivo). Trocar só o texto do botão não recria o
-    componente, então `n_clicks` nunca zera — mas nem dependemos dele pra
-    nada além de detectar QUAL cabeçalho foi clicado: o estado de ordenação
-    inteiro mora em `store-ordenacao-estrategia`."""
-    ctx = callback_context
-    if not ctx.triggered or not any(n_clicks_lista or []):
-        return no_update, no_update, no_update
-    campo_clicado = json.loads(ctx.triggered[0]['prop_id'].rsplit('.', 1)[0])['campo']
-
-    campo_atual = (ordenacao_atual or {}).get('campo')
-    direcao_atual = (ordenacao_atual or {}).get('direcao', 'desc')
-    nova_direcao = ('asc' if direcao_atual == 'desc' else 'desc') if campo_clicado == campo_atual else 'desc'
-    nova_ordenacao = {'campo': campo_clicado, 'direcao': nova_direcao}
-
-    scores = dt.calcular_score_confiabilidade()
-    stats = dt.calcular_estatisticas()
-    linhas = _linhas_confiabilidade_estrategia(scores, stats['por_estrategia'], nova_ordenacao)
-
-    rotulos_por_campo = dict(_CAMPOS_ORDENAVEIS_CONFIABILIDADE)
-    novos_rotulos = [
-        _rotulo_cabecalho_ordenavel(rotulos_por_campo[item_id['campo']], item_id['campo'], nova_ordenacao)
-        for item_id in ids_cabecalho
-    ]
-    return linhas, novos_rotulos, nova_ordenacao
+def atualizar_detalhe_estrategia_grid(cell_clicked):
+    """Clique numa linha do AG Grid "Confiabilidade por Estratégia" (item
+    F, Fase 2.6) — substitui a seta ▶/▼ por linha (`alternar_detalhe_
+    estrategia`, agora removida): `cellClicked` já traz a linha inteira em
+    `cell_clicked['data']`, sem precisar de pattern-matching id por tag.
+    Sempre re-renderiza o MESMO painel fixo (`diario-detalhe-estrategia-
+    selecionada`), nunca um id por linha — mais simples que o padrão
+    anterior porque o grid já resolve "qual linha" sozinho."""
+    if not cell_clicked or not cell_clicked.get('data'):
+        return no_update
+    tag = cell_clicked['data'].get('tag')
+    if not tag or not cell_clicked['data'].get('n'):
+        return None
+    return _detalhe_estrategia_expandido(tag)
 
 
 @app.callback(

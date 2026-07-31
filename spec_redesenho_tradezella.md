@@ -225,3 +225,111 @@ dentro do iframe do Diário acessado direto): confirmado via
 com texto escuro, e `rgb(224,92,92)`/`rgb(46,204,138)` (saturado, tema
 escuro) com texto claro — exatamente como projetado. Suíte completa (14
 suítes) passando + auditoria de acoplamento em 0.
+
+**Correção do Jesué sobre esta fase**: "parece que você está apenas
+mudando as cores e as fontes dentro da mesma estrutura" — a 2.5 mexeu só
+em CSS por cima da MESMA árvore de componentes (`html.Div`/`html.Table`/
+Plotly Indicator estático), não no "tipo de biblioteca/elementos/
+animações" que ele pediu. Ver Fase 2.6 abaixo pra correção real.
+
+## Fase 2.6 — Biblioteca real (DMC + AG Grid) + animações — ✅ CONCLUÍDO (2026-07-31)
+
+Terceira correção de rumo do Jesué sobre o mesmo pedido: "reavalie a
+estrutura de UX do sistema, isso tem a ver com o tipo de biblioteca que
+usa, os elementos, os recursos, as animações... descubra como o UX do
+TradeZella é estruturado no nível mais profundo." Pesquisa confirmou um
+limite real: TradeZella é SaaS fechado, sem documentação pública de
+código/animação — não dá pra "descobrir" a implementação interna deles.
+O que É possível (e o que este item faz): adotar bibliotecas Dash reais
+que produzem o MESMO NÍVEL de sofisticação de componente/animação.
+Plano completo aprovado via EnterPlanMode/ExitPlanMode em
+`C:\Users\jesue\.claude\plans\modular-herding-salamander.md`.
+
+**Bibliotecas novas instaladas** (`dash-mantine-components` 2.8.0,
+`dash-ag-grid` 35.3.0 — compatibilidade com `dash==4.3.0` confirmada por
+import isolado antes de qualquer código em cima):
+
+- `dash_mantine_components` (DMC) — substitui `html.Div`/flexbox cru por
+  componentes reais: `dmc.Card` (elevação/hover nativos), `dmc.Grid`/
+  `dmc.GridCol`/`dmc.SimpleGrid` (grid responsivo real, não flexbox
+  manual), `dmc.RingProgress` (gauge que ANIMA o preenchimento — o antigo
+  Plotly `go.Indicator` não animava), `dmc.ProgressRoot`/`ProgressSection`
+  (barra Avg Win/Loss), `dmc.ThemeIcon` (badges de emoji), `dmc.Skeleton`
+  (placeholder pulsante do Mentor de IA antes da 1ª geração), `dmc.Button`.
+  Requer `from dash import _dash_renderer;
+  _dash_renderer._set_react_version('18.2.0')` ANTES de `dash.Dash(...)`
+  ser instanciado (exigência do DMC 2.x) e `app.layout` inteiro envolto em
+  `dmc.MantineProvider`. Ponte de tema: `forceColorScheme` do
+  MantineProvider ligado ao MESMO `store-tema` via `clientside_callback`
+  (`assets`-style, mesmo padrão de `tema.js`).
+- `dash_ag_grid` — substitui o `html.Table` montado à mão de
+  "Confiabilidade por Estratégia" por um grid real: sort/filter/resize
+  nativos do componente (removeu por completo a callback manual
+  `ordenar_confiabilidade_estrategia` + `store-ordenacao-estrategia` — o
+  grid ordena sozinho no cliente). Expansão de detalhe por linha mudou de
+  "seta ▶ + callback de linha-irmã" pra `Input('grid-...', 'cellClicked')`
+  — clique em qualquer linha atualiza um painel de detalhe fixo abaixo do
+  grid (`atualizar_detalhe_estrategia_grid`), mais simples que o padrão
+  anterior porque o grid já resolve "qual linha" sozinho, sem precisar de
+  pattern-matching id por tag.
+
+**Animações novas** (`assets/tradezella_ux.css` + `assets/tradezella_ux.js`,
+mesmo padrão de asset já usado no projeto pra `tema.js`/`diario_zoom.js`):
+hover elevation (`translateY(-2px)` + sombra mais forte) e fade-in
+escalonado por card (`@keyframes tz-fade-in-up` + `animation-delay`
+incremental via `:nth-of-type`) nos `.tz-card`; count-up de números (Net
+P&L, Anticovardia Score) — JS pequeno que extrai o primeiro número do
+texto via regex e anima de 0 até o valor real em 600ms com ease-out
+cúbico, sem precisar duplicar formatação Python↔JS. Cuidado documentado no
+código: `animar_numero=True` só é seguro pra valores de STRING simples,
+nunca pra conteúdo composto (o JS reescreve `el.textContent`, que apagaria
+filhos não-texto como o badge do Current Streak).
+
+**Bug real corrigido durante a implementação**: `c=None`/`color=None`
+passado a componentes DMC quebra o parser de cor no navegador — Python
+`None` vira JSON `null`, e como `typeof null === 'object'` em JS, o
+parser do Mantine (que só aceita string ou `undefined`) rejeita. Corrigido
+omitindo o prop inteiro (não passar `c=`) quando não há cor, em vez de
+passar `None` explicitamente — em `_card_header_tradezella` e
+`_card_estatistica`.
+
+**Achado de ambiente, não resolvido**: um aviso de console recorrente
+("[@mantine/core] Failed to parse color. Expected color to be a string,
+instead got object") aparece durante a renderização real da aba
+Estatísticas dentro do processo `diario_app_classico.py` — MAS não
+reproduz em nenhuma tentativa isolada (testado: render direto, render via
+callback, com/sem a ponte `forceColorScheme`, com dado real idêntico).
+Confirmado que é **cosmético, não bloqueante**: a página renderiza 100% do
+conteúdo corretamente nos dois temas, os componentes DMC/AG Grid funcionam
+(sort, clique, hover, animação), verificado via `getComputedStyle` e
+inspeção de rede. Fica anotado pra investigar depois com mais tempo (não
+prioridade agora — não afeta nenhuma funcionalidade real).
+
+**Correção de layout pós-instalação** (feedback do Jesué com screenshots
+anotados: "não gosto desses espaços vazios, organize melhor os
+elementos") — `dmc.Card` NÃO estica sozinho pra preencher o container
+(diferente de um `html.Div` de bloco comum), deixando espaço morto à
+direita quando usado sozinho numa linha, ou quando dois cards ficavam lado
+a lado dentro de um `display:flex` cru (um card mais estreito não força o
+irmão a crescer). Corrigido com: `w='100%'` em `_bloco_tradezella`/
+`_bloco_anticovardia_score` (preenche o container quando sozinho);
+`dmc.SimpleGrid` (não `html.Div(display:flex)`) pra TODOS os pares
+lado-a-lado (Vencedora/Perdedora, Melhor por Horário/Direção/Ativo/
+Categoria, Por Ativo/Janela/Sala/Tags) — SimpleGrid divide a linha em
+células IGUAIS de verdade, então cada card ocupa sua metade
+independente da largura do vizinho; `dcc.Graph` (Evolução de Saldo,
+radar do Anticovardia) ganhou `config={'responsive': True}` +
+`style={'width': '100%'}` — sem isso o Plotly não redimensionava pra
+acompanhar a coluna do grid assimétrico. Também reorganizado o CONTEÚDO
+interno de cada card do header: número e mini-gráfico agora lado a lado
+(`dmc.Group justify='space-between'`) em vez de empilhados, eliminando o
+vão vazio abaixo de gauges pequenos. Verificado ao vivo: coluna esquerda
+(Evolução de Saldo + Anticovardia Score) e direita (Calendário) agora
+preenchem exatamente a largura alocada pelo grid assimétrico (511px/722px,
+sem sobra), pares "Melhor por X" em 50/50 real (596px cada).
+
+Verificado ao vivo no navegador (import isolado das 2 libs antes de
+qualquer código; suíte completa de 14 testes + auditoria de acoplamento em
+0; conteúdo real renderizado corretamente nos dois temas; grid
+"Confiabilidade por Estratégia" com dado real; larguras de coluna
+conferidas via `getBoundingClientRect`).
