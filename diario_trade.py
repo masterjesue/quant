@@ -967,6 +967,141 @@ def _maior_sequencia(sinais: pd.Series, alvo: int) -> int:
     return maior
 
 
+def sequencia_atual(df: pd.DataFrame | None = None) -> dict:
+    """Sequência ATUAL de win/loss, contando de trás pra frente a partir do
+    trade mais recente — distinto de `maior_sequencia_win/loss`
+    (`calcular_estatisticas`), que é o MÁXIMO histórico. Usado no card
+    "Current Streak" do redesenho TradeZella (item F). Breakeven quebra a
+    sequência (nem conta como win nem como loss).
+
+    Retorna `{'tipo': 'win'|'loss'|None, 'trades': n, 'dias': n_dias}` —
+    `dias` é a contagem de dias de pregão DISTINTOS cobertos pela
+    sequência (um dia com vários trades da mesma sequência conta 1x).
+    `tipo=None` quando não há trades reais ou o último trade foi
+    breakeven (sequência de tamanho zero)."""
+    if df is None:
+        df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)].copy()
+    if reais.empty:
+        return {"tipo": None, "trades": 0, "dias": 0}
+
+    reais = reais.sort_values("data_op")
+    saldo = reais["saldo_operacao_reais"].astype(float)
+    sinais = saldo.apply(lambda v: 1 if v > 0 else (-1 if v < 0 else 0)).tolist()
+    dias = reais["data_op"].astype(str).tolist()
+
+    ultimo = sinais[-1]
+    if ultimo == 0:
+        return {"tipo": None, "trades": 0, "dias": 0}
+
+    n_trades = 0
+    dias_cobertos = set()
+    for sinal, dia in zip(reversed(sinais), reversed(dias)):
+        if sinal != ultimo:
+            break
+        n_trades += 1
+        dias_cobertos.add(dia)
+
+    return {"tipo": "win" if ultimo == 1 else "loss", "trades": n_trades, "dias": len(dias_cobertos)}
+
+
+def r_multiple_trade(trade) -> float | None:
+    """R-multiple de um trade — resultado em unidades de risco inicial
+    (`resultado_pontos / stop_pontos`). Como os dois já estão na mesma
+    unidade (pontos do próprio ativo/lote do trade), `valor_ponto` cancela
+    e não entra na conta. Retorna `None` quando falta `stop_pontos` (nulo
+    ou zero) ou `resultado_pontos` — cerca de 30% da base real não tem
+    `stop_pontos` preenchido (trades antigos, sem registro completo), então
+    quem consome isto precisa tratar `None` como "sem dado", não como 0."""
+    stop = trade.get("stop_pontos") if hasattr(trade, "get") else trade["stop_pontos"]
+    resultado = trade.get("resultado_pontos") if hasattr(trade, "get") else trade["resultado_pontos"]
+    if stop is None or resultado is None or pd.isna(stop) or pd.isna(resultado) or stop == 0:
+        return None
+    return float(resultado) / float(stop)
+
+
+def duracao_minutos_trade(trade) -> float | None:
+    """Duração de um trade em minutos (`datetime_saida - datetime_entrada`).
+    Retorna `None` quando falta um dos dois timestamps — cerca de 63% da
+    base real não tem os dois preenchidos (trades antigos, importados sem
+    o detalhe de horário), então "Trade Duration Performance" (item F)
+    nasce com amostra parcial, não com 100% dos trades."""
+    entrada = trade.get("datetime_entrada") if hasattr(trade, "get") else trade["datetime_entrada"]
+    saida = trade.get("datetime_saida") if hasattr(trade, "get") else trade["datetime_saida"]
+    if entrada is None or saida is None or pd.isna(entrada) or pd.isna(saida):
+        return None
+    return (pd.Timestamp(saida) - pd.Timestamp(entrada)).total_seconds() / 60.0
+
+
+# Caps do Anticovardia Score (item F, redesenho TradeZella) — primeiro
+# palpite, mesmo espírito de SCORE_CAP_*/SCORE_PESO_* acima: ajustar depois
+# de ver o número real na tela. CAP_DRAWDOWN é em R$ FIXO, não em % do pico
+# de saldo acumulado — `calcular_estatisticas` já abandonou drawdown em %
+# de propósito (comentário logo abaixo de `pico_corrente` nesta função:
+# o pico inicial da série é pequeno, drawdown/pico explode sem sentido,
+# ex: -1185%, porque o projeto não rastreia saldo de conta, só P&L
+# acumulado a partir de zero). Repetir esse erro aqui reintroduziria o
+# mesmo bug já corrigido — por isso um cap em R$ absoluto, calibrado contra
+# o maior drawdown histórico real da base (R$ -1.152,00 em 2026-07-30).
+ANTICOVARDIA_CAP_RECOVERY = 5.0
+ANTICOVARDIA_CAP_DRAWDOWN_REAIS = 1500.0
+
+
+def calcular_anticovardia_score(df: pd.DataFrame | None = None) -> dict:
+    """Anticovardia Score (item F, redesenho TradeZella — nome trocado do
+    "Zella Score" original) — 0-100 combinando 6 eixos EM NÍVEL DE CONTA
+    (não por estratégia, como `calcular_score_confiabilidade`): Win Rate,
+    Profit Factor, Avg Win/Loss, Recovery Factor, Max Drawdown,
+    Consistency. Pesos iguais (1/6 cada), mesmo espírito do score por
+    estratégia.
+
+    NÃO inclui "disciplina/aderência a regras" — mesma razão documentada em
+    `calcular_score_confiabilidade`: não há Playbook/regra formal
+    cadastrada ainda, fabricar esse componente sem dado real seria pior que
+    omiti-lo. O radar real do TradeZella (`image1.png` do docx de
+    referência) usa "Recovery Factor" no lugar, não disciplina — os 6 eixos
+    aqui batem com essa referência visual, não com a descrição textual
+    genérica do produto.
+
+    Retorna `{'score': float|None, 'eixos': {nome: valor_0_a_100}}` —
+    `score=None` só quando não há nenhum trade real (`num_operacoes == 0`).
+    """
+    stats = calcular_estatisticas(df=df)
+    if stats["num_operacoes"] == 0:
+        return {"score": None, "eixos": {}}
+
+    win_rate = stats["taxa_acerto"] * 100
+
+    profit_factor = stats["profit_factor"]
+    eixo_profit_factor = min((profit_factor or SCORE_CAP_PROFIT_FACTOR) / SCORE_CAP_PROFIT_FACTOR, 1.0) * 100
+
+    payoff = stats["payoff"]
+    eixo_avg_win_loss = min((payoff or SCORE_CAP_PAYOFF) / SCORE_CAP_PAYOFF, 1.0) * 100
+
+    drawdown = abs(stats["drawdown_maximo_reais"])
+    saldo_total = stats["saldo_total"]
+    recovery_factor = (saldo_total / drawdown) if drawdown else 0.0
+    eixo_recovery = min(max(recovery_factor, 0.0) / ANTICOVARDIA_CAP_RECOVERY, 1.0) * 100
+
+    eixo_drawdown = 100.0 - min(drawdown / ANTICOVARDIA_CAP_DRAWDOWN_REAIS * 100, 100.0)
+
+    por_dia = stats["por_dia"]
+    dias_operados = len(por_dia)
+    dias_positivos = sum(1 for v in por_dia.values() if v["saldo"] > 0)
+    eixo_consistencia = (dias_positivos / dias_operados * 100) if dias_operados else 0.0
+
+    eixos = {
+        "win_rate": win_rate,
+        "profit_factor": eixo_profit_factor,
+        "avg_win_loss": eixo_avg_win_loss,
+        "recovery_factor": eixo_recovery,
+        "max_drawdown": eixo_drawdown,
+        "consistencia": eixo_consistencia,
+    }
+    score = sum(eixos.values()) / len(eixos)
+    return {"score": score, "eixos": eixos}
+
+
 def _agrupar_soma_contagem(df: pd.DataFrame, coluna: str) -> dict:
     """`{valor_da_coluna: {'n': contagem, 'saldo': soma de saldo_operacao_reais}}`, ordenado por saldo desc."""
     agrupado = df.groupby(coluna)["saldo_operacao_reais"].agg(["count", "sum"])
@@ -1016,7 +1151,8 @@ def calcular_estatisticas(
     vazio = {
         "num_operacoes": 0, "saldo_total": 0.0, "max_gain": 0.0, "max_loss": 0.0,
         "ganho_total": 0.0, "perda_total": 0.0,
-        "taxa_acerto": 0.0, "payoff": None, "expectativa": 0.0,
+        "taxa_acerto": 0.0, "payoff": None, "profit_factor": None, "expectativa": 0.0,
+        "media_ganho_reais": 0.0, "media_perda_reais": 0.0,
         "n_win": 0, "n_loss": 0, "n_breakeven": 0,
         "maior_sequencia_win": 0, "maior_sequencia_loss": 0,
         "por_ativo": {}, "por_janela": {}, "por_sala": {}, "por_estrategia": {},
@@ -1041,6 +1177,9 @@ def calcular_estatisticas(
     media_ganho = float(vencedoras["saldo_operacao_reais"].mean()) if n_win else 0.0
     media_perda = float(perdedoras["saldo_operacao_reais"].mean()) if n_loss else 0.0
     payoff = abs(media_ganho / media_perda) if media_perda else None
+    soma_ganhos = float(vencedoras["saldo_operacao_reais"].sum()) if n_win else 0.0
+    soma_perdas = float(perdedoras["saldo_operacao_reais"].sum()) if n_loss else 0.0
+    profit_factor = abs(soma_ganhos / soma_perdas) if soma_perdas else None
     expectativa = taxa_acerto * media_ganho + (1 - taxa_acerto) * media_perda
 
     sinais = saldo.apply(lambda v: 1 if v > 0 else (-1 if v < 0 else 0))
@@ -1085,7 +1224,9 @@ def calcular_estatisticas(
         "perda_total": float(perdedoras["saldo_operacao_reais"].sum()) if n_loss else 0.0,
         "taxa_acerto": taxa_acerto,
         "payoff": payoff,
+        "profit_factor": profit_factor,
         "expectativa": expectativa,
+        "media_ganho_reais": media_ganho, "media_perda_reais": media_perda,
         "n_win": n_win, "n_loss": n_loss, "n_breakeven": n_be,
         "maior_sequencia_win": _maior_sequencia(sinais, 1),
         "maior_sequencia_loss": _maior_sequencia(sinais, -1),

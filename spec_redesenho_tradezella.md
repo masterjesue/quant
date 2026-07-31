@@ -70,10 +70,17 @@ tooling novo.
 
 ## Fases sugeridas de execução (menor risco → maior)
 
-1. **Gaps de dado triviais primeiro** (sem UI ainda): profit_factor geral,
-   avg win/avg loss separados, `sequencia_atual`, `r_multiple_trade`,
-   duração de trade. Tudo testável em `testes/` isoladamente, sem tocar
-   layout.
+1. **✅ CONCLUÍDO (2026-07-30)** — Gaps de dado triviais: `profit_factor`
+   geral + `media_ganho_reais`/`media_perda_reais` em
+   `calcular_estatisticas`; `sequencia_atual(df)` (streak ATUAL, distinto
+   do máximo histórico); `r_multiple_trade(trade)`; `duracao_minutos_trade
+   (trade)`; `calcular_anticovardia_score(df)` (score final + 6 eixos,
+   fórmula da seção acima). Achados reais na base ao implementar: só
+   37% dos trades (83/225) têm `datetime_entrada`/`datetime_saida`
+   preenchidos — "Trade Duration Performance" (fase 5) nasce com amostra
+   parcial; ~30% não têm `stop_pontos` — R-multiple também parcial. Ambas
+   as funções retornam `None` graciosamente nesses casos, nunca erro.
+   Testado em `testes/teste_anticovardia_fase1.py`.
 2. **Header de stat cards** (Net P&L / Win% / Avg Win-Loss / Profit Factor
    / Current Streak) — substituindo os "QUANTIDADE/TAXAS/VALORES" atuais
    por cards com mini-visual (gauge/donut/sparkline). Maior impacto visual
