@@ -81,10 +81,19 @@ tooling novo.
    parcial; ~30% não têm `stop_pontos` — R-multiple também parcial. Ambas
    as funções retornam `None` graciosamente nesses casos, nunca erro.
    Testado em `testes/teste_anticovardia_fase1.py`.
-2. **Header de stat cards** (Net P&L / Win% / Avg Win-Loss / Profit Factor
-   / Current Streak) — substituindo os "QUANTIDADE/TAXAS/VALORES" atuais
-   por cards com mini-visual (gauge/donut/sparkline). Maior impacto visual
-   imediato, menor risco estrutural (não mexe em tabela nem calendário).
+2. **✅ CONCLUÍDO (2026-07-30)** — Header de stat cards: Net P&L, Trade
+   Win% (gauge), Avg Win/Loss (barra divergente verde/vermelho), Profit
+   Factor (gauge), Current Streak (`sequencia_atual`, ALL-TIME de
+   propósito — um streak cortado no limite do mês selecionado não faz
+   sentido conceitual). `_cards_header_tradezella`/`_grafico_gauge`/
+   `_grafico_barra_avg_win_loss` em `diario_app_classico.py`. Os grupos
+   antigos (Quantidade/Taxas/Valores) NÃO foram descartados — viraram um
+   bloco "Detalhes" logo abaixo (`_cards_detalhe_estatisticas`), preservando
+   Wins/Losses/Breakeven/Sequências/Max Gain-Loss/Drawdown/Ganho-Perda
+   Total. Verificado ao vivo no navegador: os 3 gráficos novos renderizam
+   com as dimensões e valores corretos, sem erro de console, "Detalhes"
+   intacto. Reafirma o achado de ambiente da Fase D: o processo filho
+   precisou ser reiniciado pra pegar o código novo (não recarrega sozinho).
 3. **Anticovardia Score** (radar) — precisa da decisão de fórmula abaixo
    antes de codar.
 4. **Calendário configurável** (stats por dia + toggle) — maior mudança de

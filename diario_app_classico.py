@@ -1693,6 +1693,121 @@ def _conteudo_detalhe_trade(id_trade: int) -> html.Div | None:
     ]))
 
 
+# ---------------------------------------------------------------------------
+# Header de stat cards estilo TradeZella (item F, fase 2,
+# `spec_redesenho_tradezella.md`) — Net P&L / Trade Win% / Avg Win-Loss /
+# Profit Factor / Current Streak, substituindo os grupos Quantidade/Taxas/
+# Valores antigos (que continuam existindo, só demovidos pra um bloco
+# "Detalhes" logo abaixo — nenhum dado é descartado, só reorganizado).
+# ---------------------------------------------------------------------------
+
+def _grafico_gauge(valor: float, maximo: float, cor_arco: str, tema: str,
+                    sufixo: str = '', casas: int = 0) -> go.Figure:
+    """Gauge circular pequeno (Win%/Profit Factor) — mesmo padrão de
+    `_grafico_evolucao_saldo`/`_radar_roda_vida`: `paper_bgcolor`/cor via
+    `PALETA_GAUGE[tema]`, sem reatividade a troca de tema depois de
+    renderizado (limitação já aceita e documentada em `assets/tema.js`)."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    fig = go.Figure(go.Indicator(
+        mode='gauge+number',
+        value=valor,
+        number={'suffix': sufixo, 'font': {'size': 18, 'color': p['text'], 'family': FONTS['mono']},
+                'valueformat': f'.{casas}f'},
+        gauge={
+            'axis': {'range': [0, maximo], 'visible': False},
+            'bar': {'color': cor_arco, 'thickness': 0.85},
+            'bgcolor': p['border'], 'borderwidth': 0,
+        },
+    ))
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', margin=dict(l=6, r=6, t=6, b=0), height=70,
+    )
+    return fig
+
+
+def _grafico_barra_avg_win_loss(media_ganho: float, media_perda: float, tema: str) -> go.Figure:
+    """Barra horizontal divergente (Avg Win/Loss) — verde estendendo pra
+    direita (ganho médio), vermelho pra esquerda (perda média), a partir do
+    zero. Mesma leitura visual do card equivalente no TradeZella
+    (`image1.png` do docx de referência)."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=[media_ganho], y=[''], orientation='h', marker_color=p['green'],
+                          text=[f"R$ {media_ganho:+.0f}"], textposition='outside'))
+    fig.add_trace(go.Bar(x=[media_perda], y=[''], orientation='h', marker_color=p['red'],
+                          text=[f"R$ {media_perda:+.0f}"], textposition='outside'))
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', showlegend=False,
+        barmode='overlay', margin=dict(l=6, r=6, t=6, b=6), height=50,
+        font=dict(family=FONTS['mono'], color=p['text2'], size=10),
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+    )
+    return fig
+
+
+def _card_header_tradezella(titulo: str, valor_str: str, cor_valor=None, grafico=None) -> html.Div:
+    conteudo = [
+        html.Div(titulo, style={'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['display'],
+                                 'textTransform': 'uppercase', 'letterSpacing': '0.06em', 'marginBottom': '5px'}),
+        html.Div(valor_str, style={'fontSize': '19px', 'fontWeight': '700', 'fontFamily': FONTS['mono'],
+                                    'color': cor_valor or C['text']}),
+    ]
+    if grafico is not None:
+        conteudo.append(dcc.Graph(figure=grafico, config={'displayModeBar': False},
+                                   style={'marginTop': '2px'}))
+    return html.Div(conteudo, style={
+        'background': C['panel'], 'border': f'1px solid {C["border"]}', 'borderRadius': '10px',
+        'padding': '12px 14px', 'flex': '1', 'minWidth': '160px',
+    })
+
+
+def _cards_header_tradezella(stats: dict, tema: str) -> html.Div:
+    """5 cards ao estilo TradeZella (item F, fase 2): Net P&L / Trade Win% /
+    Avg Win-Loss / Profit Factor / Current Streak. Reage ao MESMO período
+    que o resto do bloco de estatísticas (mês/ano selecionado no
+    calendário) — EXCETO Current Streak, que é deliberadamente ALL-TIME
+    (`dt.sequencia_atual()` sem filtro): um streak "atual" cortado no limite
+    do mês selecionado não faz sentido conceitual (um streak real de 3
+    trades pode atravessar a virada do mês)."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+
+    saldo_total = stats['saldo_total']
+    card_net_pnl = _card_header_tradezella(
+        'Net P&L', f"R$ {saldo_total:+.2f}",
+        cor_valor=(C['green'] if saldo_total > 0 else (C['red'] if saldo_total < 0 else None)),
+    )
+
+    win_pct = stats['taxa_acerto'] * 100
+    card_win_pct = _card_header_tradezella(
+        'Trade Win %', f"{win_pct:.1f}%",
+        grafico=_grafico_gauge(win_pct, 100, p['green'], tema, sufixo='%'),
+    )
+
+    card_avg_win_loss = _card_header_tradezella(
+        'Avg Win/Loss', f"{stats['payoff']:.2f}" if stats['payoff'] is not None else '—',
+        grafico=_grafico_barra_avg_win_loss(stats['media_ganho_reais'], stats['media_perda_reais'], tema),
+    )
+
+    profit_factor = stats['profit_factor']
+    card_profit_factor = _card_header_tradezella(
+        'Profit Factor', f"{profit_factor:.2f}" if profit_factor is not None else '—',
+        grafico=_grafico_gauge(min(profit_factor or 0, 3.0), 3.0, p['gold'], tema, casas=2),
+    )
+
+    streak = dt.sequencia_atual()
+    if streak['tipo'] is None:
+        streak_str, cor_streak = '—', None
+    else:
+        emoji = '🔥' if streak['tipo'] == 'win' else '❄'
+        cor_streak = C['green'] if streak['tipo'] == 'win' else C['red']
+        rotulo_trades = 'trade' if streak['trades'] == 1 else 'trades'
+        streak_str = f"{emoji} {streak['trades']} {rotulo_trades} ({streak['dias']} dia(s))"
+    card_streak = _card_header_tradezella('Current Streak', streak_str, cor_valor=cor_streak)
+
+    return html.Div([card_net_pnl, card_win_pct, card_avg_win_loss, card_profit_factor, card_streak],
+                     style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap', 'marginBottom': '14px'})
+
+
 def _card_estatistica(titulo: str, valor: str, cor=None) -> html.Div:
     return html.Div([
         html.Div(titulo, style={'fontSize': '10px', 'color': C['text2'], 'fontFamily': FONTS['display'],
@@ -2236,7 +2351,13 @@ def _grupo_cards_estatistica(titulo: str, cards: list) -> html.Div:
     ], style={'padding': '10px', 'border': f'1px dashed {C["border"]}', 'borderRadius': '10px'})
 
 
-def _cards_estatisticas(stats: dict) -> html.Div:
+def _cards_detalhe_estatisticas(stats: dict) -> html.Div:
+    """Grupos Quantidade/Taxas/Valores (nome antigo: `_cards_estatisticas`) —
+    demovidos pra bloco secundário "Detalhes" quando o header estilo
+    TradeZella (`_cards_header_tradezella`) entrou (item F, fase 2,
+    2026-07-30). Nenhum dado foi descartado: Wins/Losses/Breakeven/
+    Sequências/Max Gain-Loss/Drawdown/Ganho-Perda Total continuam aqui,
+    só não fazem mais parte do header principal."""
     payoff_str = f"{stats['payoff']:.2f}" if stats['payoff'] is not None else '—'
     grupo_quantidade = _grupo_cards_estatistica('Quantidade', [
         _card_estatistica('Operações', str(stats['num_operacoes'])),
@@ -2300,9 +2421,12 @@ def _estilo_toggle_bolinha(ativo: bool) -> dict:
     }
 
 
-def _cards_ou_vazio_estatisticas(stats: dict) -> html.Div:
+def _cards_ou_vazio_estatisticas(stats: dict, tema: str = 'light') -> html.Div:
     if stats['num_operacoes']:
-        return _cards_estatisticas(stats)
+        return html.Div([
+            _cards_header_tradezella(stats, tema),
+            _bloco_diario('Detalhes', _cards_detalhe_estatisticas(stats)),
+        ])
     return html.Div('Nenhum trade real neste período.', style={
         'padding': '16px', 'textAlign': 'center', 'color': C['text2'], 'fontSize': '12px',
     })
@@ -4183,7 +4307,7 @@ def atualizar_periodo_estatisticas(mes_atual, modo_ano, tema_atual):
         stats = dt.calcular_estatisticas(ano=ano, mes=mes)
         grade = _grade_calendario(stats['por_dia'], ano, mes)
     return (
-        _cards_ou_vazio_estatisticas(stats),
+        _cards_ou_vazio_estatisticas(stats, tema_atual or 'light'),
         grade,
         _NOMES_MES[mes],
         str(ano),
