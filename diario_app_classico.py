@@ -2100,36 +2100,35 @@ def _grafico_radar_anticovardia(eixos: dict, tema: str) -> go.Figure:
     r_fechado = valores + [valores[0]]
     theta_fechado = categorias + [categorias[0]]
 
-    fig = go.Figure()
-    # `go.Scatterpolar` não suporta `fillgradient` nativo (só o Scatter
-    # cartesiano suporta — ver `_grafico_evolucao_saldo`), então o efeito
-    # de gradiente pedido (2026-07-31: "apenas aplique o gradiente")
-    # é simulado com N cópias do mesmo polígono encolhidas em direção ao
-    # centro, cada uma com opacidade baixa constante — a sobreposição das
-    # camadas cria um centro mais saturado que se dilui em direção à
-    # borda, visualmente equivalente a um gradiente radial. Só a camada
-    # externa (escala 1.0, os valores reais) tem contorno/hover; as
-    # internas são só preenchimento decorativo.
-    n_camadas = 8
-    for i in range(n_camadas, 0, -1):
-        escala = i / n_camadas
-        externa = i == n_camadas
-        fig.add_trace(go.Scatterpolar(
-            r=[v * escala for v in r_fechado], theta=theta_fechado,
-            fill='toself', fillcolor=_hex_para_rgba(p['gold'], 0.10),
-            line=dict(width=2 if externa else 0, color=p['gold']),
-            showlegend=False, hoverinfo='r+theta' if externa else 'skip',
-        ))
+    # A 1ª tentativa de "gradiente" (N cópias do mesmo polígono encolhidas
+    # em direção ao centro) foi um erro: como os 6 eixos quase nunca têm o
+    # MESMO valor, cada cópia é uma versão IRREGULAR do polígono, e cópias
+    # concêntricas de um polígono irregular não formam faixas suaves — as
+    # arestas de cada camada cruzam as das outras, criando o efeito
+    # "estrela"/crivo de linhas visto no comparativo direto com o
+    # TradeZella real (2026-07-31: "não é fluido e clean... cheio de
+    # pontos"). O TradeZella usa preenchimento SÓLIDO de tom único, sem
+    # gradiente de verdade — Scatterpolar também não suporta `fillgradient`
+    # nativo (só o Scatter cartesiano, ver `_grafico_evolucao_saldo`), então
+    # replicar o "clean" real é exatamente isto: uma única camada.
+    fig = go.Figure(go.Scatterpolar(
+        r=r_fechado, theta=theta_fechado, fill='toself',
+        fillcolor=_hex_para_rgba(p['gold'], 0.35), line=dict(color=p['gold'], width=2),
+        showlegend=False,
+    ))
     fig.update_layout(
         # Mesmo cuidado de `_radar_roda_vida`: `autorange=False` + `tickvals`
         # explícitos, senão o Plotly quebra a escala com variância baixa.
-        # `gridshape='linear'` (2026-07-31, feedback: "deixe o gráfico
-        # quadrado/hexagonal ao invés de redondo") troca o grid circular
-        # padrão por um polígono reto nos mesmos 6 eixos.
+        # `gridshape='linear'` (feedback: "deixe o gráfico quadrado/
+        # hexagonal ao invés de redondo") troca o grid circular padrão por
+        # um polígono reto nos mesmos 6 eixos. `showticklabels=False`
+        # (2026-07-31, "não tem números no meio" no real) esconde os
+        # números 0/20/40/.../100 que poluíam o centro do gráfico — o grid
+        # em si continua visível, só o rótulo numérico some.
         polar=dict(bgcolor='rgba(0,0,0,0)', gridshape='linear',
                    radialaxis=dict(visible=True, range=[0, 100], autorange=False,
-                                    tickvals=[0, 20, 40, 60, 80, 100],
-                                    tickfont=dict(size=8, color=p['text2']), gridcolor=p['border']),
+                                    tickvals=[0, 20, 40, 60, 80, 100], showticklabels=False,
+                                    gridcolor=p['border']),
                    angularaxis=dict(tickfont=dict(size=9, color=p['text']), gridcolor=p['border'])),
         paper_bgcolor='rgba(0,0,0,0)', showlegend=False, margin=dict(l=30, r=30, t=20, b=20),
         height=280, autosize=True,
