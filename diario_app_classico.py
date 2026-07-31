@@ -2062,30 +2062,33 @@ def _card_expectativa_destaque(serie_expectativa: list, tema: str) -> dmc.Paper:
     atual, melhor, pior = validos[-1], max(validos), min(validos)
     cor_atual = 'green' if atual > 0 else ('red' if atual < 0 else None)
 
-    cabecalho = dmc.Group([
+    # TUDO numa linha só (2026-07-31, feedback com screenshot anotado:
+    # "coloque na mesma linha... veja o espaço vazio no meio") — a 1ª
+    # versão separava título+número+seta (linha 1, `justify=
+    # 'space-between'` só com ELE e o gráfico) de Melhor/Pior/Atual
+    # (linha 2 embaixo), deixando um vão enorme no meio da linha 1 (só 2
+    # filhos esticados pras pontas). Um único `dmc.Group` com todos os 5
+    # itens se distribui e preenche a largura toda sem sobra.
+    linha = dmc.Group([
         html.Div([
             dmc.Text('Expectativa Matemática', size='sm', c='dimmed'),
             dmc.Text(f"R$ {atual:+.2f}", size='xl', fw=700,
                       **({'c': cor_atual} if cor_atual else {})),
             dmc.Text(texto_variacao, size='xs', fw=600, c=cor_seta, mt=2),
         ]),
-        dcc.Graph(figure=_grafico_sparkline(serie_expectativa, tema, direcao),
-                  config={'displayModeBar': False}, style={'width': '84px', 'height': '60px'})
-        if len(validos) >= 2 else None,
-    ], justify='space-between', wrap='nowrap')
-
-    detalhe = dmc.Group([
         _mini_stat_expectativa('Melhor Desempenho', melhor, tema),
         _mini_stat_expectativa('Pior Desempenho', pior, tema),
         _mini_stat_expectativa('Atual', atual, tema),
-    ], justify='space-around', mt='md', wrap='wrap')
+        dcc.Graph(figure=_grafico_sparkline(serie_expectativa, tema, direcao),
+                  config={'displayModeBar': False}, style={'width': '84px', 'height': '60px'})
+        if len(validos) >= 2 else None,
+    ], justify='space-between', wrap='wrap', align='center')
 
     feedback = _bloco_o_que_fazer(
         'Melhor/pior valor já alcançado pela expectativa matemática acumulada, e onde ela está agora.',
         dt.feedback_expectativa(serie_expectativa))
 
-    return dmc.Paper([cabecalho, detalhe, feedback], radius='md', p='lg', withBorder=True,
-                      style={'width': '100%'})
+    return dmc.Paper([linha, feedback], radius='md', p='lg', withBorder=True, style={'width': '100%'})
 
 
 def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
