@@ -1994,17 +1994,16 @@ def _grafico_sparkline(valores: list, tema: str, direcao: str) -> go.Figure:
 
 
 def _card_com_sparkline(titulo: str, valor_str: str, valores_serie: list, tema: str,
-                          cor_valor=None, destaque: bool = False) -> dmc.Card:
+                          cor_valor=None) -> dmc.Card:
     """Card com mini-gráfico (sparkline) + variação % com seta, estilo
     "grade de cotações" (2026-07-31, pedido: "esse mini gráfico, e a
     setinha indicando a % de aumento ou de queda... adicione isso em
     alguns blocos"). `valores_serie`: pontos recentes da métrica (pode ter
     `None` nos primeiros dias, ex: Payoff antes do 1º trade perdedor) —
-    variação calculada só sobre os pontos válidos.
-
-    `destaque=True` (pedido: "quero dar mais destaque para a expectativa")
-    aumenta fonte/padding e usa `w='100%'` em vez de dividir espaço com
-    vizinhos — usado só pelo card de Expectativa."""
+    variação calculada só sobre os pontos válidos. Usado por Payoff/Fator
+    de Recuperação — o card de Expectativa tem layout próprio, ver
+    `_card_expectativa_destaque` (esta versão com `justify='space-between'`
+    e só 2 filhos deixava um vão enorme quando esticada pra `w='100%'`)."""
     pct, direcao = _variacao_percentual(valores_serie)
     cor_seta = 'green' if direcao == 'up' else ('red' if direcao == 'down' else 'gray')
     seta = '▲' if direcao == 'up' else ('▼' if direcao == 'down' else '—')
@@ -2012,24 +2011,81 @@ def _card_com_sparkline(titulo: str, valor_str: str, valores_serie: list, tema: 
     tem_grafico = len([v for v in valores_serie if v is not None]) >= 2
 
     texto = html.Div([
-        dmc.Text(titulo, size='xs' if not destaque else 'sm', c='dimmed'),
-        dmc.Text(valor_str, size='md' if not destaque else 'xl', fw=700,
-                  **({'c': cor_valor} if cor_valor else {})),
+        dmc.Text(titulo, size='xs', c='dimmed'),
+        dmc.Text(valor_str, size='md', fw=700, **({'c': cor_valor} if cor_valor else {})),
         dmc.Text(texto_variacao, size='xs', fw=600, c=cor_seta, mt=2),
     ])
     if tem_grafico:
-        altura = 44 if not destaque else 60
         grafico = dcc.Graph(
             figure=_grafico_sparkline(valores_serie, tema, direcao),
-            config={'displayModeBar': False},
-            style={'width': f'{altura + 20}px', 'height': f'{altura}px'},
+            config={'displayModeBar': False}, style={'width': '64px', 'height': '44px'},
         )
         conteudo = dmc.Group([grafico, texto], gap='sm', wrap='nowrap', justify='space-between')
     else:
         conteudo = texto
-    return dmc.Paper(conteudo, radius='md', p='sm', withBorder=True,
-                      style={'minWidth': '190px' if destaque else '160px', 'flex': '1',
-                             **({'width': '100%'} if destaque else {})})
+    return dmc.Paper(conteudo, radius='md', p='sm', withBorder=True, style={'minWidth': '160px', 'flex': '1'})
+
+
+def _mini_stat_expectativa(titulo: str, valor: float, tema: str) -> html.Div:
+    """Um dos 3 sub-indicadores (Melhor/Pior/Atual) do card de destaque da
+    Expectativa Matemática — ver `_card_expectativa_destaque`."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    cor = p['green'] if valor > 0 else (p['red'] if valor < 0 else p['text2'])
+    return html.Div([
+        dmc.Text(titulo, size='xs', c='dimmed'),
+        dmc.Text(f"R$ {valor:+.2f}", size='md', fw=700, style={'color': cor}),
+    ])
+
+
+def _card_expectativa_destaque(serie_expectativa: list, tema: str) -> dmc.Paper:
+    """Card de destaque da Expectativa Matemática (2026-07-31, pedido:
+    "ficou um espaço muito grande entre o mini gráfico e os dados...
+    Expectativa Matemática - Melhor Desempenho / Pior Desempenho e Atual.
+    Se ainda sobrar espaço vazio, coloque um breve feedback") — o
+    `_card_com_sparkline` genérico usava `justify='space-between'` com só
+    2 filhos (gráfico + texto), o que numa largura de 100% deixava um vão
+    enorme no meio (visível no screenshot). Aqui o espaço é preenchido com
+    conteúdo de verdade: Melhor/Pior/Atual lado a lado (mesmo padrão de
+    Vencedora/Perdedora já usado em "Análise de Estratégia"), e um
+    feedback dinâmico (`dt.feedback_expectativa`) embaixo se ainda sobrar
+    espaço."""
+    validos = [v for v in serie_expectativa if v is not None]
+    pct, direcao = _variacao_percentual(serie_expectativa)
+    cor_seta = 'green' if direcao == 'up' else ('red' if direcao == 'down' else 'gray')
+    seta = '▲' if direcao == 'up' else ('▼' if direcao == 'down' else '—')
+    texto_variacao = f"{seta} {abs(pct):.1f}%" if pct is not None else seta
+
+    if not validos:
+        return dmc.Paper('Sem trades reais suficientes pra calcular a Expectativa ainda.',
+                          radius='md', p='lg', withBorder=True, style={'width': '100%', 'fontSize': '12px'})
+
+    atual, melhor, pior = validos[-1], max(validos), min(validos)
+    cor_atual = 'green' if atual > 0 else ('red' if atual < 0 else None)
+
+    cabecalho = dmc.Group([
+        html.Div([
+            dmc.Text('Expectativa Matemática', size='sm', c='dimmed'),
+            dmc.Text(f"R$ {atual:+.2f}", size='xl', fw=700,
+                      **({'c': cor_atual} if cor_atual else {})),
+            dmc.Text(texto_variacao, size='xs', fw=600, c=cor_seta, mt=2),
+        ]),
+        dcc.Graph(figure=_grafico_sparkline(serie_expectativa, tema, direcao),
+                  config={'displayModeBar': False}, style={'width': '84px', 'height': '60px'})
+        if len(validos) >= 2 else None,
+    ], justify='space-between', wrap='nowrap')
+
+    detalhe = dmc.Group([
+        _mini_stat_expectativa('Melhor Desempenho', melhor, tema),
+        _mini_stat_expectativa('Pior Desempenho', pior, tema),
+        _mini_stat_expectativa('Atual', atual, tema),
+    ], justify='space-around', mt='md', wrap='wrap')
+
+    feedback = _bloco_o_que_fazer(
+        'Melhor/pior valor já alcançado pela expectativa matemática acumulada, e onde ela está agora.',
+        dt.feedback_expectativa(serie_expectativa))
+
+    return dmc.Paper([cabecalho, detalhe, feedback], radius='md', p='lg', withBorder=True,
+                      style={'width': '100%'})
 
 
 def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
@@ -2977,10 +3033,7 @@ def _cards_detalhe_estatisticas(stats: dict, tema: str = 'light',
         _card_estatistica('Drawdown Máx.', f"R$ {stats['drawdown_maximo_reais']:+.2f}",
                            cor=C['red'] if stats['drawdown_maximo_reais'] < 0 else None),
     ], crescer=True)
-    card_expectativa = _card_com_sparkline(
-        'Expectativa Matemática', f"R$ {stats['expectativa']:+.2f}", evolucao['expectativa'], tema,
-        cor_valor=('green' if stats['expectativa'] > 0 else ('red' if stats['expectativa'] < 0 else None)),
-        destaque=True)
+    card_expectativa = _card_expectativa_destaque(evolucao['expectativa'], tema)
     return html.Div([
         card_expectativa,
         html.Div([grupo_quantidade, grupo_taxas],

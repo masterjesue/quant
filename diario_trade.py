@@ -1169,6 +1169,32 @@ def evolucao_metricas_expandida(df: pd.DataFrame | None = None,
     return {"datas": datas, "payoff": payoff, "fator_recuperacao": fator_recuperacao, "expectativa": expectativa}
 
 
+def feedback_expectativa(valores: list) -> dict:
+    """Veredito DINÂMICO pro card Expectativa Matemática (2026-07-31,
+    pedido: "se ainda sobrar espaço vazio, coloque um breve feedback") —
+    compara o valor ATUAL contra o melhor/pior nível já alcançado na
+    série expansiva (mesmo espírito de `feedback_duracao_performance`,
+    nunca texto fixo)."""
+    validos = [v for v in valores if v is not None]
+    if len(validos) < 2:
+        return {"tem_dado": False, "mensagem": "Amostra insuficiente ainda."}
+    atual, melhor, pior = validos[-1], max(validos), min(validos)
+    if atual >= melhor - 1e-9:
+        acao = f"Expectativa no MELHOR nível já registrado (R$ {atual:+.2f}/trade) — o que está funcionando agora."
+        cor = "green"
+    elif atual <= pior + 1e-9:
+        acao = (f"Expectativa no PIOR nível já registrado (R$ {atual:+.2f}/trade, contra R$ {melhor:+.2f} no "
+                f"melhor momento) — reavalie setup e gestão antes de continuar operando.")
+        cor = "red"
+    elif atual > 0:
+        acao = f"Expectativa positiva (R$ {atual:+.2f}/trade) — ainda distante do melhor nível (R$ {melhor:+.2f})."
+        cor = "green"
+    else:
+        acao = f"Expectativa negativa (R$ {atual:+.2f}/trade) — nem no pior nível (R$ {pior:+.2f}), mas exige atenção."
+        cor = "yellow"
+    return {"tem_dado": True, "atual": atual, "melhor": melhor, "pior": pior, "acao_texto": acao, "cor_acao": cor}
+
+
 def feedback_duracao_performance(linhas: list[dict]) -> dict:
     """Veredito DINÂMICO pro card Desempenho por Duração da Operação (item
     F) — compara duração média dos trades vencedores x perdedores (mesmo
