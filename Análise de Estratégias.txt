@@ -1,0 +1,18 @@
+Análise de Estratégias. 
+[BLOCO CONFIABILIDADE POR ESTRATÉGIA]
+- Adicionar classificação (crescente \ decrescente) por coluna (setinha do lado, como no excel). 
+- Adicionar Categoria da Estratégia, são três: Tendência, Reversão e Lateralidade. Essa é uma característica editável no cadastro da estratégia, crie isso. Já classifique as categorias que você identificar pela própria característica da estratégia (definição padrão do conceito em si, nos livros e etc...). Você terá que fazer alguns ajustes, por exemplo, a estratégia Topo \ Fundo Duplo se tornarão duas estratégias diferentes (Topo Duplo na venda, Fundo Duplo na compra).
+
+[Estatísticas das Estratégias]
+No detalhamento da estratégia ao clicar na seta, melhore a visualização, faça em formato de blocos como se fosse um mini dashboard.
+Crie um bloco acima de "CONFIABILIDADE POR ESTRATÉGIA" chamado "ANÁLISE DE ESTRATÉGIA". Junte os blocos "POR ATIVO", "POR JANELA", "POR SALA / ANÁLISE" e "POR TAGS SETUP / ERRO" coloque tudo em um painel de dashboard estatístico adicionando as estatísticas gerais das estratégia (Melhor estratégia por horário, melhor estratégia por direção, melhor estratégia por ativo, melhor estratégia por categoria). Estratégia Vencedora (coloque em destaque de forma ilustrativa - por exemplo, um troféu ou medalha). Também destaque a Estratégia Perdedora.
+
+Outras Estratégias:
+Aqui temos dois casos diferentes que preciso que me ajude a classificar. O trades em "Outros" desse mês estão sem registro no diário porque o sistema não estava operacional no momento. Esses trades não foram testes de novas estratégias, erros operacionais ou simplesmente trades sem estratégias. Eles foram trades dentro do meu operacional mais usado (Suporte \ Resistência \ Pivot) com a análise do Professor Igor, mas não houve registro dos detalhes e não me lembro desses detalhes para classificar.
+Já os trades "Outros" dos meses anteriores entram na categoria de teste de nova estratégia ou erro operacional.
+Quero que rode uma análise para buscar identificar pistas que indicam trade "errado" ou fora do operacional (por exemplo alvos e stops muito longos ou muito curtos sem justificativa técnica, trades muito curtos, trades rápidos em sequência - provavelmente sem análise ou em estado emocional alterado) Os trades do primeiro e segundo mês principalmente, são da fase a aprendizado - é importante identificar isso para analisar  a minha evolução operacional e estratégica. Eu imagino que a divisão seja algo assim: Sem Estratégia (Erro e Aprendizagem); Não Classificado (devido à algum desafio operacional, pessoal ou técnico); Outras Estratégias (Teste de novas formas de operar - intencional e dentro do gerenciamento de risco).
+
+Depois de tudo ajustado, organizado e bem definido, ainda dentro da Análise de Estratégias crie um bloco usando a API do Mentor de IA para fazer uma análise interpretativa do meu operacional, analisando curva de aprendizagem, evolução operacional \ estratégica e próximos passos. Para controle de tokens, esse feedback deve ser diário, uma vez ao dia analisando do dia anterior para trás.
+
+Faça uma análise de UX dessa seção de Estratégia, veja o que pode ser ilustrado com gráficos e recursos visuais que facilitem a interpretação das informações.
+

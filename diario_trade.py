@@ -170,8 +170,27 @@ CATEGORIA_ESTRATEGIA_OPCOES = ["tendencia", "reversao", "lateralidade"]
 ROTULO_CATEGORIA_ESTRATEGIA = {
     "tendencia": "Tendência", "reversao": "Reversão", "lateralidade": "Lateralidade",
 }
-COLUNAS_RR_PRESETS = ["id", "nome", "alvo_pontos", "stop_pontos", "breakeven_pontos", "ativo", "criado_em"]
 COLUNAS_TAGS_SETUP_ERRO = ["id", "slug", "nome", "tipo", "ativo", "criado_em"]
+
+# Checklist Pré-Trade (Playbook, 2026-08-02) — cadastro geral de itens de
+# checklist, NÃO ligado a estratégia (é o ritual diário de pré-mercado,
+# igual pra qualquer setup). `padrao=True` marca qual checklist o guarda-
+# corpo de Posição usa quando não há escolha explícita — só 1 por vez.
+COLUNAS_CHECKLIST_PRETRADE = ["id", "slug", "nome", "itens", "padrao", "ativo", "criado_em"]
+
+# Gerenciamento de Risco (Playbook, 2026-08-02; corrigido 2026-08-03) —
+# cadastro SEPARADO e reutilizável (substitui os antigos R:R Presets).
+# Correção do Jesué: NÃO é vinculado à Estratégia — é definido PRIMEIRO por
+# ATIVO (WIN/WDO têm parâmetros de pontuação/volatilidade diferentes).
+# `ativo_mercado` guarda o instrumento ("WIN"/"WDO" — nome deliberadamente
+# diferente da coluna `ativo` de ativo/inativo do cadastro, que todo outro
+# registro deste arquivo usa pro mesmo propósito). `padrao` é escopado POR
+# `ativo_mercado` (WIN tem seu próprio padrão, WDO o seu — ver
+# `definir_gerenciamento_risco_padrao`), não um padrão global único.
+COLUNAS_GERENCIAMENTO_RISCO = [
+    "id", "slug", "nome", "ativo_mercado", "alvo_pontos", "stop_pontos", "breakeven_pontos",
+    "regra_saida", "regra_conduta", "justificativa", "padrao", "ativo", "criado_em",
+]
 
 
 def _slugificar(nome: str) -> str:
@@ -251,68 +270,238 @@ def desativar_estrategia(id_estrategia: int) -> bool:
     return editar_estrategia(id_estrategia, ativo=False)
 
 
-def listar_rr_presets(somente_ativos: bool = True) -> pd.DataFrame:
-    df = persistencia.carregar_rr_presets()
+def listar_checklists_pretrade(somente_ativos: bool = True) -> pd.DataFrame:
+    """Semeia a partir de `cfg.DIARIO_CHECKLIST_PRE_TRADE` na 1ª chamada
+    (tabela ainda não existe em disco) — mesmo idioma de `listar_estrategias`."""
+    df = persistencia.carregar_checklist_pretrade()
     if df is None:
-        df = pd.DataFrame(columns=COLUNAS_RR_PRESETS)
-        persistencia.salvar_rr_presets(df)
-    df = df.reindex(columns=COLUNAS_RR_PRESETS)
+        df = pd.DataFrame([{
+            "id": 1, "slug": "padrao", "nome": "Checklist Padrão",
+            "itens": list(cfg.DIARIO_CHECKLIST_PRE_TRADE),
+            "padrao": True, "ativo": True, "criado_em": datetime.now(),
+        }], columns=COLUNAS_CHECKLIST_PRETRADE)
+        persistencia.salvar_checklist_pretrade(df)
+    df = df.reindex(columns=COLUNAS_CHECKLIST_PRETRADE)
     if somente_ativos:
         df = df[df["ativo"].astype(bool)]
     return df.sort_values("nome").reset_index(drop=True)
 
 
-def obter_rr_preset(id_preset) -> dict | None:
-    """Aceita id (int/float) — usado pelo callback que auto-preenche
-    Alvo/Stop a partir do valor selecionado no dropdown de R:R."""
-    if id_preset is None:
+def obter_checklist_pretrade(id_checklist=None) -> dict | None:
+    """Sem `id_checklist`, retorna o checklist `padrao=True` (ou o primeiro
+    ativo, se nenhum estiver marcado como padrão)."""
+    df = listar_checklists_pretrade(somente_ativos=True)
+    if df.empty:
         return None
-    df = persistencia.carregar_rr_presets()
+    if id_checklist is not None:
+        try:
+            linhas = df[df["id"] == int(id_checklist)]
+        except (TypeError, ValueError):
+            return None
+        return linhas.iloc[0].to_dict() if not linhas.empty else None
+    padrao = df[df["padrao"].astype(bool)]
+    return (padrao if not padrao.empty else df).iloc[0].to_dict()
+
+
+def criar_checklist_pretrade(nome: str, itens: list[str] | None = None, padrao: bool = False) -> int | None:
+    with persistencia.lock_estrategias() as adquirida:
+        if not adquirida:
+            return None
+        df = persistencia.carregar_checklist_pretrade()
+        if df is None:
+            df = pd.DataFrame(columns=COLUNAS_CHECKLIST_PRETRADE)
+        eh_primeiro = df.empty
+        if padrao or eh_primeiro:
+            df["padrao"] = False
+        nova = {
+            "id": _proximo_id(df), "slug": _slugificar(nome), "nome": nome.strip(),
+            "itens": list(itens or []), "padrao": bool(padrao or eh_primeiro),
+            "ativo": True, "criado_em": datetime.now(),
+        }
+        df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
+        persistencia.salvar_checklist_pretrade(df.reindex(columns=COLUNAS_CHECKLIST_PRETRADE))
+        return nova["id"]
+
+
+def editar_checklist_pretrade(id_checklist: int, **campos) -> bool:
+    with persistencia.lock_estrategias() as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_checklist_pretrade()
+        if df is None or id_checklist not in set(df["id"]):
+            return False
+        idx = df.index[df["id"] == id_checklist][0]
+        for chave, valor in campos.items():
+            if chave in COLUNAS_CHECKLIST_PRETRADE:
+                df.at[idx, chave] = valor
+        persistencia.salvar_checklist_pretrade(df)
+        return True
+
+
+def definir_checklist_pretrade_padrao(id_checklist: int) -> bool:
+    """Zera `padrao` em todas as linhas, marca True só em `id_checklist` —
+    só 1 checklist padrão por vez."""
+    with persistencia.lock_estrategias() as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_checklist_pretrade()
+        if df is None or id_checklist not in set(df["id"]):
+            return False
+        df["padrao"] = df["id"] == id_checklist
+        persistencia.salvar_checklist_pretrade(df)
+        return True
+
+
+def desativar_checklist_pretrade(id_checklist: int) -> bool:
+    return editar_checklist_pretrade(id_checklist, ativo=False)
+
+
+def listar_gerenciamentos_risco(somente_ativos: bool = True, ativo_mercado: str | None = None) -> pd.DataFrame:
+    """`ativo_mercado` ('WIN'/'WDO') filtra pra só as linhas daquele
+    instrumento — usado pelo seletor no trade, que mostra primeiro as
+    opções do ativo corrente."""
+    df = persistencia.carregar_gerenciamento_risco()
+    if df is None:
+        df = pd.DataFrame(columns=COLUNAS_GERENCIAMENTO_RISCO)
+        persistencia.salvar_gerenciamento_risco(df)
+    df = df.reindex(columns=COLUNAS_GERENCIAMENTO_RISCO)
+    if somente_ativos:
+        df = df[df["ativo"].astype(bool)]
+    if ativo_mercado is not None:
+        df = df[df["ativo_mercado"] == ativo_mercado]
+    return df.sort_values("nome").reset_index(drop=True)
+
+
+def obter_gerenciamento_risco(id_gerenciamento) -> dict | None:
+    """Aceita id (int/float/string numérica); `None` se `id_gerenciamento`
+    for `None` ou não existir."""
+    if id_gerenciamento is None or (isinstance(id_gerenciamento, float) and math.isnan(id_gerenciamento)):
+        return None
+    df = persistencia.carregar_gerenciamento_risco()
     if df is None or df.empty:
         return None
     try:
-        linhas = df[df["id"] == int(id_preset)]
+        linhas = df[df["id"] == int(id_gerenciamento)]
     except (TypeError, ValueError):
         return None
     return linhas.iloc[0].to_dict() if not linhas.empty else None
 
 
-def criar_rr_preset(nome: str, alvo_pontos: float, stop_pontos: float,
-                     breakeven_pontos: float | None = None) -> int | None:
+def obter_gerenciamento_risco_padrao(ativo_mercado: str | None) -> dict | None:
+    """O gerenciamento `padrao=True` PARA AQUELE ATIVO (WIN e WDO têm cada
+    um o seu próprio padrão — nunca um padrão global único, já que os
+    parâmetros de pontuação/volatilidade diferem entre os dois). Cai pro
+    primeiro ativo daquele instrumento se nenhum estiver marcado padrão;
+    `None` se não houver nenhum gerenciamento cadastrado pra esse ativo."""
+    if not ativo_mercado:
+        return None
+    df = listar_gerenciamentos_risco(somente_ativos=True, ativo_mercado=ativo_mercado)
+    if df.empty:
+        return None
+    padrao = df[df["padrao"].astype(bool)]
+    return (padrao if not padrao.empty else df).iloc[0].to_dict()
+
+
+def criar_gerenciamento_risco(nome: str, ativo_mercado: str, alvo_pontos: float, stop_pontos: float,
+                               breakeven_pontos: float | None = None, regra_saida: str = "",
+                               regra_conduta: str = "", justificativa: str = "",
+                               padrao: bool = False) -> int | None:
     with persistencia.lock_estrategias() as adquirida:
         if not adquirida:
             return None
-        df = persistencia.carregar_rr_presets()
+        df = persistencia.carregar_gerenciamento_risco()
         if df is None:
-            df = pd.DataFrame(columns=COLUNAS_RR_PRESETS)
+            df = pd.DataFrame(columns=COLUNAS_GERENCIAMENTO_RISCO)
+        eh_primeiro_do_ativo = df.empty or not (df["ativo_mercado"] == ativo_mercado).any()
+        vira_padrao = bool(padrao or eh_primeiro_do_ativo)
+        if vira_padrao and not df.empty:
+            # Zera `padrao` só nas linhas do MESMO ativo_mercado — WIN e WDO
+            # têm padrões independentes.
+            df.loc[df["ativo_mercado"] == ativo_mercado, "padrao"] = False
         nova = {
-            "id": _proximo_id(df), "nome": nome.strip(),
+            "id": _proximo_id(df), "slug": _slugificar(nome), "nome": nome.strip(),
+            "ativo_mercado": ativo_mercado,
             "alvo_pontos": float(alvo_pontos), "stop_pontos": float(stop_pontos),
             "breakeven_pontos": float(breakeven_pontos) if breakeven_pontos not in (None, "") else None,
+            "regra_saida": regra_saida or "", "regra_conduta": regra_conduta or "",
+            "justificativa": justificativa or "", "padrao": vira_padrao,
             "ativo": True, "criado_em": datetime.now(),
         }
         df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
-        persistencia.salvar_rr_presets(df.reindex(columns=COLUNAS_RR_PRESETS))
+        persistencia.salvar_gerenciamento_risco(df.reindex(columns=COLUNAS_GERENCIAMENTO_RISCO))
         return nova["id"]
 
 
-def editar_rr_preset(id_preset: int, **campos) -> bool:
+def editar_gerenciamento_risco(id_gerenciamento: int, **campos) -> bool:
     with persistencia.lock_estrategias() as adquirida:
         if not adquirida:
             return False
-        df = persistencia.carregar_rr_presets()
-        if df is None or id_preset not in set(df["id"]):
+        df = persistencia.carregar_gerenciamento_risco()
+        if df is None or id_gerenciamento not in set(df["id"]):
             return False
-        idx = df.index[df["id"] == id_preset][0]
+        idx = df.index[df["id"] == id_gerenciamento][0]
         for chave, valor in campos.items():
-            if chave in COLUNAS_RR_PRESETS:
+            if chave in COLUNAS_GERENCIAMENTO_RISCO:
                 df.at[idx, chave] = valor
-        persistencia.salvar_rr_presets(df)
+        persistencia.salvar_gerenciamento_risco(df)
         return True
 
 
-def desativar_rr_preset(id_preset: int) -> bool:
-    return editar_rr_preset(id_preset, ativo=False)
+def definir_gerenciamento_risco_padrao(id_gerenciamento: int) -> bool:
+    """Zera `padrao` nas outras linhas do MESMO `ativo_mercado` (não em
+    todas — WIN e WDO têm padrões independentes), marca True só em
+    `id_gerenciamento`."""
+    with persistencia.lock_estrategias() as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_gerenciamento_risco()
+        if df is None or id_gerenciamento not in set(df["id"]):
+            return False
+        ativo_mercado = df.loc[df["id"] == id_gerenciamento, "ativo_mercado"].iloc[0]
+        df.loc[df["ativo_mercado"] == ativo_mercado, "padrao"] = False
+        df.loc[df["id"] == id_gerenciamento, "padrao"] = True
+        persistencia.salvar_gerenciamento_risco(df)
+        return True
+
+
+def desativar_gerenciamento_risco(id_gerenciamento: int) -> bool:
+    return editar_gerenciamento_risco(id_gerenciamento, ativo=False)
+
+
+def resolver_estrategia_unica(estrategia_tags: list[str] | None) -> dict | None:
+    """Retorna a linha de `listar_estrategias()` cujo slug bate, SÓ quando
+    exatamente 1 estratégia estiver selecionada — 0 ou 2+ não permitem
+    resolver de forma inequívoca qual checklist/gerenciamento de risco
+    mostrar (não adivinha)."""
+    if not estrategia_tags or len(estrategia_tags) != 1:
+        return None
+    df = listar_estrategias(somente_ativas=False)
+    linhas = df[df["slug"] == estrategia_tags[0]]
+    return linhas.iloc[0].to_dict() if not linhas.empty else None
+
+
+def avaliar_risco_seguido(alvo_pontos, stop_pontos, gerenciamento: dict | None,
+                           tolerancia_pct: float = cfg.PLAYBOOK_TOLERANCIA_RISCO_PCT) -> bool | None:
+    """`gerenciamento` já deve vir RESOLVIDO (ver `resolver_risco_da_
+    estrategia`) — `None` se a estratégia não tiver gerenciamento vinculado
+    (não fabrica dado). Senão, True se Alvo E Stop do trade estão dentro de
+    `tolerancia_pct` do alvo_pontos/stop_pontos cadastrados no perfil."""
+    if not gerenciamento:
+        return None
+    risco_alvo = gerenciamento.get("alvo_pontos")
+    risco_stop = gerenciamento.get("stop_pontos")
+    if risco_alvo in (None, 0) or risco_stop in (None, 0):
+        return None
+    if alvo_pontos is None or stop_pontos is None:
+        return None
+    try:
+        alvo_pontos, stop_pontos = float(alvo_pontos), float(stop_pontos)
+        risco_alvo, risco_stop = float(risco_alvo), float(risco_stop)
+    except (TypeError, ValueError):
+        return None
+    dentro_alvo = abs(alvo_pontos - risco_alvo) / risco_alvo <= tolerancia_pct
+    dentro_stop = abs(stop_pontos - risco_stop) / risco_stop <= tolerancia_pct
+    return bool(dentro_alvo and dentro_stop)
 
 
 def listar_tags_setup_erro(somente_ativas: bool = True) -> pd.DataFrame:
@@ -449,7 +638,12 @@ def desativar_tag_emocional(id_tag: int) -> bool:
 
 COLUNAS_CHECKIN_DIARIO = [
     "data", "sono_qualidade", "sono_hora_dormir", "sono_hora_acordar",
-    "sono_duracao_horas", "cafe_qualidade", "autocuidado_minutos",
+    "sono_duracao_horas", "cafe_qualidade",
+    # Água/Exercício Físico/Alimentação (2026-08-03, pedido do Jesué) —
+    # mesma escala 1-5 de sono/café, só com ícone próprio na UI em vez de
+    # estrela (ver `_icone_rating` em diario_app_classico.py).
+    "agua_qualidade", "exercicio_qualidade", "alimentacao_qualidade",
+    "autocuidado_minutos",
     "meditacao_minutos", "gratidao_1", "gratidao_2", "gratidao_3",
     "gratidao_4", "gratidao_5", "observacoes",
 ]
@@ -465,6 +659,44 @@ def obter_checkin_dia(data) -> dict | None:
         return None
     linhas = df[df["data"] == data]
     return linhas.iloc[0].to_dict() if not linhas.empty else None
+
+
+COLUNAS_CHECKLIST_PRETRADE_DIA = ["data", "id_checklist", "marcados", "total", "criado_em"]
+
+
+def obter_checklist_pretrade_dia(data) -> dict | None:
+    """O 'foi feito hoje?' do guarda-corpo — ritual diário, igual ao
+    check-in emocional (não é por-trade). `None` se ainda não preenchido
+    nesse dia."""
+    if isinstance(data, str):
+        data = date.fromisoformat(data)
+    df = persistencia.carregar_checklist_pretrade_dia()
+    if df is None or df.empty:
+        return None
+    linhas = df[df["data"] == data]
+    return linhas.iloc[0].to_dict() if not linhas.empty else None
+
+
+def salvar_checklist_pretrade_dia(data, id_checklist: int, marcados: list[int], total: int) -> bool:
+    """Upsert por data — mesmo idioma de `salvar_checkin_dia`, nunca duplica
+    linha do mesmo dia."""
+    if isinstance(data, str):
+        data = date.fromisoformat(data)
+    with persistencia.lock_checklist_pretrade_dia() as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_checklist_pretrade_dia()
+        if df is None:
+            df = pd.DataFrame(columns=COLUNAS_CHECKLIST_PRETRADE_DIA)
+        df = df[df["data"] != data]
+        nova = {
+            "data": data, "id_checklist": int(id_checklist),
+            "marcados": list(marcados or []), "total": int(total),
+            "criado_em": datetime.now(),
+        }
+        df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
+        persistencia.salvar_checklist_pretrade_dia(df.reindex(columns=COLUNAS_CHECKLIST_PRETRADE_DIA))
+        return True
 
 
 def _calcular_duracao_sono(hora_dormir, hora_acordar) -> float | None:
@@ -522,8 +754,10 @@ def listar_checkins(data_ini=None, data_fim=None) -> pd.DataFrame:
 
 
 def calcular_medias_emocionais_dia(data) -> dict | None:
-    """Média das 5 notas emocionais (Confiança/Humor/Energia/Atenção/
-    Presença) dos trades do dia — entrada auxiliar de
+    """Média das notas emocionais (Confiança/Humor/Energia/Presença/
+    Equilíbrio/Disciplina — "Atenção" saiu da UI em 2026-08-03, mantida
+    aqui só pra trades antigos que ainda têm o campo preenchido continuarem
+    contribuindo) dos trades do dia — entrada auxiliar de
     `calcular_nivel_hawkins`. `None` se não houver trade nenhum trade
     naquele dia com nota emocional preenchida."""
     if isinstance(data, str):
@@ -532,7 +766,8 @@ def calcular_medias_emocionais_dia(data) -> dict | None:
     if df is None or df.empty:
         return None
     medias = {}
-    for campo in ("emo_confianca", "emo_humor", "emo_energia", "emo_atencao", "emo_presenca"):
+    for campo in ("emo_confianca", "emo_humor", "emo_energia", "emo_atencao", "emo_presenca",
+                  "emo_equilibrio", "emo_disciplina"):
         if campo in df.columns:
             serie = pd.to_numeric(df[campo], errors="coerce").dropna()
             if not serie.empty:
@@ -632,20 +867,22 @@ def calcular_nivel_hawkins(checkin: dict | None, medias_emocionais_dia: dict | N
     adaptação própria, a recalibrar com uso real (mesmo espírito dos
     outros scores do Diário: nunca apresentar como certeza/calibrado).
 
-    Composição: média simples dos campos 1-5 disponíveis (sono_qualidade e
-    cafe_qualidade do check-in, mais confianca/humor/energia/atencao/
-    presenca médios dos trades do dia quando existirem), normalizada pra
-    0-1; autocuidado/meditação entram só como pequeno bônus aditivo (não
-    como nota de peso igual às demais). Mapeamento contínuo pra escala log
-    de Hawkins via `valor = 20 * 50 ** composto` (composto=0 -> 20,
-    composto=1 -> 1000); nome do nível = mais próximo em `NIVEIS_HAWKINS`.
-    Retorna `None` se não houver check-in do dia — sem dado, sem gauge,
-    nunca um valor inventado.
+    Composição: média simples dos campos 1-5 disponíveis (sono_qualidade,
+    cafe_qualidade, agua_qualidade, exercicio_qualidade,
+    alimentacao_qualidade do check-in, mais confianca/humor/energia/
+    presenca/equilibrio/disciplina médios dos trades do dia quando
+    existirem), normalizada pra 0-1; autocuidado/meditação entram só como
+    pequeno bônus aditivo (não como nota de peso igual às demais).
+    Mapeamento contínuo pra escala log de Hawkins via `valor = 20 * 50 **
+    composto` (composto=0 -> 20, composto=1 -> 1000); nome do nível = mais
+    próximo em `NIVEIS_HAWKINS`. Retorna `None` se não houver check-in do
+    dia — sem dado, sem gauge, nunca um valor inventado.
     """
     if not checkin:
         return None
     notas = []
-    for campo in ("sono_qualidade", "cafe_qualidade"):
+    for campo in ("sono_qualidade", "cafe_qualidade", "agua_qualidade",
+                  "exercicio_qualidade", "alimentacao_qualidade"):
         v = checkin.get(campo)
         if v is not None and not (isinstance(v, float) and pd.isna(v)):
             notas.append(float(v))
@@ -696,9 +933,21 @@ COLUNAS_DIARIO = [
     # (mesmo padrão de vocabulário aberto de tags_setup_erro) e Sentimento
     # de Mercado (0-100, mesmas faixas do Fear & Greed Index).
     "emo_confianca", "emo_humor", "emo_energia", "emo_atencao", "emo_presenca",
+    # "Equilíbrio"/"Disciplina" (2026-08-03) — "Atenção" saiu da UI mas
+    # continua no schema (trades antigos ainda a têm preenchida).
+    "emo_equilibrio", "emo_disciplina",
     "tags_emocionais", "sentimento_mercado",
     "conta", "data_replay",
     "fonte_registro", "criado_em",
+    # PLAYBOOK — snapshot de aderência no momento do save (2026-08-02).
+    # Congelado, nunca uma referência viva ao cadastro (reordenar/editar um
+    # checklist depois não reescreve a história de um trade já lançado).
+    # checklist_pretrade_* vem do registro DIÁRIO (ritual único, antes de
+    # operar) — não é escolhido por trade. checklist_estrategia_* só é
+    # populado quando exatamente 1 estratégia foi selecionada no trade.
+    "checklist_estrategia_slug", "checklist_estrategia_marcados", "checklist_estrategia_total",
+    "checklist_pretrade_marcados_dia", "checklist_pretrade_total_dia",
+    "risco_gerenciamento_seguido", "coaching_checkin_feito",
 ]
 
 # Tabela separada da principal (não colunas extras em COLUNAS_DIARIO) —
@@ -825,6 +1074,7 @@ CAMPOS_EDITAVEIS_TRADE = (
     "nivel_sr_referencia", "nivel_sr_tipo", "nivel_sr_forte",
     "tags_setup_erro", "tags_emocionais", "sentimento_mercado",
     "emo_confianca", "emo_humor", "emo_energia", "emo_atencao", "emo_presenca",
+    "emo_equilibrio", "emo_disciplina",
 )
 
 # Subconjunto de `CAMPOS_EDITAVEIS_TRADE` guardado como lista no parquet.
@@ -1155,18 +1405,76 @@ def evolucao_metricas_expandida(df: pd.DataFrame | None = None,
     if reais.empty:
         return {"datas": [], "payoff": [], "fator_recuperacao": [], "expectativa": []}
 
+    # 2026-08-02, bug real de performance: a versão anterior chamava
+    # `calcular_estatisticas()` UMA VEZ POR DIA distinto do período — cada
+    # chamada refaz o pipeline inteiro (win/loss split, groupbys de
+    # ativo/janela/sala/estratégia, explode de tags) sobre o sub-histórico
+    # "até aquele dia", só pra extrair 3 números (payoff/fator_recuperacao/
+    # expectativa). Perfilado ao vivo: 17 chamadas de `calcular_estatisticas`
+    # somando ~550ms num único clique de troca de mês — a causa real da
+    # lentidão relatada ("lentidão ao clicar, carregar informações quando
+    # mudamos o calendário"). Reescrito como UMA passada vetorizada
+    # (cumsum/cummax/cummin do pandas) que reproduz exatamente a mesma
+    # fórmula de `calcular_estatisticas` (mesmas linhas ~1365-1404 acima),
+    # sem recomputar os breakdowns que este resultado nem usa.
     reais = reais.copy()
     reais["data_op"] = pd.to_datetime(reais["data_op"])
-    dias = sorted(reais["data_op"].dt.date.unique())
-    datas, payoff, fator_recuperacao, expectativa = [], [], [], []
-    for dia in dias:
-        ate_aqui = reais[reais["data_op"].dt.date <= dia]
-        stats = calcular_estatisticas(df=ate_aqui)
-        datas.append(dia.isoformat())
-        payoff.append(stats["payoff"])
-        fator_recuperacao.append(stats["fator_recuperacao"])
-        expectativa.append(stats["expectativa"])
-    return {"datas": datas, "payoff": payoff, "fator_recuperacao": fator_recuperacao, "expectativa": expectativa}
+    reais = reais.sort_values("data_op")
+    saldo = reais["saldo_operacao_reais"].astype(float)
+    is_win = saldo > 0
+    is_loss = saldo < 0
+
+    n_cum = pd.Series(range(1, len(reais) + 1), index=reais.index)
+    n_win_cum = is_win.cumsum()
+    n_loss_cum = is_loss.cumsum()
+    soma_ganhos_cum = saldo.where(is_win, 0.0).cumsum()
+    soma_perdas_cum = saldo.where(is_loss, 0.0).cumsum()
+
+    media_ganho_cum = (soma_ganhos_cum / n_win_cum.replace(0, pd.NA)).fillna(0.0).astype(float)
+    media_perda_cum = (soma_perdas_cum / n_loss_cum.replace(0, pd.NA)).fillna(0.0).astype(float)
+    taxa_acerto_cum = n_win_cum / n_cum
+
+    payoff_cum = (media_ganho_cum / media_perda_cum.replace(0, pd.NA)).abs()
+    expectativa_cum = taxa_acerto_cum * media_ganho_cum + (1 - taxa_acerto_cum) * media_perda_cum
+
+    saldo_acumulado = saldo.cumsum()
+    pico_corrente = saldo_acumulado.cummax()
+    drawdown_maximo_cum = (saldo_acumulado - pico_corrente).cummin()
+    fator_recuperacao_cum = saldo_acumulado / drawdown_maximo_cum.replace(0, pd.NA).abs()
+
+    # Nota: `payoff`/`expectativa` batem EXATO com a versão antiga (agregados
+    # puros, independentes de ordem). `fator_recuperacao` pode variar no
+    # dígito menos significativo em dias com 2+ trades, porque `data_op` só
+    # tem granularidade de DIA (sem horário) — quando há empate de data, a
+    # trajetória intradiária pico/vale depende da ordem relativa desses
+    # trades, e a versão antiga já era não-determinística nisso (cada
+    # chamada de `calcular_estatisticas(df=ate_aqui)` re-ordenava com
+    # `sort_values` default, que não é estável e podia reordenar o empate
+    # de forma diferente a cada tamanho de fatia). Testado: com sort
+    # explicitamente estável nos dois lados, a diferença PERSISTE — ou
+    # seja, a ambiguidade já vinha do design (data sem hora), não é
+    # regressão desta reescrita. Afeta só o desenho da sparkline histórica,
+    # nunca o valor ATUAL exibido (que vem direto de `calcular_estatisticas`
+    # sobre o período inteiro, sem passar por aqui).
+    reais = reais.assign(
+        _dia=reais["data_op"].dt.date,
+        _payoff=payoff_cum, _fator_recuperacao=fator_recuperacao_cum, _expectativa=expectativa_cum,
+    )
+    # Um ponto por dia — snapshot no ÚLTIMO trade daquele dia (mesma
+    # semântica do loop original: "todos os trades até aquele dia
+    # inclusive"). `reais` já está ordenado por `data_op`, então `tail(1)`
+    # por grupo preserva a ordem cronológica sem precisar reordenar depois.
+    ultimo_por_dia = reais.groupby("_dia", sort=True).tail(1)
+
+    def _ou_none(v):
+        return None if pd.isna(v) else float(v)
+
+    return {
+        "datas": [d.isoformat() for d in ultimo_por_dia["_dia"]],
+        "payoff": [_ou_none(v) for v in ultimo_por_dia["_payoff"]],
+        "fator_recuperacao": [_ou_none(v) for v in ultimo_por_dia["_fator_recuperacao"]],
+        "expectativa": [float(v) for v in ultimo_por_dia["_expectativa"]],
+    }
 
 
 def feedback_expectativa(valores: list) -> dict:
@@ -1288,6 +1596,110 @@ def calcular_anticovardia_score(df: pd.DataFrame | None = None) -> dict:
         "consistencia": eixo_consistencia,
     }
     score = sum(eixos.values()) / len(eixos)
+    return {"score": score, "eixos": eixos}
+
+
+# -----------------------------------------------------------------------------
+# PLAYBOOK — SCORE DE ADERÊNCIA (2026-08-02). Substitui `_score_qualidade_setup`
+# (aderência a traçado de S/R) como fonte da coluna "Score" do Histórico —
+# aderência a traçado continua existindo/rodando (`avaliar_aderencia_tracados`),
+# só deixou de contar pra qualidade do trade: virou dado de bastidores pro
+# Quant Lab/backtesting/treino do motor de price action.
+# -----------------------------------------------------------------------------
+
+PLAYBOOK_PESO_CHECKLIST_PRETRADE = 0.30
+PLAYBOOK_PESO_CHECKLIST_ESTRATEGIA = 0.30
+PLAYBOOK_PESO_RISCO = 0.25
+PLAYBOOK_PESO_COACHING_CHECKIN = 0.15
+
+TRADESCORE_PESO_ANTICOVARDIA = 0.5
+TRADESCORE_PESO_PLAYBOOK = 0.5
+
+
+def _pct_checklist(marcados, total) -> float | None:
+    """None se total for None/0/NaN (checklist inexistente nesse trade —
+    trade anterior a esta feature, ou nenhuma estratégia/checklist
+    resolvida). Nunca fabrica dado que falta."""
+    if total is None or (isinstance(total, float) and math.isnan(total)) or not total:
+        return None
+    marcados = marcados if isinstance(marcados, (list, tuple)) else []
+    return min(len(marcados) / total, 1.0) * 100
+
+
+def calcular_playbook_adherence_trade(trade: dict) -> dict:
+    """Aderência ao Playbook de UM trade, 0-100. Combina os 4 componentes
+    (checklist pré-trade do dia, checklist da estratégia, gerenciamento de
+    risco seguido, check-in de coaching feito) com os pesos `PLAYBOOK_PESO_*`,
+    mas RENORMALIZA entre os componentes disponíveis quando algum é `None`
+    (nunca fabrica dado que falta, nunca zera o score todo por 1 componente
+    ausente). `adherence=None` só quando os 4 estiverem ausentes.
+    Retorna `{'adherence': float|None, 'componentes': {chave: float|None}}`."""
+    componentes = {
+        "checklist_pretrade": _pct_checklist(
+            trade.get("checklist_pretrade_marcados_dia"), trade.get("checklist_pretrade_total_dia")),
+        "checklist_estrategia": _pct_checklist(
+            trade.get("checklist_estrategia_marcados"), trade.get("checklist_estrategia_total")),
+        "risco": (100.0 if trade.get("risco_gerenciamento_seguido") is True else
+                  0.0 if trade.get("risco_gerenciamento_seguido") is False else None),
+        "coaching_checkin": (100.0 if trade.get("coaching_checkin_feito") is True else
+                              0.0 if trade.get("coaching_checkin_feito") is False else None),
+    }
+    pesos = {
+        "checklist_pretrade": PLAYBOOK_PESO_CHECKLIST_PRETRADE,
+        "checklist_estrategia": PLAYBOOK_PESO_CHECKLIST_ESTRATEGIA,
+        "risco": PLAYBOOK_PESO_RISCO,
+        "coaching_checkin": PLAYBOOK_PESO_COACHING_CHECKIN,
+    }
+    disponiveis = {k: v for k, v in componentes.items() if v is not None}
+    if not disponiveis:
+        return {"adherence": None, "componentes": componentes}
+    peso_total = sum(pesos[k] for k in disponiveis)
+    adherence = sum(v * pesos[k] for k, v in disponiveis.items()) / peso_total
+    return {"adherence": adherence, "componentes": componentes}
+
+
+def calcular_trade_score(trade: dict, anticovardia_score_atual: float | None = None) -> float | None:
+    """Nova fonte da coluna 'Score' do Histórico — 0.5 * Anticovardia Score
+    (nível de conta, valor ATUAL passado por `anticovardia_score_atual`,
+    tipicamente `calcular_anticovardia_score()['score']` calculado 1x fora
+    de um loop de linhas, nunca recalculado retroativamente por trade) +
+    0.5 * Aderência ao Playbook (nível do trade). Se só 1 lado existir, usa
+    só ele; `None` se os dois forem `None`."""
+    adherence = calcular_playbook_adherence_trade(trade)["adherence"]
+    if anticovardia_score_atual is None and adherence is None:
+        return None
+    if anticovardia_score_atual is None:
+        return adherence
+    if adherence is None:
+        return anticovardia_score_atual
+    return anticovardia_score_atual * TRADESCORE_PESO_ANTICOVARDIA + adherence * TRADESCORE_PESO_PLAYBOOK
+
+
+def calcular_discipline_score(df: pd.DataFrame | None = None, dias: int | None = None) -> dict:
+    """'Pontos de Disciplina' — métrica AGREGADA (não é o TradeScore: aquele
+    mede 1 trade, este mede o hábito ao longo de um período). Média de
+    `calcular_playbook_adherence_trade()` sobre os trades reais do período
+    (todos, se `dias=None`). Retorna `{'score': float|None, 'eixos': {...}}`
+    — MESMO formato de `calcular_anticovardia_score`, de propósito, pra
+    reaproveitar o layout de card/radar já existente."""
+    if df is None:
+        df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)] if "is_simulated" in df.columns else df
+    if dias is not None and not reais.empty:
+        limite = pd.Timestamp.now().normalize() - pd.Timedelta(days=dias)
+        reais = reais[pd.to_datetime(reais["data_op"]) >= limite]
+    if reais.empty:
+        return {"score": None, "eixos": {}}
+
+    resultados = [calcular_playbook_adherence_trade(linha.to_dict()) for _, linha in reais.iterrows()]
+    chaves = ["checklist_pretrade", "checklist_estrategia", "risco", "coaching_checkin"]
+    eixos = {}
+    for chave in chaves:
+        valores = [r["componentes"][chave] for r in resultados if r["componentes"][chave] is not None]
+        if valores:
+            eixos[chave] = sum(valores) / len(valores)
+    adherencias = [r["adherence"] for r in resultados if r["adherence"] is not None]
+    score = sum(adherencias) / len(adherencias) if adherencias else None
     return {"score": score, "eixos": eixos}
 
 
@@ -2940,6 +3352,10 @@ COLUNAS_POSICOES_ABERTAS = [
     "nivel_sr_referencia_preliminar", "resumo_operacional_preliminar",
     "emo_confianca_preliminar", "emo_humor_preliminar", "emo_energia_preliminar",
     "emo_atencao_preliminar", "emo_presenca_preliminar",
+    # Autoavaliação (2026-08-03) — "Atenção" saiu da UI (mantido aqui só
+    # pra trades antigos continuarem lendo o valor histórico, nunca mais
+    # preenchido por trade novo); "Equilíbrio"/"Disciplina" são os 2 novos.
+    "emo_equilibrio_preliminar", "emo_disciplina_preliminar",
     "tags_emocionais_preliminar", "sentimento_mercado_preliminar",
     "criado_em", "atualizado_em",
 ]

@@ -691,6 +691,12 @@ DIARIO_CHECKLIST_PRE_TRADE = [
     "Ainda estou dentro do limite de operações do dia",
 ]
 
+# Playbook (2026-08-02) — tolerância pra considerar que o Alvo/Stop do trade
+# "seguiu" o Gerenciamento de Risco cadastrado na estratégia (dentro de X% do
+# alvo/stop em pontos cadastrados). Primeiro palpite, mesmo espírito de
+# ajustável de TOLERANCIA_SAIDA_FRACAO — revisar depois de ver casos reais.
+PLAYBOOK_TOLERANCIA_RISCO_PCT = 0.10
+
 # -----------------------------------------------------------------------------
 # MODO APRENDIZAGEM — Fase 3.3 (2026-07-21): ajuste fino automático
 # -----------------------------------------------------------------------------

@@ -114,8 +114,9 @@ def auditar(modulo, construtores, nome_modulo):
 import diario_app_classico as dac  # noqa: E402
 
 total = auditar(dac, {
-    "estatisticas": lambda: dac._construir_diario_estatisticas(
-        dac.dt.calcular_estatisticas(), dac.dt.calcular_score_confiabilidade()),
+    # "estatisticas" saiu daqui no rollout TradeZella (2026-07-31) — virou
+    # painel-dashboard em dashboard.py, processo separado que este audit
+    # nao cobre (ver CLAUDE.md/plano da fase).
     "posicao": dac._construir_diario_em_andamento,
     "historico": dac._construir_diario_historico,
     "estrategias": dac._construir_diario_estrategias,

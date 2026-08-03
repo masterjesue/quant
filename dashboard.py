@@ -12,16 +12,22 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from dash import _dash_renderer
+_dash_renderer._set_react_version('18.2.0')
 import dash
 from dash import dcc, html, Input, Output, State, callback_context, no_update, ALL
+import dash_mantine_components as dmc
+import dash_ag_grid as dag
+from dash_iconify import DashIconify
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
 import threading
 import json
+import calendar
 import logging
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 # Log de erros de sincronização em arquivo dedicado (nunca console — evita
 # o UnicodeEncodeError já documentado quando a mensagem de erro carrega
@@ -45,6 +51,7 @@ import persistencia
 import run_backtest
 import mt5_loader
 import diario_trade
+import diario_trade as dt
 import aprendizagem
 import tracados
 import indice_medo_ganancia
@@ -167,24 +174,87 @@ def carregar_bases():
                                     with lock:
                                         estado['bases'][ativo] = df_novo
 
-                        # Detecta contratos vigentes para exibição no status
-                        with lock:
+                        # Detecta contratos vigentes para exibição no status.
+                        # 2026-08-02, bug real encontrado após relato de "SQ
+                        # muito lento/travado": estas 4 chamadas (MT5 direto
+                        # + rede pro DI) ficavam DENTRO do `with lock:` —
+                        # `detectar_contrato_mais_recente` faz várias
+                        # chamadas `mt5.copy_rates_from_pos` em loop, e a
+                        # IPC do MT5 é documentadamente instável (ver
+                        # CLAUDE.md). Se qualquer uma travasse, o `lock`
+                        # (compartilhado por TODO o resto do app pra ler
+                        # `estado`) ficava preso indefinidamente, congelando
+                        # a navegação inteira do painel pai — o processo
+                        # filho do Diário (porta 8053) continuava respondendo
+                        # normal, já que é outro processo/lock, confirmando o
+                        # diagnóstico. Corrigido no mesmo padrão já usado em
+                        # `_sincronizar_posicoes_background`: chamadas
+                        # bloqueantes rodam FORA do lock, só a escrita no
+                        # `estado` (rápida, nunca trava) roda dentro.
+                        bases_atuais = estado['bases']
+                        try:
                             t = mt5_loader.detectar_contrato_mais_recente('WIN')
+                        except Exception:
+                            t = None
+                        try:
                             w = mt5_loader.detectar_contrato_mais_recente('WDO')
+                        except Exception:
+                            w = None
+                        # Ativos correlacionados (DI1FUT/WINFUT/WDOFUT) pro
+                        # painel do hero — mesma cadência de 30s, nunca no
+                        # tick de 1s (evita chamadas MT5 extras por segundo).
+                        # Ver correlacao_ativos.py.
+                        try:
+                            cotacoes_correlacionadas = correlacao_ativos.obter_cotacoes_correlacionadas(
+                                bases_atuais.get('WIN'), bases_atuais.get('WDO'))
+                        except Exception:
+                            cotacoes_correlacionadas = None
+                        try:
+                            fechamentos_di = correlacao_ativos.obter_fechamentos_di()
+                        except Exception:
+                            fechamentos_di = None
+
+                        with lock:
                             estado['contrato_win'] = t or '—'
                             estado['contrato_wdo'] = w or '—'
-                            # Ativos correlacionados (DI1FUT/WINFUT/WDOFUT)
-                            # pro painel do hero — mesma cadência de 30s,
-                            # nunca no tick de 1s (evita chamadas MT5
-                            # extras por segundo). Ver correlacao_ativos.py.
-                            estado['cotacoes_correlacionadas'] = correlacao_ativos.obter_cotacoes_correlacionadas(
-                                estado['bases'].get('WIN'), estado['bases'].get('WDO'))
-                            estado['fechamentos_di'] = correlacao_ativos.obter_fechamentos_di()
+                            estado['cotacoes_correlacionadas'] = cotacoes_correlacionadas
+                            estado['fechamentos_di'] = fechamentos_di
+
+                        # Cabeçalho de conexão em Posição (Playbook,
+                        # 2026-08-03) — capturado aqui (única thread que
+                        # fala com o MT5 de verdade) e persistido pro
+                        # processo FILHO (diario_app_classico.py) ler,
+                        # mesmo padrão de `posicoes_abertas.parquet`.
+                        try:
+                            conectividade = mt5_loader.checar_conectividade()
+                            conta = mt5_loader.obter_info_conta()
+                            persistencia.salvar_status_conexao({
+                                'conectado': conectividade.get('status') == 'ok',
+                                'status': conectividade.get('status'),
+                                'latencia_ms': conectividade.get('latencia_ms'),
+                                'login': conta.get('login') if conta else None,
+                                'servidor': conta.get('servidor') if conta else None,
+                                'saldo': conta.get('saldo') if conta else None,
+                                'patrimonio': conta.get('patrimonio') if conta else None,
+                                'margem_livre': conta.get('margem_livre') if conta else None,
+                                'moeda': conta.get('moeda') if conta else None,
+                                'atualizado_em': datetime.now(),
+                            })
+                        except Exception:
+                            pass
 
                         mt5_loader.desconectar()
                     except Exception as e:
                         with lock:
                             estado['erro'] = f"MT5: {str(e)[:60]}"
+                        try:
+                            persistencia.salvar_status_conexao({
+                                'conectado': False, 'status': 'erro_conexao', 'latencia_ms': None,
+                                'login': None, 'servidor': None, 'saldo': None, 'patrimonio': None,
+                                'margem_livre': None, 'moeda': None, 'atualizado_em': datetime.now(),
+                            })
+                        except Exception:
+                            pass
 
     except Exception as e:
         with lock:
@@ -762,7 +832,7 @@ def _botao_toggle_sr(id_botao: str) -> html.Button:
     """Ícone de olho sobreposto no canto do gráfico — mostra/oculta as
     linhas de S/R desenhadas (ver store-sr-visivel e a função
     `desenharNiveisSR` em assets/lwchart.js)."""
-    return html.Button('👁', id=id_botao, type='button', n_clicks=0,
+    return html.Button(_icone('tabler:eye', tamanho=14), id=id_botao, type='button', n_clicks=0,
                         title='Mostrar/ocultar níveis de S/R no gráfico',
                         style={
                             'position': 'absolute', 'top': '8px', 'right': '8px',
@@ -778,7 +848,7 @@ def _botao_toggle_mme21(id_botao: str) -> html.Button:
     """Ícone de olho da MME21 — mesmo padrão de `_botao_toggle_sr`, só que
     posicionado à esquerda dele (right: 38px em vez de 8px) pra não
     sobrepor no mesmo canto do gráfico."""
-    return html.Button('👁', id=id_botao, type='button', n_clicks=0,
+    return html.Button(_icone('tabler:eye', tamanho=14), id=id_botao, type='button', n_clicks=0,
                         title='Mostrar/ocultar MME21 no gráfico',
                         style={
                             'position': 'absolute', 'top': '8px', 'right': '38px',
@@ -808,25 +878,6 @@ def _botao_reset_zoom(id_botao: str) -> html.Button:
                             'border': f'1px solid {C["border"]}', 'borderRadius': '6px',
                             'padding': '0',
                         })
-
-
-def _estilo_aba(chave: str, aba_ativa: str) -> dict:
-    """Estilo de uma aba do cabeçalho (QUANT LAB/BACKTESTING/DIÁRIO/
-    CONFIGURAÇÕES) dado qual está ativa — mesmo princípio de
-    `_estilo_botao_ativo`: usado no layout estático inicial E no callback
-    `atualizar_estilo_aba_ativa`, o `html.Button` nunca é recriado (a troca
-    de aba do clássico é implementada pela primeira vez neste módulo — até
-    aqui os 4 botões existiam só como decoração, sem callback nenhum)."""
-    ativa = (chave == aba_ativa)
-    return {
-        'background': 'transparent', 'border': 'none',
-        'borderBottom': f'2px solid {C["gold"]}' if ativa else '2px solid transparent',
-        'color': C['text'] if ativa else C['text2'],
-        'padding': '8px 20px', 'cursor': 'pointer',
-        'fontFamily': FONTS['display'], 'fontSize': '12px',
-        'fontWeight': '600' if ativa else '400',
-        'letterSpacing': '0.06em',
-    }
 
 
 def construir_market_view(m: dict) -> html.Div:
@@ -1539,10 +1590,11 @@ def _card_mme21(analise: dict) -> html.Div:
     if not analise.get('operavel', True):
         return html.Div([
             _rotulo, numero,
-            html.Div('⚠ MERCADO LATERAL', style={
+            html.Div(_texto_com_icone('tabler:alert-triangle', 'MERCADO LATERAL', tamanho=14), style={
                 'fontSize': '13px', 'fontWeight': '700', 'color': C['bg'],
                 'background': C['yellow'], 'padding': '6px 10px', 'borderRadius': '6px',
-                'marginBottom': '10px', 'letterSpacing': '0.05em', 'display': 'inline-block',
+                'marginBottom': '10px', 'letterSpacing': '0.05em', 'display': 'inline-flex',
+                'alignItems': 'center', 'gap': '4px',
             }),
             html.Div(analise.get('mensagem') or 'MME21 não deve ser operada em mercado lateral.', style={
                 'fontSize': '13px', 'color': C['text'], 'fontFamily': FONTS['body'],
@@ -1751,7 +1803,7 @@ def _card_estudo_tracado(analise: dict, expandido: bool = False) -> html.Div:
                     'fontWeight': '700', 'letterSpacing': '0.05em',
                 }),
             ], style={'flex': '1'}),
-            html.Button('🗑', id={'type': 'del-tracado', 'index': analise['id_tracado']},
+            html.Button(_icone('tabler:trash', tamanho=14), id={'type': 'del-tracado', 'index': analise['id_tracado']},
                         n_clicks=0, title='Remover traçado', style={
                             'background': 'transparent', 'border': f'1px solid {C["border"]}',
                             'borderRadius': '6px', 'color': C['text2'], 'cursor': 'pointer',
@@ -1987,9 +2039,9 @@ def _texto_log_recalibracao() -> html.Div:
         }))
     else:
         for s in sugestoes:
-            partes.append(html.Div(f"⚠ {s['detalhe']}", style={
+            partes.append(html.Div(_texto_com_icone('tabler:alert-triangle', s['detalhe'], tamanho=13), style={
                 'fontSize': '12px', 'color': C['gold'], 'fontFamily': FONTS['body'],
-                'lineHeight': '1.5', 'marginBottom': '4px',
+                'lineHeight': '1.5', 'marginBottom': '4px', 'display': 'flex', 'alignItems': 'center', 'gap': '4px',
             }))
     return html.Div(partes)
 
@@ -2027,6 +2079,1853 @@ def _painel_sugestoes_estruturais() -> html.Div:
 # LAYOUT PRINCIPAL
 # =============================================================================
 
+# Menu lateral achatado (rollout TradeZella, 2026-07-31 — "faça um menu
+# lateral como é no TradeZella... não estamos fazendo melhorias, estamos
+# mudando TOTALMENTE a experiência"). Achatado por pedido explícito do
+# Menu lateral de DUAS colunas, estilo TradeZella de verdade (2026-07-31,
+# pedido explícito do Jesué junto de um print de referência: "Faça um menu
+# retrátil. Veja que na lateral esquerda tem botões que abrem menus
+# diferentes" — a versão anterior, achatada numa lista só, não tinha essa
+# trilha de ícones). `_GRUPOS_MENU` é a fonte única de verdade: cada grupo
+# vira 1 ícone fixo na TRILHA (sempre visível, à esquerda); o PAINEL DE
+# RÓTULOS ao lado mostra só os itens do grupo ATIVO (os outros ficam com
+# `display:none`, nunca desmontados — mesma disciplina de sempre) e pode
+# recolher inteiro via `btn-menu-colapsar` (☰), deixando só a trilha de
+# ícones.
+#
+# Nesta mesma leva, 3 decisões de nomenclatura que o Jesué tinha deixado
+# "pra depois" (rollout original) e confirmou agora: Histórico exibe como
+# "Diário" (chave interna continua `historico`, zero módulo tocado por
+# causa disso); Bem-Estar virou "Coaching"; Padrões saiu do nível
+# principal e entrou DENTRO de Coaching — é o primeiro grupo com mais de
+# 1 seção, e é exatamente o que motivou ter um painel de rótulos por grupo
+# em vez de manter tudo achatado. "Novo Trade" saiu do menu por completo:
+# virou botão "+ Novo Trade" dentro do Diário, abrindo em pop-up (ver
+# `diario_app_classico.py::_construir_diario_historico`), não mais uma
+# seção própria.
+#
+# Ícones em `tabler:*` (via `DashIconify`/`dash-iconify`, pacote NOVO
+# instalado nesta leva — correção do Jesué: "Esses emojis do menu não
+# estão no estilo tradezella" — TradeZella usa ícones de linha finos e
+# monocromáticos, não emoji colorido de fonte do sistema). `dash-iconify`
+# empacota o SVG de cada ícone localmente (verificado via inspeção de
+# rede num teste isolado — sem chamada a nenhuma API externa em runtime),
+# então não introduz dependência de rede.
+_GRUPOS_MENU = [
+    # (chave_grupo, rótulo_grupo, ícone tabler, [seções do grupo] — None = grupo é a própria seção)
+    ('dashboard', 'Dashboard', 'tabler:layout-dashboard', None),
+    ('historico', 'Diário', 'tabler:notebook', None),
+    ('estrategias', 'Estratégias', 'tabler:puzzle', None),
+    ('posicao', 'Posição', 'tabler:map-pin', None),
+    ('coaching', 'Coaching', 'tabler:heart',
+     [('bem_estar', 'Bem-Estar', 'tabler:heart'), ('padroes', 'Padrões', 'tabler:chart-dots')]),
+    ('lab', 'Quant Lab', 'tabler:flask', None),
+    ('back', 'Backtesting', 'tabler:player-track-prev', None),
+    ('config', 'Configurações', 'tabler:settings', None),
+]
+_GRUPOS_CHAVES = [g for g, _, _, _ in _GRUPOS_MENU]
+_GRUPO_PARA_SECOES = {
+    g: ([s for s, _, _ in sub] if sub else [g]) for g, _, _, sub in _GRUPOS_MENU
+}
+_SECAO_PARA_GRUPO = {s: g for g, secoes in _GRUPO_PARA_SECOES.items() for s in secoes}
+_ROTULOS_SECAO = {g: nome for g, nome, _, sub in _GRUPOS_MENU if not sub}
+_ICONES_SECAO = {g: icone for g, _, icone, sub in _GRUPOS_MENU if not sub}
+for _g, _, _, _sub in _GRUPOS_MENU:
+    if _sub:
+        for _s, _nome, _icone in _sub:
+            _ROTULOS_SECAO[_s] = _nome
+            _ICONES_SECAO[_s] = _icone
+_TODAS_SECOES = list(_SECAO_PARA_GRUPO.keys())
+# As 5 seções que continuam renderizadas pelo processo filho — qualquer
+# uma delas ativa mostra o MESMO iframe (`painel-diario`), só avisado por
+# postMessage (ver `assets/secao_diario.js`) de qual sub-aba mostrar lá
+# dentro (mesmo princípio já usado pra tema, `assets/tema.js`). "Novo
+# Trade" NÃO entra mais aqui — virou pop-up interno do Diário, nunca é
+# `store-aba-ativa` (ver comentário de `_GRUPOS_MENU`).
+_ABAS_DIARIO_FILHO = ['historico', 'estrategias', 'posicao', 'padroes', 'bem_estar']
+
+
+def _estilo_rail_botao(ativo: bool) -> dict:
+    return {
+        'width': '38px', 'height': '38px', 'fontSize': '18px', 'border': 'none',
+        'borderRadius': '8px', 'cursor': 'pointer', 'padding': 0,
+        'background': C['gold'] if ativo else 'transparent',
+        'color': C['bg'] if ativo else C['text2'],
+        'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center',
+    }
+
+
+
+# =============================================================================
+# DASHBOARD (ex-Estatísticas do Diário) — relocado de diario_app_classico.py
+# (rollout TradeZella, 2026-07-31: "Tire a aba Estatísticas de dentro do
+# Diário, e torne-o a página inicial do Dashboard"). Todo este bloco (tokens
+# TZ_*, cards/gráficos/calendário/Mentor de IA/Confiabilidade por
+# Estratégia) é código já validado e testado ao longo do item F — movido
+# fisicamente pra cá, sem reescrever a lógica. `_formatar_janela`/
+# `_mapa_nomes_estrategias` também existem (duplicados) em
+# `diario_app_classico.py`, que ainda os usa pra Histórico/Posição.
+# =============================================================================
+
+def _formatar_janela(chave: str | None) -> str:
+    """"Abertura (9:00-9:30)" — mesma função de `diario_app_classico.py`,
+    duplicada aqui (pequena, sem estado) porque os dois processos agora
+    precisam dela independentemente."""
+    if not chave or chave not in cfg.JANELAS_PREGAO:
+        return chave or '—'
+    inicio, fim = cfg.JANELAS_PREGAO[chave]
+    return f"{chave.replace('_', ' ').title()} ({inicio}-{fim})"
+
+
+def _mapa_nomes_estrategias() -> dict:
+    """slug -> nome de exibição — mesma função de `diario_app_classico.py`,
+    duplicada aqui pelo mesmo motivo de `_formatar_janela`."""
+    return {l['slug']: l['nome'] for _, l in dt.listar_estrategias(somente_ativas=False).iterrows()}
+
+
+TZ_RAIO_CARD = '14px'
+
+
+TZ_RAIO_CELULA = '8px'
+
+
+TZ_SOMBRA_CARD = '0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04)'
+
+
+TZ_PADDING_CARD = '18px 20px'
+
+
+TZ_GAP_GRID = '16px'
+
+
+TZ_PASTEL_CALENDARIO = {
+    'light': {'green_bg': '#DCFCE7', 'red_bg': '#FEE2E2', 'neutro_bg': '#F1F1F6', 'texto': '#14141C'},
+}
+
+
+def _tz_estilo_card(extra: dict | None = None) -> dict:
+    """Estilo de card do redesenho TradeZella — sombra suave em vez de
+    borda grossa, cantos bem arredondados, padding generoso. Reaproveita
+    `C['panel']` (já existente) como fundo, só troca a moldura."""
+    base = {
+        'background': C['panel'], 'borderRadius': TZ_RAIO_CARD,
+        'boxShadow': TZ_SOMBRA_CARD, 'padding': TZ_PADDING_CARD,
+    }
+    if extra:
+        base.update(extra)
+    return base
+
+
+def _bloco_tradezella(titulo, children) -> dmc.Card:
+    """Equivalente a `_bloco_diario`, só que `dmc.Card` real (item F, Fase
+    2.6 — não mais `html.Div` com sombra pintada à mão) usado em TODA a
+    aba Estatísticas (rollout progressivo: só aqui por enquanto, decisão
+    do Jesué). NÃO substitui `_bloco_diario` (as outras abas do Diário
+    continuam com ele, sem mudança, até a próxima etapa do rollout).
+
+    `w='100%'` (2026-07-31, feedback do Jesué: "não gosto desses espaços
+    vazios") — `dmc.Card` não estica sozinho pra preencher o container
+    (diferente de um `html.Div` de bloco comum), deixando espaço morto à
+    direita quando usado sozinho numa linha. Quando usado EM PAR (ex:
+    "Melhor por Horário"/"Melhor por Direção"), o par inteiro precisa estar
+    dentro de um `dmc.SimpleGrid` (não `display:flex` cru) pra cada card
+    ocupar sua célula por igual — ver `_bloco_analise_estrategia`."""
+    return dmc.Card([
+        dmc.Text(titulo, size='sm', fw=600, mb='md'),
+        children,
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
+def _card_header_tradezella(titulo: str, valor_str, cor_valor=None, componente=None,
+                              animar_numero: bool = False) -> dmc.Card:
+    """Card estilo TradeZella (item F, Fase 2.6 — `dmc.Card` real, não
+    `html.Div` com sombra pintada à mão): elevação nativa (`shadow`/
+    `withBorder`), cantos arredondados via `radius`, hover embutido do
+    componente. `componente`, se passado, é um objeto DMC animável de
+    verdade (`dmc.RingProgress`/`dmc.ProgressRoot`), nunca mais um
+    `dcc.Graph` Plotly estático pra esse papel.
+
+    `animar_numero=True` marca o valor com a classe `tz-numero-animado`
+    (`assets/tradezella_ux.js` conta de 0 até o valor real ao montar) — só
+    seguro pra `valor_str` de STRING simples (nunca quando `valor_str` é
+    um componente composto, tipo o badge+texto do Current Streak: o JS
+    reescreve `el.textContent`, o que apagaria filhos não-texto)."""
+    # `c=None` quebra o parser de cor do Mantine no navegador (Python
+    # `None` vira JSON `null`, e `typeof null === 'object'` em JS — o
+    # parser só aceita string ou `undefined`) — só passa `c` quando há
+    # cor de verdade, mesmo cuidado em `_card_estatistica` logo abaixo.
+    kwargs_valor = {'c': cor_valor} if cor_valor else {}
+    if animar_numero:
+        kwargs_valor['className'] = 'tz-numero-animado'
+    texto = html.Div([
+        dmc.Text(titulo, size='sm', c='dimmed'),
+        dmc.Text(valor_str, size='xl', fw=700, **kwargs_valor),
+    ])
+    # Gráfico ao LADO do número, não embaixo (2026-07-31, feedback do
+    # Jesué: "não gosto desses espaços vazios") — um `dmc.RingProgress` de
+    # 70px embaixo de um texto de ~30px deixava um vão vazio à direita
+    # dele; lado a lado (`dmc.Group justify='space-between'`) usa a
+    # largura do card por inteiro, sem sobra. Cards sem gráfico (Net P&L/
+    # Current Streak) ficam só com `texto`, sem vão nenhum — `align=
+    # 'center'` centraliza verticalmente contra a altura do gráfico
+    # quando ele existe.
+    conteudo = dmc.Group([texto, componente], justify='space-between', align='center', wrap='nowrap') \
+        if componente is not None else texto
+    # `SimpleGrid` estica todo card da linha pra altura do mais alto (o
+    # que tem RingProgress/barra) — sem centralizar verticalmente, um
+    # card só-texto (Saldo Líquido/Sequência Atual) sobrava um vão em
+    # branco embaixo do conteúdo (2026-07-31, 2ª rodada do mesmo
+    # feedback "espaço vazio"). `display:flex` + `justifyContent:center`
+    # no Card centraliza o conteúdo na altura real da linha, qualquer
+    # que seja ela.
+    return dmc.Card(conteudo, withBorder=True, shadow='sm', radius='lg', p='lg',
+                     className='tz-card',
+                     style={'flex': '1', 'minWidth': '190px', 'height': '100%',
+                            'display': 'flex', 'flexDirection': 'column', 'justifyContent': 'center'})
+
+
+def _cards_header_tradezella(stats: dict, tema: str) -> dmc.SimpleGrid:
+    """5 cards ao estilo TradeZella (item F): Net P&L / Trade Win% / Avg
+    Win-Loss / Profit Factor / Current Streak — `dmc.SimpleGrid` real (não
+    `html.Div` com `display:flex` manual) pra responsividade nativa.
+    Current Streak é deliberadamente ALL-TIME (`dt.sequencia_atual()` sem
+    filtro): um streak "atual" cortado no limite do mês selecionado não
+    faz sentido conceitual (um streak real de 3 trades pode atravessar a
+    virada do mês)."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+
+    saldo_total = stats['saldo_total']
+    # Sparkline + seta de variação % (2026-07-31, pedido: "esse mini
+    # gráfico, e a setinha indicando a % de aumento ou de queda... quero
+    # que adicione isso... no Saldo Líquido") — reaproveita
+    # `evolucao_saldo_acumulado` (já expansivo, já calculado por
+    # `calcular_estatisticas`), sem precisar de dado novo. `valor_str`
+    # composto (não string simples) — perde `animar_numero` (mesma
+    # ressalva já documentada em `_card_header_tradezella` pra conteúdo
+    # composto, mesmo padrão já usado no Current Streak).
+    evolucao_saldo = stats['evolucao_saldo_acumulado']
+    pct_saldo, direcao_saldo = _variacao_percentual(evolucao_saldo)
+    cor_seta_saldo = 'green' if direcao_saldo == 'up' else ('red' if direcao_saldo == 'down' else 'gray')
+    seta_saldo = '▲' if direcao_saldo == 'up' else ('▼' if direcao_saldo == 'down' else '—')
+    texto_variacao_saldo = f"{seta_saldo} {abs(pct_saldo):.1f}%" if pct_saldo is not None else seta_saldo
+    componente_saldo = None
+    if len([v for v in evolucao_saldo if v is not None]) >= 2:
+        componente_saldo = dcc.Graph(
+            figure=_grafico_sparkline(evolucao_saldo, tema, direcao_saldo),
+            config={'displayModeBar': False}, style={'width': '70px', 'height': '48px'})
+    card_net_pnl = _card_header_tradezella(
+        'Saldo Líquido',
+        html.Div([
+            dmc.Text(f"R$ {saldo_total:+.2f}", size='xl', fw=700, className='tz-numero-animado',
+                      **({'c': 'green' if saldo_total > 0 else 'red'} if saldo_total != 0 else {})),
+            dmc.Text(texto_variacao_saldo, size='xs', fw=600, c=cor_seta_saldo, mt=2),
+        ]),
+        componente=componente_saldo,
+    )
+
+    # Anel de 3 seções (Win/Loss/Breakeven), não só um arco verde de % —
+    # bate com o gauge real do TradeZella (`image1.png`: "Trade win %"
+    # mostra um anel segmentado vermelho/azul/verde com as 3 contagens
+    # embaixo, não um arco único de porcentagem).
+    win_pct = stats['taxa_acerto'] * 100
+    card_win_pct = _card_header_tradezella(
+        'Taxa de Acerto',
+        html.Div([
+            dmc.Text(f"{win_pct:.1f}%", size='xl', fw=700, className='tz-numero-animado'),
+            dmc.Group([
+                dmc.Text(str(stats['n_loss']), size='xs', c='red', fw=700),
+                dmc.Text(str(stats['n_breakeven']), size='xs', c='dimmed', fw=700),
+                dmc.Text(str(stats['n_win']), size='xs', c='green', fw=700),
+            ], gap=6, mt=2),
+        ]),
+        componente=dmc.RingProgress(
+            size=70, thickness=7, roundCaps=True,
+            sections=[
+                {'value': stats['n_loss'] / stats['num_operacoes'] * 100, 'color': 'red'},
+                {'value': stats['n_breakeven'] / stats['num_operacoes'] * 100, 'color': 'gray'},
+                {'value': stats['n_win'] / stats['num_operacoes'] * 100, 'color': 'green'},
+            ] if stats['num_operacoes'] else [],
+        ),
+    )
+
+    payoff = stats['payoff']
+    media_ganho, media_perda_abs = stats['media_ganho_reais'], abs(stats['media_perda_reais'])
+    total_win_loss = media_ganho + media_perda_abs
+    pct_ganho = (media_ganho / total_win_loss * 100) if total_win_loss else 0
+    # Valores em R$ embaixo da barra (verde à esquerda, vermelho à
+    # direita) — bate com o card real do TradeZella, que mostra "$951" e
+    # "-$352" sob os dois lados da barra, não só o número de payoff.
+    barra_avg_win_loss = html.Div([
+        dmc.ProgressRoot([
+            dmc.ProgressSection(value=pct_ganho, color='green'),
+            dmc.ProgressSection(value=100 - pct_ganho, color='red'),
+        ], size='lg', radius='xl'),
+        dmc.Group([
+            dmc.Text(f"R$ +{media_ganho:.0f}", size='xs', c='green', fw=600),
+            dmc.Text(f"R$ -{media_perda_abs:.0f}", size='xs', c='red', fw=600),
+        ], justify='space-between', mt=4),
+    ], style={'width': '120px'}) if total_win_loss else None
+    card_avg_win_loss = _card_header_tradezella(
+        'Ganho/Perda Médio', f"{payoff:.2f}" if payoff is not None else '—',
+        componente=barra_avg_win_loss,
+    )
+
+    profit_factor = stats['profit_factor']
+    pf_normalizado = min(profit_factor or 0, 3.0) / 3.0 * 100
+    card_profit_factor = _card_header_tradezella(
+        'Fator de Lucro', f"{profit_factor:.2f}" if profit_factor is not None else '—',
+        componente=dmc.RingProgress(
+            size=70, thickness=7, roundCaps=True,
+            sections=[{'value': pf_normalizado, 'color': 'green' if (profit_factor or 0) >= 1 else 'red'}],
+        ),
+    )
+
+    streak = dt.sequencia_atual()
+    if streak['tipo'] is None:
+        streak_str, cor_streak = '—', None
+        badge_streak = None
+    else:
+        cor_streak = 'green' if streak['tipo'] == 'win' else 'red'
+        rotulo_trades = 'trade' if streak['trades'] == 1 else 'trades'
+        rotulo_dias = 'dia' if streak['dias'] == 1 else 'dias'
+        streak_str = f"{streak['trades']} {rotulo_trades} ({streak['dias']} {rotulo_dias})"
+        badge_streak = dmc.ThemeIcon(_icone('tabler:flame' if streak['tipo'] == 'win' else 'tabler:snowflake', tamanho=18),
+                                       color=cor_streak, variant='light', radius='xl', size='lg')
+    card_streak = _card_header_tradezella(
+        'Sequência Atual',
+        html.Div([badge_streak, html.Span(streak_str, style={'marginLeft': '8px'})],
+                  style={'display': 'flex', 'alignItems': 'center'}) if badge_streak else streak_str,
+        cor_valor=cor_streak,
+    )
+
+    return dmc.SimpleGrid(
+        [card_net_pnl, card_win_pct, card_avg_win_loss, card_profit_factor, card_streak],
+        cols={'base': 1, 'sm': 2, 'lg': 5}, spacing='md', mb='md',
+    )
+
+
+def _card_estatistica(titulo: str, valor: str, cor=None) -> dmc.Paper:
+    """Card de detalhe (grupos Quantidade/Taxas/Valores) — `dmc.Paper`
+    real (item F, Fase 2.6) em vez de `html.Div` com fundo pintado."""
+    return dmc.Paper([
+        dmc.Text(titulo, size='xs', c='dimmed'),
+        dmc.Text(valor, size='md', fw=700, **({'c': cor} if cor else {})),
+    ], radius='md', p='sm', withBorder=True, style={'minWidth': '120px', 'flex': '1'})
+
+
+def _variacao_percentual(valores: list) -> tuple:
+    """Variação % entre os 2 últimos pontos NÃO-`None` de uma série
+    expansiva (2026-07-31, pedido: "mini gráfico, e a setinha indicando a
+    % de aumento ou de queda, geralmente usado nas grades de cotações").
+    `None` quando há menos de 2 pontos válidos ou o ponto anterior é ~0
+    (percentual sobre uma base perto de zero não tem leitura estável —
+    nunca fabrica um número aqui). Direção usa o SINAL do delta bruto
+    (`atual - anterior`), não do valor em si — funciona igual pra métricas
+    que cruzam zero (Saldo Líquido, Fator de Recuperação)."""
+    validos = [v for v in valores if v is not None]
+    if len(validos) < 2:
+        return None, 'flat'
+    anterior, atual = validos[-2], validos[-1]
+    delta = atual - anterior
+    direcao = 'up' if delta > 1e-9 else ('down' if delta < -1e-9 else 'flat')
+    if abs(anterior) < 1e-9:
+        return None, direcao
+    return delta / abs(anterior) * 100, direcao
+
+
+def _grafico_sparkline(valores: list, tema: str, direcao: str) -> go.Figure:
+    """Mini-gráfico de linha, sem eixos/grade — mesmo padrão visual de
+    grade de cotações (2026-07-31). Cor segue a direção (verde=subiu,
+    vermelho=desceu, cinza=estável), igual à leitura de
+    `_variacao_percentual`."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    cor = p['green'] if direcao == 'up' else (p['red'] if direcao == 'down' else p['text2'])
+    validos = [v for v in valores if v is not None]
+    fig = go.Figure(go.Scatter(
+        x=list(range(len(validos))), y=validos, mode='lines',
+        line=dict(color=cor, width=2, shape='spline', smoothing=0.3),
+        fill='tozeroy', fillcolor=_hex_para_rgba(cor, 0.15),
+    ))
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=0, r=0, t=4, b=4),
+        xaxis=dict(visible=False, fixedrange=True), yaxis=dict(visible=False, fixedrange=True),
+        showlegend=False,
+    )
+    return fig
+
+
+def _card_com_sparkline(titulo: str, valor_str: str, valores_serie: list, tema: str,
+                          cor_valor=None) -> dmc.Card:
+    """Card com mini-gráfico (sparkline) + variação % com seta, estilo
+    "grade de cotações" (2026-07-31, pedido: "esse mini gráfico, e a
+    setinha indicando a % de aumento ou de queda... adicione isso em
+    alguns blocos"). `valores_serie`: pontos recentes da métrica (pode ter
+    `None` nos primeiros dias, ex: Payoff antes do 1º trade perdedor) —
+    variação calculada só sobre os pontos válidos. Usado por Payoff/Fator
+    de Recuperação — o card de Expectativa tem layout próprio, ver
+    `_card_expectativa_destaque` (esta versão com `justify='space-between'`
+    e só 2 filhos deixava um vão enorme quando esticada pra `w='100%'`)."""
+    pct, direcao = _variacao_percentual(valores_serie)
+    cor_seta = 'green' if direcao == 'up' else ('red' if direcao == 'down' else 'gray')
+    seta = '▲' if direcao == 'up' else ('▼' if direcao == 'down' else '—')
+    texto_variacao = f"{seta} {abs(pct):.1f}%" if pct is not None else seta
+    tem_grafico = len([v for v in valores_serie if v is not None]) >= 2
+
+    texto = html.Div([
+        dmc.Text(titulo, size='xs', c='dimmed'),
+        dmc.Text(valor_str, size='md', fw=700, **({'c': cor_valor} if cor_valor else {})),
+        dmc.Text(texto_variacao, size='xs', fw=600, c=cor_seta, mt=2),
+    ])
+    if tem_grafico:
+        grafico = dcc.Graph(
+            figure=_grafico_sparkline(valores_serie, tema, direcao),
+            config={'displayModeBar': False}, style={'width': '64px', 'height': '44px'},
+        )
+        conteudo = dmc.Group([grafico, texto], gap='sm', wrap='nowrap', justify='space-between')
+    else:
+        conteudo = texto
+    return dmc.Paper(conteudo, radius='md', p='sm', withBorder=True, style={'minWidth': '160px', 'flex': '1'})
+
+
+def _mini_stat_expectativa(titulo: str, valor: float, tema: str) -> html.Div:
+    """Um dos 3 sub-indicadores (Melhor/Pior/Atual) do card de destaque da
+    Expectativa Matemática — ver `_card_expectativa_destaque`."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    cor = p['green'] if valor > 0 else (p['red'] if valor < 0 else p['text2'])
+    return html.Div([
+        dmc.Text(titulo, size='xs', c='dimmed'),
+        dmc.Text(f"R$ {valor:+.2f}", size='md', fw=700, style={'color': cor}),
+    ])
+
+
+def _card_expectativa_destaque(serie_expectativa: list, tema: str) -> dmc.Paper:
+    """Card de destaque da Expectativa Matemática (2026-07-31, pedido:
+    "ficou um espaço muito grande entre o mini gráfico e os dados...
+    Expectativa Matemática - Melhor Desempenho / Pior Desempenho e Atual.
+    Se ainda sobrar espaço vazio, coloque um breve feedback") — o
+    `_card_com_sparkline` genérico usava `justify='space-between'` com só
+    2 filhos (gráfico + texto), o que numa largura de 100% deixava um vão
+    enorme no meio (visível no screenshot). Aqui o espaço é preenchido com
+    conteúdo de verdade: Melhor/Pior/Atual lado a lado (mesmo padrão de
+    Vencedora/Perdedora já usado em "Análise de Estratégia"), e um
+    feedback dinâmico (`dt.feedback_expectativa`) embaixo se ainda sobrar
+    espaço."""
+    validos = [v for v in serie_expectativa if v is not None]
+    pct, direcao = _variacao_percentual(serie_expectativa)
+    cor_seta = 'green' if direcao == 'up' else ('red' if direcao == 'down' else 'gray')
+    seta = '▲' if direcao == 'up' else ('▼' if direcao == 'down' else '—')
+    texto_variacao = f"{seta} {abs(pct):.1f}%" if pct is not None else seta
+
+    if not validos:
+        return dmc.Paper('Sem trades reais suficientes pra calcular a Expectativa ainda.',
+                          radius='md', p='lg', withBorder=True, style={'width': '100%', 'fontSize': '12px'})
+
+    atual, melhor, pior = validos[-1], max(validos), min(validos)
+    cor_atual = 'green' if atual > 0 else ('red' if atual < 0 else None)
+
+    # TUDO numa linha só (2026-07-31, feedback com screenshot anotado:
+    # "coloque na mesma linha... veja o espaço vazio no meio") — a 1ª
+    # versão separava título+número+seta (linha 1, `justify=
+    # 'space-between'` só com ELE e o gráfico) de Melhor/Pior/Atual
+    # (linha 2 embaixo), deixando um vão enorme no meio da linha 1 (só 2
+    # filhos esticados pras pontas). Um único `dmc.Group` com todos os 5
+    # itens se distribui e preenche a largura toda sem sobra.
+    linha = dmc.Group([
+        html.Div([
+            dmc.Text('Expectativa Matemática', size='sm', c='dimmed'),
+            dmc.Text(f"R$ {atual:+.2f}", size='xl', fw=700,
+                      **({'c': cor_atual} if cor_atual else {})),
+            dmc.Text(texto_variacao, size='xs', fw=600, c=cor_seta, mt=2),
+        ]),
+        _mini_stat_expectativa('Melhor Desempenho', melhor, tema),
+        _mini_stat_expectativa('Pior Desempenho', pior, tema),
+        _mini_stat_expectativa('Atual', atual, tema),
+        dcc.Graph(figure=_grafico_sparkline(serie_expectativa, tema, direcao),
+                  config={'displayModeBar': False}, style={'width': '84px', 'height': '60px'})
+        if len(validos) >= 2 else None,
+    ], justify='space-between', wrap='wrap', align='center')
+
+    feedback = _bloco_o_que_fazer(
+        'Melhor/pior valor já alcançado pela expectativa matemática acumulada, e onde ela está agora.',
+        dt.feedback_expectativa(serie_expectativa))
+
+    return dmc.Paper([linha, feedback], radius='md', p='lg', withBorder=True, style={'width': '100%'})
+
+
+def _bloco_breakdown_diario(titulo: str, dados: dict) -> html.Div:
+    linhas = [
+        html.Div([
+            html.Span(chave.replace('_', ' ').title(), style={'flex': '1', 'fontSize': '12px'}),
+            html.Span(str(v['n']), style={'width': '34px', 'textAlign': 'right', 'fontSize': '12px',
+                                           'fontFamily': FONTS['body']}),
+            html.Span(f"R$ {v['saldo']:+.0f}", style={
+                'width': '90px', 'textAlign': 'right', 'fontSize': '12px', 'fontFamily': FONTS['body'],
+                'color': C['green'] if v['saldo'] > 0 else (C['red'] if v['saldo'] < 0 else C['text2']),
+            }),
+        ], style={'display': 'flex', 'padding': '4px 0', 'borderBottom': f'1px solid {C["border"]}'})
+        for chave, v in dados.items()
+    ] or [html.Div('Sem dados.', style={'fontSize': '12px', 'color': C['text2']})]
+    return _bloco_tradezella(titulo, html.Div(linhas))
+
+
+_ROTULO_DIRECAO_OPERACAO = {'long': 'Compra', 'short': 'Venda'}
+
+
+def _tabela_melhor_por(titulo: str, dados: dict, rotulos_grupo: dict | None = None) -> html.Div:
+    """'Melhor estratégia por X' (janela/direção/ativo/categoria) — ver
+    `dt.analise_estrategia`. Cada grupo só aparece se alguma estratégia
+    atingiu `dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA` NAQUELE recorte; texto
+    explícito quando não há nenhum grupo qualificado, em vez de bloco vazio
+    sem explicação."""
+    nomes = _mapa_nomes_estrategias()
+    rotulos_grupo = rotulos_grupo or {}
+    if not dados:
+        linhas = [html.Div(f'Amostra insuficiente (mínimo {dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA} trades por grupo).',
+                           style={'fontSize': '12px', 'color': C['text2']})]
+    else:
+        linhas = []
+        for chave, info in sorted(dados.items(), key=lambda kv: -kv[1]['saldo']):
+            rotulo_chave = rotulos_grupo.get(chave, str(chave).replace('_', ' ').title())
+            nome_estrategia = nomes.get(info['estrategia'], str(info['estrategia']).replace('_', ' ').title())
+            saldo = info['saldo']
+            cor = C['green'] if saldo > 0 else (C['red'] if saldo < 0 else C['text2'])
+            linhas.append(html.Div([
+                html.Span(rotulo_chave, style={'flex': '1', 'fontSize': '12px', 'color': C['text2']}),
+                html.Span(nome_estrategia, style={'flex': '1.3', 'fontSize': '12px', 'fontWeight': '600'}),
+                html.Span(f"R$ {saldo:+.0f} ({info['n']})", style={
+                    'width': '110px', 'textAlign': 'right', 'fontSize': '12px',
+                    'fontFamily': FONTS['body'], 'color': cor,
+                }),
+            ], style={'display': 'flex', 'padding': '4px 0', 'borderBottom': f'1px solid {C["border"]}'}))
+    return _bloco_tradezella(titulo, html.Div(linhas))
+
+
+def _icone(nome_tabler: str, tamanho: int = 13, cor: str | None = None, **kwargs) -> DashIconify:
+    """Ícone padrão (Tabler, via `dash_iconify`) — substitui os glifos
+    Unicode/emoji soltos usados antes como ícone de status/botão (2026-08-03,
+    pedido do Jesué: "REMOVA TODOS OS EMOJIS... identidade visual mais
+    refinada com ícones estilizados", mesmo padrão TradeZella já usado em
+    `diario_app_classico.py` desde a Fase 2)."""
+    if cor:
+        kwargs['color'] = cor
+    return DashIconify(icon=nome_tabler, width=tamanho, **kwargs)
+
+
+def _texto_com_icone(nome_tabler: str, texto: str, cor: str | None = None, tamanho: int = 13):
+    """Ícone + texto lado a lado — substitui o padrão antigo de prefixar uma
+    string crua com um glifo emoji (`f'⚠ {texto}'`, `f'✔ {texto}'`, etc.).
+    Retorna uma LISTA (não um `html.Span`) de propósito: usável direto como
+    `children` de qualquer componente (`html.Div(_texto_com_icone(...))`) ou
+    dentro de uma lista maior (`html.Span(['prefixo: ', *_texto_com_icone(...)])`)."""
+    return [_icone(nome_tabler, tamanho=tamanho, cor=cor), f' {texto}']
+
+
+def _card_estrategia_destaque(titulo: str, icone_tabler: str, info: dict | None, cor_dmc: str) -> dmc.Card:
+    """Estratégia Vencedora/Perdedora, destacada de forma ilustrada (pedido
+    explícito do docx: "coloque em destaque de forma ilustrativa — por
+    exemplo, um troféu ou medalha"). `dmc.Card` + `dmc.ThemeIcon` real
+    (item F, Fase 2.6) — `cor_dmc` é um nome de cor Mantine ('green'/
+    'red'), não mais a string CSS var `C[...]` usada antes. `icone_tabler`
+    era um emoji (🏆/📉) até 2026-08-03, agora um nome de ícone Tabler."""
+    nomes = _mapa_nomes_estrategias()
+    if info is None:
+        conteudo = dmc.Text(f'Amostra insuficiente ainda (mínimo {dt.ANALISE_ESTRATEGIA_MIN_AMOSTRA} trades).',
+                             size='sm', c='dimmed')
+    else:
+        nome = nomes.get(info['estrategia'], str(info['estrategia']).replace('_', ' ').title())
+        saldo = info['saldo']
+        cor_saldo = 'green' if saldo > 0 else ('red' if saldo < 0 else 'dimmed')
+        conteudo = html.Div([
+            dmc.Text(nome, size='lg', fw=700),
+            dmc.Text(f"R$ {saldo:+.2f} em {info['n']} operações", size='sm', c=cor_saldo, mt=4),
+        ])
+    return dmc.Card([
+        dmc.Group([
+            dmc.ThemeIcon(_icone(icone_tabler, tamanho=18), color=cor_dmc, variant='light', radius='xl', size='lg'),
+            dmc.Text(titulo, size='sm', fw=600, c='dimmed'),
+        ], mb='sm'),
+        conteudo,
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', className='tz-card',
+       style={'flex': '1', 'minWidth': '220px'})
+
+
+def _conteudo_mentor_ia(cache: dict | None) -> html.Div:
+    """Corpo do bloco Mentor de IA — texto cacheado (se houver) ou
+    `dmc.Skeleton` (placeholder cinza pulsante — item F, Fase 2.6, real
+    componente de loading em vez de só texto estático) quando ainda não
+    foi gerado. Usado tanto no render inicial quanto como retorno da
+    callback, pra manter os dois caminhos idênticos."""
+    if not cache or not cache.get('texto'):
+        return html.Div([
+            dmc.Skeleton(height=12, width='90%', mb='xs'),
+            dmc.Skeleton(height=12, width='75%', mb='xs'),
+            dmc.Skeleton(height=12, width='60%'),
+            dmc.Text('Ainda não gerada. Clique em "Gerar análise de hoje".', size='xs', c='dimmed', mt='sm'),
+        ])
+    gerado_em = cache.get('gerado_em', '')
+    try:
+        horario = datetime.fromisoformat(gerado_em).strftime('%d/%m %H:%M')
+    except ValueError:
+        horario = gerado_em
+    return html.Div([
+        dcc.Markdown(cache['texto'], style={'fontSize': '13px', 'lineHeight': '1.6'}),
+        dmc.Text(f"Gerado em {horario} · {cache.get('modelo_usado', '')} · "
+                 f"{cache.get('tokens_usados', 0)} tokens", size='xs', c='dimmed', mt='sm'),
+    ])
+
+
+def _bloco_mentor_ia() -> dmc.Card:
+    """Mentor de IA — análise retrospectiva diária (item D, "upgrade
+    diario.docx", 2026-07-30): curva de aprendizagem, evolução operacional/
+    estratégica, próximos passos, tom DIRETO e objetivo. Reusa o MESMO hub
+    Gemini/OpenRouter do chat (`ai_analyst._despachar_para_modelo`), nunca
+    uma chamada própria. `dmc.Card`/`dmc.Button` reais (item F, Fase 2.6).
+
+    Cadência de 1x/dia é só uma SUGESTÃO da UI (rótulo do botão muda pra
+    "Gerar nova análise" depois da 1ª geração do dia) — nunca um bloqueio,
+    porque o Jesué pode querer regenerar manualmente. O botão em si nunca é
+    recriado por sua própria callback (evitaria resetar n_clicks) — só o
+    `children` de `diario-mentor-ia-conteudo` e o rótulo do botão mudam."""
+    cache = ai_analyst.carregar_analise_diaria()
+    hoje = date.today().isoformat()
+    ja_gerou_hoje = bool(cache) and cache.get('data') == hoje
+    return dmc.Card([
+        dmc.Group([
+            dmc.ThemeIcon(_icone('tabler:compass', tamanho=18), color='yellow', variant='light', radius='xl', size='lg'),
+            dmc.Text('Mentor de IA — Evolução Operacional', size='sm', fw=600),
+            dmc.Button(
+                'Gerar nova análise' if ja_gerou_hoje else 'Gerar análise de hoje',
+                id='btn-gerar-mentor-ia', n_clicks=0, variant='light', color='gray',
+                size='xs', radius='xl', ml='auto',
+            ),
+        ], mb='md'),
+        dcc.Loading(
+            id='loading-mentor-ia', type='dot', color=C['gold'],
+            children=html.Div(_conteudo_mentor_ia(cache), id='diario-mentor-ia-conteudo'),
+        ),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mt='md', className='tz-card')
+
+
+_ROTULO_EIXO_ANTICOVARDIA = {
+    'win_rate': 'Taxa de Acerto',
+    'profit_factor': 'Fator de Lucro',
+    'avg_win_loss': 'Ganho/Perda Médio',
+    'recovery_factor': 'Fator de Recuperação',
+    'max_drawdown': 'Drawdown Máximo',
+    'consistencia': 'Consistência',
+}
+
+
+_ORDEM_EIXOS_ANTICOVARDIA = ['win_rate', 'profit_factor', 'avg_win_loss',
+                             'recovery_factor', 'max_drawdown', 'consistencia']
+
+
+def _grafico_radar_anticovardia(eixos: dict, tema: str) -> go.Figure:
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    categorias = [_ROTULO_EIXO_ANTICOVARDIA[e] for e in _ORDEM_EIXOS_ANTICOVARDIA]
+    valores = [eixos.get(e, 0.0) for e in _ORDEM_EIXOS_ANTICOVARDIA]
+    r_fechado = valores + [valores[0]]
+    theta_fechado = categorias + [categorias[0]]
+
+    # A 1ª tentativa de "gradiente" (N cópias do mesmo polígono encolhidas
+    # em direção ao centro) foi um erro: como os 6 eixos quase nunca têm o
+    # MESMO valor, cada cópia é uma versão IRREGULAR do polígono, e cópias
+    # concêntricas de um polígono irregular não formam faixas suaves — as
+    # arestas de cada camada cruzam as das outras, criando o efeito
+    # "estrela"/crivo de linhas visto no comparativo direto com o
+    # TradeZella real (2026-07-31: "não é fluido e clean... cheio de
+    # pontos"). O TradeZella usa preenchimento SÓLIDO de tom único, sem
+    # gradiente de verdade — Scatterpolar também não suporta `fillgradient`
+    # nativo (só o Scatter cartesiano, ver `_grafico_evolucao_saldo`), então
+    # replicar o "clean" real é exatamente isto: uma única camada.
+    fig = go.Figure(go.Scatterpolar(
+        r=r_fechado, theta=theta_fechado, fill='toself',
+        fillcolor=_hex_para_rgba(p['gold'], 0.35), line=dict(color=p['gold'], width=2),
+        showlegend=False,
+    ))
+    fig.update_layout(
+        # Mesmo cuidado de `_radar_roda_vida`: `autorange=False` + `tickvals`
+        # explícitos, senão o Plotly quebra a escala com variância baixa.
+        # `gridshape='linear'` (feedback: "deixe o gráfico quadrado/
+        # hexagonal ao invés de redondo") troca o grid circular padrão por
+        # um polígono reto nos mesmos 6 eixos. `showticklabels=False`
+        # (2026-07-31, "não tem números no meio" no real) esconde os
+        # números 0/20/40/.../100 que poluíam o centro do gráfico — o grid
+        # em si continua visível, só o rótulo numérico some.
+        polar=dict(bgcolor='rgba(0,0,0,0)', gridshape='linear',
+                   radialaxis=dict(visible=True, range=[0, 100], autorange=False,
+                                    tickvals=[0, 20, 40, 60, 80, 100], showticklabels=False,
+                                    gridcolor=p['border']),
+                   angularaxis=dict(tickfont=dict(size=9, color=p['text']), gridcolor=p['border'])),
+        paper_bgcolor='rgba(0,0,0,0)', showlegend=False, margin=dict(l=30, r=30, t=20, b=20),
+        height=280, autosize=True,
+    )
+    return fig
+
+
+def _barra_anticovardia_score(score: float, tema: str = 'light') -> html.Div:
+    """Barra de gradiente 0-100 (vermelho→amarelo→verde) com marcador na
+    posição do score — o TradeZella mostra o Zella Score como BARRA
+    horizontal degradê, não anel (2026-07-31, feedback: "O Anticovardia
+    Score é em barra, e não em círculo"). Sem componente DMC pronto pra
+    isso (`RingProgress` é círculo; `ProgressRoot` não faz gradiente
+    contínuo nem marcador de posição livre) — construído com CSS puro
+    (`linear-gradient` + marcador posicionado via `left: calc(pct% - r)`),
+    mesmo padrão de outros widgets sem equivalente pronto no projeto."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    pct = max(0.0, min(score, 100.0))
+    cor_marcador = p['red'] if score < 33 else (p['yellow'] if score < 66 else p['green'])
+    return html.Div([
+        html.Div(html.Div(style={
+            'position': 'absolute', 'left': f'calc({pct}% - 8px)', 'top': '-4px',
+            'width': '16px', 'height': '16px', 'borderRadius': '50%',
+            'background': cor_marcador, 'border': f"2px solid {p['panel']}",
+            'boxShadow': '0 1px 3px rgba(0,0,0,0.35)',
+        }), style={
+            'position': 'relative', 'height': '8px', 'borderRadius': '4px',
+            'background': f"linear-gradient(to right, {p['red']}, {p['yellow']}, {p['green']})",
+        }),
+        html.Div([
+            html.Span(str(v), style={'fontSize': '10px', 'color': p['text2'], 'fontFamily': FONTS['body']})
+            for v in (0, 20, 40, 60, 80, 100)
+        ], style={'display': 'flex', 'justifyContent': 'space-between', 'marginTop': '6px'}),
+    ], style={'width': '100%', 'padding': '8px 4px 0 4px'})
+
+
+def _bloco_anticovardia_score(tema: str = 'light') -> dmc.Card:
+    """Anticovardia Score — `dmc.Card` real com o radar Plotly (sem
+    equivalente DMC pronto, mantido) + a barra degradê
+    `_barra_anticovardia_score` pro score final (item F — TradeZella usa
+    barra, não anel/círculo, ver docstring da barra)."""
+    resultado = dt.calcular_anticovardia_score()
+    if resultado['score'] is None:
+        return dmc.Card('Sem trades reais suficientes pra calcular o Anticovardia Score ainda.',
+                         withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', w='100%',
+                         style={'fontSize': '12px', 'color': C['text2']})
+    score = resultado['score']
+    return dmc.Card([
+        dmc.Text('Anticovardia Score', size='sm', fw=600, mb='sm'),
+        dcc.Graph(figure=_grafico_radar_anticovardia(resultado['eixos'], tema),
+                  config={'displayModeBar': False, 'responsive': True}, style={'width': '100%'}),
+        _barra_anticovardia_score(score, tema),
+        dmc.Group([
+            dmc.Text(f"Seu Anticovardia Score: {score:.1f}", size='sm', fw=700,
+                      className='tz-numero-animado'),
+        ], justify='flex-start', mt='sm'),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
+_ROTULO_EIXO_DISCIPLINA = {
+    'checklist_pretrade': 'Checklist Pré-Mercado',
+    'checklist_estrategia': 'Checklist da Estratégia',
+    'risco': 'Gerenciamento de Risco',
+    'coaching_checkin': 'Check-in de Coaching',
+}
+
+
+def _bloco_discipline_score(tema: str = 'light') -> dmc.Card:
+    """Pontos de Disciplina (Playbook, 2026-08-02) — complemento (NÃO
+    substituto) do Anticovardia Score: aquele mede resultado financeiro,
+    este mede aderência ao PROCESSO (checklist pré-mercado, checklist da
+    estratégia, gerenciamento de risco, check-in de coaching). Mesma fonte
+    (`dt.calcular_discipline_score`) usada aqui e em Bem-Estar — visual mais
+    simples que o radar do Anticovardia (4 barras `dmc.Progress`, não há
+    referência visual do TradeZella pra essa métrica nova)."""
+    resultado = dt.calcular_discipline_score()
+    if resultado['score'] is None:
+        return dmc.Card('Sem trades reais suficientes pra calcular os Pontos de Disciplina ainda.',
+                         withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', w='100%',
+                         className='tz-card', style={'fontSize': '12px', 'color': C['text2']})
+    barras = []
+    for chave, rotulo in _ROTULO_EIXO_DISCIPLINA.items():
+        valor = resultado['eixos'].get(chave)
+        barras.append(dmc.Stack([
+            dmc.Group([
+                dmc.Text(rotulo, size='xs', c=C['text2']),
+                dmc.Text(f"{valor:.0f}" if valor is not None else '—', size='xs', fw=700),
+            ], justify='space-between'),
+            dmc.Progress(value=valor or 0, color='yellow', size='sm', radius='xl'),
+        ], gap=4, mb='xs'))
+    return dmc.Card([
+        dmc.Text('Pontos de Disciplina', size='sm', fw=600, mb='sm'),
+        html.Div(barras),
+        dmc.Group([
+            dmc.Text(f"{resultado['score']:.1f}", size='sm', fw=700, className='tz-numero-animado'),
+        ], justify='flex-start', mt='sm'),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
+def _bloco_trades_recentes(tema: str = 'light') -> dmc.Card:
+    """Trades Recentes (item F — bloco condensado que faltava, 2026-07-31:
+    "você não está mostrando o bloco de trades recentes no dashboard,
+    como é no TradeZella"). Lista os últimos `dt.trades_recentes` trades
+    reais num formato compacto (data/ativo/direção/estratégia/R-múltiplo/
+    resultado) — prévia rápida, não substitui o Histórico (que tem
+    filtro completo + edição)."""
+    linhas = dt.trades_recentes(n=8)
+    if not linhas:
+        return dmc.Card('Nenhum trade real lançado ainda.', withBorder=True, shadow='sm',
+                         radius='lg', p='lg', mb='md', w='100%', className='tz-card',
+                         style={'fontSize': '12px', 'color': C['text2']})
+    nomes_estrategias = _mapa_nomes_estrategias()
+
+    def _celula(conteudo, largura, alinhar='left'):
+        return html.Div(conteudo, style={'width': largura, 'textAlign': alinhar, 'flexShrink': '0'})
+
+    cabecalho = dmc.Group([
+        _celula(dmc.Text('Data', size='xs', c='dimmed'), '70px'),
+        _celula(dmc.Text('Ativo', size='xs', c='dimmed'), '55px'),
+        _celula(dmc.Text('Direção', size='xs', c='dimmed'), '65px'),
+        dmc.Text('Estratégia', size='xs', c='dimmed', style={'flex': '1'}),
+        _celula(dmc.Text('R-Múltiplo', size='xs', c='dimmed'), '80px', 'right'),
+        _celula(dmc.Text('Resultado', size='xs', c='dimmed'), '90px', 'right'),
+    ], wrap='nowrap', gap='xs', style={'padding': '0 4px 6px 4px'})
+
+    linhas_ui = [cabecalho]
+    for t in linhas:
+        saldo = t['saldo_operacao_reais']
+        cor_saldo = 'green' if saldo > 0 else ('red' if saldo < 0 else 'dimmed')
+        r_mult = t['r_multiple']
+        direcao_label = _ROTULO_DIRECAO_OPERACAO.get(t['tipo_operacao'], t['tipo_operacao'])
+        cor_direcao = 'blue' if t['tipo_operacao'] == 'long' else 'grape'
+        nome_estrategia = nomes_estrategias.get(t['estrategia'], t['estrategia']) if t['estrategia'] else '—'
+        linhas_ui.append(dmc.Group([
+            _celula(dmc.Text(t['data_op'], size='xs'), '70px'),
+            _celula(dmc.Text(t['ativo'], size='xs', fw=600), '55px'),
+            _celula(dmc.Badge(direcao_label, color=cor_direcao, variant='light', size='sm'), '65px'),
+            dmc.Text(nome_estrategia, size='xs', c='dimmed', truncate=True, style={'flex': '1'}),
+            _celula(dmc.Text(f"{r_mult:+.2f}R" if r_mult is not None else '—', size='xs'), '80px', 'right'),
+            _celula(dmc.Text(f"R$ {saldo:+.2f}", size='xs', fw=700, c=cor_saldo), '90px', 'right'),
+        ], wrap='nowrap', gap='xs', style={'padding': '6px 4px', 'borderTop': f"1px solid {C['border']}"}))
+
+    return dmc.Card([
+        dmc.Text('Trades Recentes', size='sm', fw=600, mb='sm'),
+        html.Div(linhas_ui),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
+def _grafico_duracao_performance(tema: str = 'light') -> go.Figure:
+    """Scatter Duração × Resultado (item F, fase 5 — "Trade Duration
+    Performance" do TradeZella). Um ponto por trade real com os dois
+    timestamps preenchidos (`dt.dados_duracao_performance` — boa parte da
+    base não tem, amostra parcial por natureza), cor por sinal do saldo
+    (verde ganho/vermelho perda), eixo X em minutos, eixo Y em R$."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    linhas = dt.dados_duracao_performance()
+    fig = go.Figure()
+    if linhas:
+        duracoes = [t['duracao_minutos'] for t in linhas]
+        saldos = [t['saldo_operacao_reais'] for t in linhas]
+        cores = [p['green'] if s > 0 else (p['red'] if s < 0 else p['text2']) for s in saldos]
+        textos = [f"{t['ativo']} · {_ROTULO_DIRECAO_OPERACAO.get(t['tipo_operacao'], t['tipo_operacao'])} · {t['data_op']}"
+                  for t in linhas]
+        fig.add_trace(go.Scatter(
+            x=duracoes, y=saldos, mode='markers',
+            marker=dict(color=cores, size=8, opacity=0.75, line=dict(width=1, color=p['panel'])),
+            text=textos, hovertemplate='%{text}<br>Duração: %{x:.0f} min<br>Resultado: R$ %{y:.2f}<extra></extra>',
+        ))
+        fig.add_hline(y=0, line_width=1, line_color=p['border'])
+    fig.update_layout(
+        paper_bgcolor=p['panel'], plot_bgcolor=p['panel'],
+        font=dict(family=FONTS['body'], color=p['text2'], size=10),
+        margin=dict(l=45, r=10, t=10, b=35), height=260,
+        xaxis=dict(showgrid=True, gridcolor=p['border'], gridwidth=0.5, title='Duração (minutos)'),
+        yaxis=dict(showgrid=True, gridcolor=p['border'], gridwidth=0.5, title='R$', zeroline=False),
+    )
+    return fig
+
+
+def _bloco_o_que_fazer(descricao: str, resultado: dict) -> html.Div:
+    """"O que fazer com isso" (2026-07-31, pedido: "coloque um feedback
+    dinâmico e uma descrição... o nosso famoso 'o que fazer com isso'") —
+    mesmo padrão já estabelecido em `dashboard.py::_balao_big_players` pros
+    velocímetros do hero: descrição FIXA do que o gráfico mostra +
+    veredito DINÂMICO calculado do dado real (`resultado`, de
+    `dt.feedback_progress_tracker`/`dt.feedback_duracao_performance`), não
+    um texto genérico igual sempre."""
+    if not resultado.get('tem_dado'):
+        corpo = html.Div(resultado.get('mensagem', 'Sem dado suficiente ainda.'),
+                          style={'fontSize': '11px', 'color': C['text2'], 'lineHeight': '1.5'})
+    else:
+        corpo = html.Div([
+            html.Span('O que fazer: ', style={'fontWeight': '700', 'color': C['text']}),
+            html.Span(resultado['acao_texto'], style={'color': C.get(resultado.get('cor_acao'), C['text2'])}),
+        ], style={'fontSize': '11px', 'lineHeight': '1.5'})
+    return html.Div([
+        html.Div(descricao, style={'fontSize': '11px', 'color': C['text2'], 'lineHeight': '1.5', 'marginBottom': '6px'}),
+        corpo,
+    ], style={'marginTop': '10px', 'paddingTop': '10px', 'borderTop': f"1px solid {C['border']}",
+              'fontFamily': FONTS['body']})
+
+
+def _bloco_duracao_performance(tema: str = 'light') -> dmc.Card:
+    """Card "Desempenho por Duração da Operação" (item F, fase 5) — só
+    aparece com conteúdo real; card informativo quando não há amostra
+    (a maioria dos trades antigos não tem os 2 timestamps)."""
+    linhas = dt.dados_duracao_performance()
+    if not linhas:
+        return dmc.Card(
+            'Sem trades reais com horário de entrada/saída registrado ainda '
+            '(precisa dos dois timestamps preenchidos).',
+            withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', w='100%',
+            className='tz-card', style={'fontSize': '12px', 'color': C['text2']})
+    return dmc.Card([
+        dmc.Text('Desempenho por Duração da Operação', size='sm', fw=600, mb='sm'),
+        dcc.Graph(figure=_grafico_duracao_performance(tema),
+                  config={'displayModeBar': False, 'responsive': True}, style={'width': '100%'}),
+        _bloco_o_que_fazer(
+            'Cada ponto é um trade real (só os com horário de entrada e saída '
+            'registrados): duração em minutos no eixo X, resultado em R$ no eixo Y.',
+            dt.feedback_duracao_performance(linhas)),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
+def _bloco_analise_estrategia(stats_geral: dict, tema: str = 'light') -> html.Div:
+    """Painel "Análise de Estratégia" — pedido do docx: "junte os blocos Por
+    Ativo, Por Janela, Por Sala/Análise e Por Tags Setup/Erro num painel de
+    dashboard estatístico, adicionando melhor estratégia por horário/
+    direção/ativo/categoria; destaque a Estratégia Vencedora (troféu/
+    medalha) e a Perdedora". O Mentor de IA (item D) também vive aqui dentro
+    — pedido explícito do docx: "ainda dentro da Análise de Estratégias
+    crie um bloco [do Mentor]". O Anticovardia Score (item F, fase 3,
+    redesenho TradeZella) NÃO mora mais aqui dentro — migrou pra coluna
+    esquerda do grid assimétrico em `_construir_diario_estatisticas` (Fase
+    2.6: composição real de página, não pilha vertical única — ver
+    `spec_redesenho_tradezella.md`)."""
+    analise = dt.analise_estrategia()
+    rotulos_janela = {k: _formatar_janela(k) for k in cfg.JANELAS_PREGAO}
+    # `dmc.SimpleGrid` em vez de `html.Div(display:flex)` cru (2026-07-31,
+    # feedback do Jesué: "não gosto desses espaços vazios, organize melhor
+    # os elementos") — SimpleGrid divide a linha em células IGUAIS de
+    # verdade; um `dmc.Card` dentro de flexbox não estica sozinho e deixava
+    # metade da linha em branco quando o card vizinho era mais estreito.
+    #
+    # Detalhes (Melhor por X + Por Ativo/Janela/Sala/Tags) recolhidos por
+    # padrão (2026-07-31, feedback: "deixe Vencedora/Perdedora e Mentor de
+    # IA visíveis, o resto contraído, clicando numa seta") — só Vencedora/
+    # Perdedora e Mentor de IA ficam sempre visíveis. `dmc.Collapse`
+    # testado primeiro e DESCARTADO: reproduzido em isolamento (app Dash
+    # mínimo, só um botão + Collapse) que o `opened` setado por callback
+    # NUNCA sai de `height:0/display:none` — bug real da combinação DMC/
+    # Dash deste projeto, não erro de uso. Troca pro padrão já PROVADO
+    # neste arquivo (`alternar_modo_ano`/`btn-diario-cal-config`): conteúdo
+    # sempre presente no DOM, só o `style` (`display`) alterna — nenhuma
+    # medição de altura envolvida, não pode falhar do mesmo jeito. Botão
+    # estático (nunca recriado pela própria callback): o `children` do
+    # botão guarda o estado (seta ▼/▲).
+    detalhes = html.Div([
+        dmc.SimpleGrid([
+            _tabela_melhor_por('Melhor por Horário', analise['melhor_por_janela'], rotulos_janela),
+            _tabela_melhor_por('Melhor por Direção', analise['melhor_por_direcao'], _ROTULO_DIRECAO_OPERACAO),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
+            _tabela_melhor_por('Melhor por Ativo', analise['melhor_por_ativo']),
+            _tabela_melhor_por('Melhor por Categoria', analise['melhor_por_categoria'],
+                               dt.ROTULO_CATEGORIA_ESTRATEGIA),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
+            _bloco_breakdown_diario('Por Ativo', stats_geral['por_ativo']),
+            _bloco_breakdown_diario('Por Janela', stats_geral['por_janela']),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.SimpleGrid([
+            _bloco_breakdown_diario('Por Sala/Análise', stats_geral['por_sala']),
+            _bloco_breakdown_diario('Por Tags Setup/Erro', stats_geral['por_tags_setup_erro']),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+    ], id='colapso-analise-estrategia-detalhes', style={'display': 'none'})
+    return html.Div([
+        dmc.SimpleGrid([
+            _card_estrategia_destaque('Estratégia Vencedora', 'tabler:trophy', analise['vencedora'], 'green'),
+            _card_estrategia_destaque('Estratégia Perdedora', 'tabler:trending-down', analise['perdedora'], 'red'),
+        ], cols={'base': 1, 'md': 2}, spacing='md', mb='md'),
+        dmc.Button('Ver detalhes', id='btn-analise-estrategia-detalhes', n_clicks=0,
+                   variant='subtle', color='gray', size='xs', mb='sm'),
+        detalhes,
+        _bloco_mentor_ia(),
+    ])
+
+
+def _hex_para_rgba(hex_cor: str, alpha: float) -> str:
+    """Converte '#RRGGBB' pra 'rgba(r,g,b,a)' — Plotly só aceita opacidade
+    via rgba(), não hex separado. Usado pelo fill translúcido dos gráficos
+    abaixo, que precisam de PALETA_GAUGE (hex literal) por tema."""
+    h = hex_cor.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f'rgba({r},{g},{b},{alpha})'
+
+
+def _segmentos_cor_por_sinal(xs: list, ys: list) -> list:
+    """Quebra a série em segmentos verde (>=0)/vermelho (<0), inserindo um
+    ponto interpolado exatamente no cruzamento de zero — é o que dá o
+    efeito "linha muda de cor exatamente onde cruza o eixo" do equity
+    curve real do TradeZella (2026-07-31, feedback "gráficos não
+    mudaram": o gráfico de Evolução de Saldo era uma linha/preenchimento
+    de UMA cor só, sem essa dualidade)."""
+    xs_num = pd.to_datetime(xs).astype('int64').astype(float)
+    segmentos = []
+    atual_x, atual_y = [xs[0]], [ys[0]]
+    sinal_atual = 'pos' if ys[0] >= 0 else 'neg'
+    for i in range(1, len(ys)):
+        sinal = 'pos' if ys[i] >= 0 else 'neg'
+        if sinal != sinal_atual:
+            y_prev, y_cur = ys[i - 1], ys[i]
+            frac = y_prev / (y_prev - y_cur) if (y_prev - y_cur) != 0 else 0.0
+            x_cruz_num = xs_num[i - 1] + frac * (xs_num[i] - xs_num[i - 1])
+            x_cruz = pd.Timestamp(int(x_cruz_num))
+            atual_x.append(x_cruz); atual_y.append(0.0)
+            segmentos.append((sinal_atual, atual_x, atual_y))
+            atual_x, atual_y = [x_cruz], [0.0]
+            sinal_atual = sinal
+        atual_x.append(xs[i]); atual_y.append(ys[i])
+    segmentos.append((sinal_atual, atual_x, atual_y))
+    return segmentos
+
+
+def _grafico_evolucao_saldo(stats: dict, tema: str = 'light') -> go.Figure:
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    fig = go.Figure()
+    if stats['evolucao_data']:
+        cor_por_sinal = {'pos': p['green'], 'neg': p['red']}
+        for sinal, xs_seg, ys_seg in _segmentos_cor_por_sinal(
+                stats['evolucao_data'], stats['evolucao_saldo_acumulado']):
+            cor = cor_por_sinal[sinal]
+            extremo = max(ys_seg) if sinal == 'pos' else min(ys_seg)
+            fig.add_trace(go.Scatter(
+                x=xs_seg, y=ys_seg, mode='lines', line=dict(color=cor, width=2, shape='spline', smoothing=0.3),
+                # Gradiente vertical de verdade (`fillgradient`, Plotly
+                # nativo — 2026-07-31, feedback "aplique o gradiente em
+                # todos os gráficos do dashboard"): transparente na linha
+                # de zero, cor sólida no pico/vale do segmento — igual ao
+                # "mountain chart" real do TradeZella (verde sólido no
+                # topo esmaecendo pra branco perto do eixo).
+                fill='tozeroy', fillcolor=_hex_para_rgba(cor, 0.15),
+                fillgradient=dict(type='vertical', start=0, stop=extremo,
+                                   colorscale=[[0, _hex_para_rgba(cor, 0.0)], [1, _hex_para_rgba(cor, 0.45)]]),
+                showlegend=False, hoverinfo='x+y',
+            ))
+        fig.add_hline(y=0, line_width=1, line_color=p['border'])
+    fig.update_layout(
+        paper_bgcolor=p['panel'], plot_bgcolor=p['panel'],
+        font=dict(family=FONTS['body'], color=p['text2'], size=10),
+        margin=dict(l=45, r=10, t=10, b=30), height=200,
+        xaxis=dict(showgrid=False, gridcolor=p['border']),
+        yaxis=dict(showgrid=True, gridcolor=p['border'], gridwidth=0.5, title='R$ acumulado', zeroline=False),
+        hovermode='x unified',
+    )
+    return fig
+
+
+_NOMES_MES = ['', 'Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+              'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro']
+
+
+_DIAS_SEMANA = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb']
+
+
+_OPCOES_STATS_CALENDARIO = [
+    ('r_multiple', 'R-Multiple'),
+    ('daily_pl', 'Daily P/L'),
+    ('pontos', 'Pontos'),
+    ('n_trades', 'Nº de Trades'),
+    ('winrate', 'Day Winrate'),
+]
+
+
+_STATS_CALENDARIO_PADRAO = ['r_multiple', 'daily_pl', 'n_trades', 'winrate']
+
+
+def _grade_calendario(por_dia: dict, detalhe_dias: dict, ano: int, mes: int,
+                       stats_visiveis: list | None = None, tema: str = 'light') -> html.Div:
+    """Grade mensal por dia — `html.Div` customizado (mesma razão de
+    `diario_app_98.py::_grade_calendario_98`: sem precedente de Plotly
+    heatmap no projeto). `detalhe_dias` (`dt.detalhe_dias_calendario`)
+    fornece R-multiple médio/Nº trades/Day Winrate/Pontos por dia — ver
+    `stats_visiveis` (lista de chaves de `_OPCOES_STATS_CALENDARIO`)
+    controlando quais dessas linhas extras aparecem em cada célula. Uma
+    coluna extra por linha de semana soma o saldo + conta os dias operados
+    daquela semana (item F, fase 4: "total semanal na lateral").
+
+    Cor de célula depende do TEMA (item F, redesenho visual TradeZella,
+    conferido nas 3 referências reais do docx): no tema claro
+    (`image1.png`) o TradeZella usa fundo PASTEL + texto escuro; no tema
+    escuro (`image3.png`) usa fundo saturado + texto claro (já bem
+    parecido com o que este calendário sempre teve). Por isso só o tema
+    claro troca de paleta aqui — `TZ_PASTEL_CALENDARIO`."""
+    stats_visiveis = stats_visiveis if stats_visiveis is not None else _STATS_CALENDARIO_PADRAO
+    pastel = TZ_PASTEL_CALENDARIO.get(tema)
+    cal = calendar.Calendar(firstweekday=6)  # domingo primeiro
+    semanas = cal.monthdayscalendar(ano, mes)
+
+    cabecalho = html.Div([
+        html.Div(d, style={'flex': '1', 'textAlign': 'center', 'fontSize': '10px',
+                            'color': C['text2'], 'fontFamily': FONTS['body']})
+        for d in _DIAS_SEMANA
+    ] + [html.Div('Semana', style={'width': '90px', 'textAlign': 'center', 'fontSize': '10px',
+                                     'color': C['text2'], 'fontFamily': FONTS['body']})],
+        style={'display': 'flex', 'marginBottom': '4px'})
+
+    linhas = [cabecalho]
+    for semana in semanas:
+        celulas = []
+        saldo_semana = 0.0
+        dias_operados_semana = 0
+        for dia in semana:
+            if dia == 0:
+                celulas.append(html.Div(style={'flex': '1', 'minHeight': '40px', 'margin': '2px'}))
+                continue
+            data_iso = f"{ano:04d}-{mes:02d}-{dia:02d}"
+            info = por_dia.get(data_iso)
+            detalhe = detalhe_dias.get(data_iso)
+            if info is None:
+                bg, cor_texto = C['bg'], C['text2']
+            elif info['saldo'] > 0:
+                bg = pastel['green_bg'] if pastel else C['green']
+                cor_texto = pastel['texto'] if pastel else C['bg']
+                saldo_semana += info['saldo']
+                dias_operados_semana += 1
+            elif info['saldo'] < 0:
+                bg = pastel['red_bg'] if pastel else C['red']
+                cor_texto = pastel['texto'] if pastel else C['bg']
+                saldo_semana += info['saldo']
+                dias_operados_semana += 1
+            else:
+                bg = pastel['neutro_bg'] if pastel else C['border']
+                cor_texto = pastel['texto'] if pastel else C['text2']
+                dias_operados_semana += 1
+            estilo_celula = {'background': bg, 'borderRadius': TZ_RAIO_CELULA,
+                              'flex': '1', 'minHeight': '40px', 'margin': '2px', 'padding': '4px',
+                              'color': cor_texto, 'textAlign': 'center'}
+            conteudo = [html.Div(str(dia), style={'fontSize': '11px'})]
+            if info is not None and 'daily_pl' in stats_visiveis:
+                conteudo.append(html.Div(f"R$ {info['saldo']:+.0f}",
+                                          style={'fontSize': '10px', 'fontFamily': FONTS['body'], 'fontWeight': '700'}))
+            if info is not None and detalhe is not None:
+                estilo_extra = {'fontSize': '9px', 'fontFamily': FONTS['body'], 'opacity': '0.85'}
+                if 'n_trades' in stats_visiveis:
+                    conteudo.append(html.Div(f"{detalhe['n']} trade(s)", style=estilo_extra))
+                # R-Multiple e Day Winrate ficam NA MESMA LINHA (conferido em
+                # `image2.png`: "-1.14R, 33.33%" é um texto só, não 2 linhas).
+                partes_linha = []
+                if 'r_multiple' in stats_visiveis:
+                    rm = detalhe['r_multiple_medio']
+                    partes_linha.append(f"{rm:+.2f}R" if rm is not None else '—R')
+                if 'winrate' in stats_visiveis:
+                    partes_linha.append(f"{detalhe['taxa_acerto'] * 100:.1f}%")
+                if partes_linha:
+                    conteudo.append(html.Div(', '.join(partes_linha), style=estilo_extra))
+                if 'pontos' in stats_visiveis:
+                    conteudo.append(html.Div(f"{detalhe['pontos_total']:+.0f}pts", style=estilo_extra))
+            if info is not None:
+                # Clicável só quando há operação no dia — navega pro
+                # Histórico já filtrado (ver `clicar_dia_calendario`).
+                celulas.append(html.Div(conteudo, id={'type': 'diario-cal-dia', 'index': data_iso},
+                                         n_clicks=0, style={**estilo_celula, 'cursor': 'pointer'}))
+            else:
+                celulas.append(html.Div(conteudo, style=estilo_celula))
+        cor_semana = (C['green'] if saldo_semana > 0 else (C['red'] if saldo_semana < 0 else C['text2']))
+        celulas.append(html.Div([
+            html.Div(f"R$ {saldo_semana:+.0f}", style={'fontSize': '11px', 'fontWeight': '700',
+                                                         'fontFamily': FONTS['body'], 'color': cor_semana}),
+            html.Div(f"{dias_operados_semana} dia(s)", style={'fontSize': '9px', 'color': C['text2']}),
+        ], style={'width': '90px', 'minHeight': '40px', 'margin': '2px', 'padding': '4px',
+                  'textAlign': 'center', 'background': C['panel'], 'borderRadius': TZ_RAIO_CELULA,
+                  'boxShadow': TZ_SOMBRA_CARD}))
+        linhas.append(html.Div(celulas, style={'display': 'flex'}))
+    return html.Div(linhas)
+
+
+def _conteudo_config_calendario(stats_visiveis: list) -> html.Div:
+    """Painel "Display stats" (item F, fase 4) — mesmo padrão de
+    `_conteudo_checklist_pre_trade` (Checklist de verdade, marcável), só
+    que este PERSISTE a seleção (grava em `store-calendario-stats-
+    visiveis` via `atualizar_stats_visiveis_calendario`), ao contrário do
+    checklist pré-trade que é ritual efêmero de propósito."""
+    return html.Div([
+        html.Div('Stats visíveis por dia', style={'fontSize': '12px', 'fontWeight': '600',
+                                                    'fontFamily': FONTS['body'],
+                                                    'color': C['text'], 'marginBottom': '8px'}),
+        dcc.Checklist(
+            id='diario-cal-config-itens',
+            options=[{'label': rotulo, 'value': chave} for chave, rotulo in _OPCOES_STATS_CALENDARIO],
+            value=stats_visiveis, labelStyle={'display': 'inline-block', 'marginRight': '16px', 'fontSize': '12px',
+                                               'fontFamily': FONTS['body']},
+            inputStyle={'marginRight': '6px'},
+        ),
+    ], style=_tz_estilo_card({'marginBottom': '8px', 'padding': '14px 16px'}))
+
+
+def _grade_calendario_anual(por_mes: dict, ano: int, tema: str = 'light') -> html.Div:
+    """Grade 4x3 (um trimestre por linha) com o saldo agregado de cada mês
+    do ano — usada quando o toggle "Ano Corrente" está ligado. Mesma
+    paleta pastel-no-claro/saturado-no-escuro de `_grade_calendario`."""
+    pastel = TZ_PASTEL_CALENDARIO.get(tema)
+    linhas = []
+    for trimestre in range(4):
+        celulas = []
+        for i in range(3):
+            mes_num = trimestre * 3 + i + 1
+            info = por_mes.get(f"{ano:04d}-{mes_num:02d}")
+            if info is None:
+                bg, cor_texto = C['bg'], C['text2']
+            elif info['saldo'] > 0:
+                bg = pastel['green_bg'] if pastel else C['green']
+                cor_texto = pastel['texto'] if pastel else C['bg']
+            elif info['saldo'] < 0:
+                bg = pastel['red_bg'] if pastel else C['red']
+                cor_texto = pastel['texto'] if pastel else C['bg']
+            else:
+                bg = pastel['neutro_bg'] if pastel else C['border']
+                cor_texto = pastel['texto'] if pastel else C['text2']
+            celulas.append(html.Div([
+                html.Div(_NOMES_MES[mes_num][:3], style={'fontSize': '11px', 'fontWeight': '700'}),
+                html.Div(f"R$ {info['saldo']:+.0f}" if info else '—',
+                          style={'fontSize': '10px', 'fontFamily': FONTS['body']}),
+                html.Div(f"{info['n']} op." if info else '', style={'fontSize': '9px'}),
+            ], style={'background': bg, 'borderRadius': TZ_RAIO_CELULA,
+                       'flex': '1', 'minHeight': '52px', 'margin': '2px', 'padding': '6px',
+                       'color': cor_texto, 'textAlign': 'center'}))
+        linhas.append(html.Div(celulas, style={'display': 'flex'}))
+    return html.Div(linhas)
+
+
+_CELL_STYLE_SALDO = {'function': "params.value > 0 ? {'color': 'var(--green)', 'fontWeight': 700} "
+                                  ": params.value < 0 ? {'color': 'var(--red)', 'fontWeight': 700} : null"}
+
+
+_CELL_STYLE_SCORE = {'function': "params.value >= 70 ? {'color': 'var(--green)', 'fontWeight': 700} "
+                                  ": params.value >= 40 ? {'color': 'var(--yellow)', 'fontWeight': 700} "
+                                  ": params.value >= 0 ? {'color': 'var(--red)', 'fontWeight': 700} : null"}
+
+
+def _linhas_grid_confiabilidade(scores: dict, saldos_por_estrategia: dict) -> list:
+    """`rowData` do AG Grid "Confiabilidade por Estratégia" (item F, Fase
+    2.6 — `dag.AgGrid` real substitui a `html.Table` montada linha a
+    linha à mão: sort/filter/resize NATIVOS do componente, nada de
+    callback própria pra ordenar coluna — `ordenar_confiabilidade_
+    estrategia`/`store-ordenacao-estrategia` foram removidos, o grid faz
+    isso sozinho no cliente).
+
+    `tag` fica no dict (coluna oculta, `hide: True` no columnDef) pra
+    identificar a linha clicada e buscar `_detalhe_estrategia_expandido`."""
+    nomes = _mapa_nomes_estrategias()
+    categorias = _mapa_categorias_estrategias()
+    linhas = []
+    for tag, v in scores.items():
+        saldo = saldos_por_estrategia.get(tag, {}).get('saldo')
+        if v['n'] == 0:
+            score_label = 'sem dados'
+        elif not v['amostra_suficiente']:
+            score_label = f"amostra insuficiente (n={v['n']})"
+        else:
+            score_label = f"{v['score']:.0f}"
+        linhas.append({
+            'tag': tag,
+            'nome': nomes.get(tag, tag.replace('_', ' ').title()),
+            'categoria': categorias.get(tag, '—'),
+            'n': v['n'],
+            'saldo': saldo if saldo is not None else 0.0,
+            'saldo_label': f"R$ {saldo:+.0f}" if saldo is not None else '—',
+            'taxa_acerto': f"{v['taxa_acerto'] * 100:.1f}%" if v['taxa_acerto'] is not None else '—',
+            'payoff': f"{v['payoff']:.2f}" if v['payoff'] is not None else '—',
+            'profit_factor': f"{v['profit_factor']:.2f}" if v['profit_factor'] is not None else '—',
+            'score': v['score'] if v['score'] is not None else -1,
+            'score_label': score_label,
+        })
+    return linhas
+
+
+def _tabela_score_confiabilidade(scores: dict, saldos_por_estrategia: dict | None = None) -> html.Div:
+    """Bloco único "Confiabilidade por Estratégia" — fusão do antigo "Score
+    de Confiabilidade" com o breakdown "Por Estratégia" (pedido do Jesué em
+    2026-07-30: "junte o score de confiabilidade e a seção 'Por Estratégia'
+    no mesmo bloco"), agora como `dag.AgGrid` real (item F, Fase 2.6):
+    sort/filter/resize de coluna nativos do componente (clique no
+    cabeçalho ordena, sem callback Python nenhuma pra isso), clique numa
+    linha abre o detalhe abaixo do grid (`atualizar_detalhe_estrategia_grid`).
+
+    Eram dois painéis lendo VOCABULÁRIOS diferentes — o score varria a lista
+    de bootstrap congelada no código e o breakdown varria o cadastro
+    editável — então mostravam nomes diferentes para os mesmos trades. Ver
+    `dt._tags_para_pontuar` para a correção da causa raiz."""
+    saldos_por_estrategia = saldos_por_estrategia or {}
+    linhas = _linhas_grid_confiabilidade(scores, saldos_por_estrategia)
+
+    grid = dag.AgGrid(
+        id='grid-confiabilidade-estrategia',
+        rowData=linhas,
+        # 2026-08-02: `getRowId` foi tentado aqui e REVERTIDO — mesmo
+        # problema do bug irmão em `_grid_historico`/diario_app_
+        # classico.py (o Jesué pegou ao vivo: "aparece apenas um trade
+        # na grade" no Histórico). `params.data.tag` avaliava sempre pra
+        # `undefined` dentro do `getRowId` por uma razão ainda não
+        # identificada, colapsando todas as linhas pro mesmo id. Causa
+        # raiz do clique resolvida sem getRowId — ver
+        # `atualizar_detalhe_estrategia_grid` (usa `rowIndex` + `State`
+        # do `rowData`).
+        columnDefs=[
+            {'field': 'tag', 'hide': True},
+            {'field': 'nome', 'headerName': 'Estratégia', 'sortable': True, 'filter': True, 'flex': 2},
+            {'field': 'categoria', 'headerName': 'Categoria', 'sortable': True, 'filter': True},
+            {'field': 'n', 'headerName': 'N', 'sortable': True, 'filter': True, 'maxWidth': 90},
+            {'field': 'saldo', 'headerName': 'Saldo', 'sortable': True, 'filter': True,
+             'valueFormatter': {'function': "params.data.saldo_label"}, 'cellStyle': _CELL_STYLE_SALDO},
+            {'field': 'taxa_acerto', 'headerName': 'Taxa Acerto', 'sortable': True, 'filter': True},
+            {'field': 'payoff', 'headerName': 'Payoff', 'sortable': True, 'filter': True},
+            {'field': 'profit_factor', 'headerName': 'Fator de Lucro', 'sortable': True, 'filter': True},
+            {'field': 'score', 'headerName': 'Score', 'sortable': True, 'filter': True,
+             'valueFormatter': {'function': "params.data.score_label"}, 'cellStyle': _CELL_STYLE_SCORE},
+        ],
+        defaultColDef={'resizable': True, 'sortable': True, 'flex': 1},
+        # 2026-08-02, causa raiz REAL do bug irmão em
+        # `_grid_historico`/diario_app_classico.py, achada clicando de
+        # verdade no Chrome real: o `cellClicked` desta versão do
+        # dash-ag-grid nunca inclui `data`, só rowId/rowIndex/colId/value
+        # — `atualizar_detalhe_estrategia_grid` sempre caiu no `no_update`
+        # silenciosamente. `getRowId` (acima, prop de nível superior) =
+        # `tag` (estável, é a mesma coluna oculta que já identificava a
+        # linha).
+        dashGridOptions={'domLayout': 'autoHeight', 'animateRows': True},
+        columnSize='responsiveSizeToFit',
+        className='ag-theme-alpine',
+        style={'width': '100%'},
+    )
+    return html.Div([
+        dmc.Text('Só trades reais (o simulador não entra). Clique numa coluna pra ordenar/filtrar; '
+                 'clique numa linha pra ver o detalhe do setup.', size='xs', c='dimmed', mb='sm'),
+        grid,
+        html.Div(id='diario-detalhe-estrategia-selecionada', style={'marginTop': '12px'}),
+    ])
+
+
+def _grupo_cards_estatistica(titulo: str, cards: list, crescer: bool = False) -> html.Div:
+    """Um grupo rotulado de cards (2026-07-30, feedback: "está meio bagunçado,
+    aleatório. Agrupe as quantidades de operações, taxas e valores em blocos
+    diferentes") — antes os 15 cards eram uma única fileira sem nenhuma
+    ordem lógica visível (contagem, R$ e % intercalados). Agora cada grupo
+    tem seu próprio rótulo e uma borda mais sutil que a dos cards
+    individuais, só pra indicar "isto pertence junto".
+
+    `crescer=True` (2026-07-31, feedback: "redimensionar os blocos pra
+    tirar os espaços vazios" — o grupo "Taxas" com só 2 cards ficava bem
+    mais estreito que "Quantidade" ao lado, sobrando um vão vazio até a
+    borda direita do container) — faz o grupo crescer (`flex: 1`) pra
+    preencher o espaço que sobra na linha, e os cards dentro dele (já
+    `flex: 1` em `_card_estatistica`) se espalham por essa largura extra
+    em vez de ficarem colados à esquerda."""
+    return html.Div([
+        html.Div(titulo, style={'fontSize': '12px', 'color': C['text2'], 'fontFamily': FONTS['body'],
+                                 'fontWeight': '600', 'marginBottom': '10px'}),
+        html.Div(cards, style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
+    ], style={'padding': '12px', 'borderRadius': TZ_RAIO_CARD, 'background': 'rgba(128,128,128,0.05)',
+              **({'flex': '1', 'minWidth': '240px'} if crescer else {})})
+
+
+def _cards_detalhe_estatisticas(stats: dict, tema: str = 'light',
+                                  ano: int | None = None, mes: int | None = None) -> html.Div:
+    """Grupos Quantidade/Taxas/Valores (nome antigo: `_cards_estatisticas`) —
+    demovidos pra bloco secundário "Detalhes" quando o header estilo
+    TradeZella (`_cards_header_tradezella`) entrou (item F, fase 2,
+    2026-07-30). Nenhum dado foi descartado: Wins/Losses/Breakeven/
+    Sequências/Max Gain-Loss/Drawdown/Ganho-Perda Total continuam aqui,
+    só não fazem mais parte do header principal.
+
+    `ano`/`mes` (2026-07-31) seguem o MESMO recorte de período já usado
+    em `stats` (calendário) — passados adiante pra
+    `dt.evolucao_metricas_expandida` pra sparkline e número grande sempre
+    falarem do mesmo período."""
+    evolucao = dt.evolucao_metricas_expandida(ano=ano, mes=mes)
+    payoff_str = f"{stats['payoff']:.2f}" if stats['payoff'] is not None else '—'
+    grupo_quantidade = _grupo_cards_estatistica('Quantidade', [
+        _card_estatistica('Operações', str(stats['num_operacoes'])),
+        _card_estatistica('Wins', str(stats['n_win']), cor=C['green']),
+        _card_estatistica('Losses', str(stats['n_loss']), cor=C['red']),
+        _card_estatistica('Breakeven', str(stats['n_breakeven'])),
+        _card_estatistica('Seq. Wins', str(stats['maior_sequencia_win'])),
+        _card_estatistica('Seq. Losses', str(stats['maior_sequencia_loss'])),
+    ])
+    # Taxa de Acerto já aparece no card do header (`_cards_header_tradezella`)
+    # — removida daqui pra não duplicar (2026-07-31, feedback do Jesué).
+    # Payoff/Fator de Recuperação ganham sparkline + variação % (2026-07-31,
+    # pedido: "esse mini gráfico, e a setinha... adicione nas taxas").
+    fator_recuperacao = stats['fator_recuperacao']
+    grupo_taxas = _grupo_cards_estatistica('Taxas', [
+        _card_com_sparkline('Payoff', payoff_str, evolucao['payoff'], tema),
+        _card_com_sparkline('Fator de Recuperação',
+                             f"{fator_recuperacao:.2f}" if fator_recuperacao is not None else '—',
+                             evolucao['fator_recuperacao'], tema,
+                             cor_valor=('green' if (fator_recuperacao or 0) >= 1
+                                        else ('red' if fator_recuperacao is not None else None))),
+    ], crescer=True)
+    # Saldo Total removido (2026-07-31, feedback: "remova o Saldo Total dos
+    # Detalhes - é a mesma informação repetida" — já é o card "Saldo
+    # Líquido" do header). Expectativa também sai daqui: vira card
+    # PRÓPRIO em destaque logo abaixo (mesmo feedback: "quero dar mais
+    # destaque para a expectativa, é um dos principais indicadores").
+    grupo_valores = _grupo_cards_estatistica('Valores (R$)', [
+        # Ganho Total/Perda Total (2026-07-30, feedback: "está faltando") —
+        # soma de todos os vencedores/perdedores, ao lado de Max Gain/Max Loss
+        # (melhor/pior trade ÚNICO) pra não confundir os dois.
+        _card_estatistica('Ganho Total', f"R$ {stats['ganho_total']:+.2f}", cor=C['green']),
+        _card_estatistica('Perda Total', f"R$ {stats['perda_total']:+.2f}", cor=C['red']),
+        _card_estatistica('Max Gain', f"R$ {stats['max_gain']:+.2f}", cor=C['green']),
+        _card_estatistica('Max Loss', f"R$ {stats['max_loss']:+.2f}", cor=C['red']),
+        _card_estatistica('Drawdown Máx.', f"R$ {stats['drawdown_maximo_reais']:+.2f}",
+                           cor=C['red'] if stats['drawdown_maximo_reais'] < 0 else None),
+    ], crescer=True)
+    card_expectativa = _card_expectativa_destaque(evolucao['expectativa'], tema)
+    return html.Div([
+        card_expectativa,
+        html.Div([grupo_quantidade, grupo_taxas],
+                  style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginTop': '12px'}),
+        html.Div([grupo_valores], style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginTop': '12px'}),
+    ], style={'marginBottom': '16px'})
+
+
+_TOGGLE_LARGURA = 42
+
+
+_TOGGLE_ALTURA = 22
+
+
+_TOGGLE_BOLINHA = 18
+
+
+_TOGGLE_MARGEM = 2
+
+
+def _estilo_toggle_trilho(ativo: bool) -> dict:
+    """Trilho do toggle switch 'Ano Inteiro' (feedback 2026-07-12: pediu o
+    visual padrão de toggle switch de app — trilho arredondado + bolinha
+    deslizante — no lugar do botão retangular antigo. Só no clássico: no
+    SQ'98 esse visual destoaria do bisel Win98, mantido como botão."""
+    return {
+        'position': 'relative', 'width': f'{_TOGGLE_LARGURA}px', 'height': f'{_TOGGLE_ALTURA}px',
+        'borderRadius': f'{_TOGGLE_ALTURA // 2}px', 'border': 'none', 'padding': '0',
+        'cursor': 'pointer', 'flexShrink': '0',
+        # C['border'] (#1C1C28) é quase invisível contra o fundo escuro pra
+        # servir de trilho "desligado" — tom intermediário só pra esse uso.
+        'background': C['green'] if ativo else '#3A3A48',
+        'transition': 'background-color 0.2s ease',
+    }
+
+
+def _estilo_toggle_bolinha(ativo: bool) -> dict:
+    deslocamento = _TOGGLE_LARGURA - _TOGGLE_BOLINHA - _TOGGLE_MARGEM if ativo else _TOGGLE_MARGEM
+    return {
+        'position': 'absolute', 'top': f'{_TOGGLE_MARGEM}px', 'left': f'{deslocamento}px',
+        'width': f'{_TOGGLE_BOLINHA}px', 'height': f'{_TOGGLE_BOLINHA}px', 'borderRadius': '50%',
+        'background': '#FFFFFF', 'boxShadow': '0 1px 3px rgba(0,0,0,0.4)',
+        'transition': 'left 0.2s ease',
+    }
+
+
+def _cards_ou_vazio_estatisticas(stats: dict, tema: str = 'light',
+                                   ano: int | None = None, mes: int | None = None) -> html.Div:
+    """2026-08-02, correção do Jesué: um período real sem trades (ex: mês
+    corrente ainda em andamento) mostrava só a frase "Nenhum trade real
+    neste período" no lugar dos cards — "acredito que os blocos tenham
+    que ser carregados, mesmo com valores zerados. Senão fica parecendo um
+    bug." `calcular_estatisticas` já devolve um dict `vazio` seguro (todo
+    campo numérico em 0/None, nunca NaN/divisão por zero — ver o dict
+    `vazio` lá) especificamente pra isso; `_cards_header_tradezella`/
+    `_cards_detalhe_estatisticas` já toleram `num_operacoes == 0` (guardas
+    explícitos nos RingProgress/payoff/profit_factor). O aviso de "nenhum
+    trade" continua aparecendo — só que ACIMA dos cards zerados, não no
+    lugar deles (ver `atualizar_periodo_estatisticas`, que já emite esse
+    aviso separadamente via `Output('...', 'children')` do título)."""
+    return html.Div([
+        _cards_header_tradezella(stats, tema),
+        _bloco_tradezella('Detalhes', _cards_detalhe_estatisticas(stats, tema, ano=ano, mes=mes)),
+    ])
+
+
+def _resto_periodo_estatisticas(stats: dict, tema: str = 'light') -> html.Div:
+    """Evolução de saldo do período — a parte do painel de Estatísticas que
+    pode ser livremente recriada a cada troca de mês/ano (nenhum desses
+    componentes guarda estado de clique). O calendário em si (grade +
+    botões) NÃO mora aqui — ver o comentário em `_construir_diario_
+    estatisticas` pro porquê.
+
+    Por Ativo/Janela/Sala/Tags Setup-Erro NÃO moram mais aqui (2026-07-30,
+    "upgrade diario.docx": "junte os blocos... num painel de dashboard
+    estatístico") — migraram pra dentro de "Análise de Estratégia"
+    (`_bloco_analise_estrategia`), junto de "Confiabilidade por Estratégia".
+    Antes eram sensíveis ao período (mês/ano selecionado); agora são
+    ALL-TIME, consistentes com o resto daquele painel — só a Evolução de
+    Saldo continua reagindo ao seletor de período."""
+    return html.Div([
+        _bloco_tradezella('Evolução de Saldo', dcc.Graph(
+            figure=_grafico_evolucao_saldo(stats, tema), config={'displayModeBar': False, 'responsive': True},
+            style={'width': '100%'},
+        )),
+    ])
+
+
+def _bloco_status_badges() -> html.Div:
+    """Reconciliação MT5 (agora em background) e resumo de Aderência aos Traçados
+    (agora enriquece o Histórico) — ver diario_app_98.py::
+    _bloco_status_badges_98 pro mesmo raciocínio."""
+    resumo_rec = dt.resumo_reconciliacao()
+    if resumo_rec is None:
+        badge_rec = html.Span('Reconciliação: aguardando o 1º ciclo em background (a cada 5min).',
+                               style={'color': C['text2']})
+    else:
+        problemas = (resumo_rec['divergente'] + resumo_rec['sem_correspondencia_mt5']
+                     + resumo_rec['sem_correspondencia_diario'])
+        if problemas == 0:
+            badge_rec = html.Span(
+                ['Reconciliação MT5: ', *_texto_com_icone('tabler:check', f"{resumo_rec['ok']} trade(s) OK (últimos 30 dias).")],
+                style={'color': C['green'], 'display': 'inline-flex', 'alignItems': 'center', 'gap': '2px'})
+        else:
+            badge_rec = html.Span(
+                ['Reconciliação MT5: ', *_texto_com_icone('tabler:alert-triangle',
+                    f"{problemas} pendência(s) nos últimos 30 dias "
+                    f"({resumo_rec['divergente']} divergente(s), {resumo_rec['sem_correspondencia_mt5']} sem execução MT5, "
+                    f"{resumo_rec['sem_correspondencia_diario']} sem registro no diário).")],
+                style={'color': C['gold'], 'display': 'inline-flex', 'alignItems': 'center', 'gap': '2px'})
+
+    resumo_ader = dt.avaliar_aderencia_tracados()
+    if resumo_ader.empty:
+        badge_ader = html.Span(
+            'Aderência aos Traçados: sem trades avaliáveis ainda (precisa de nível S/R referenciado + snapshot de mercado).',
+            style={'color': C['text2']})
+    else:
+        total = len(resumo_ader)
+        precisos = int((resumo_ader['classificacao'] == 'visto_preciso').sum())
+        badge_ader = html.Span(f"Aderência aos Traçados: {precisos}/{total} trade(s) vistos com precisão pelo motor "
+                                f"(ver coluna no Histórico).", style={'color': C['text']})
+
+    return _bloco_tradezella('Status', html.Div([
+        html.Div(badge_rec, style={'fontSize': '12px', 'marginBottom': '4px'}),
+        html.Div(badge_ader, style={'fontSize': '12px'}),
+    ]))
+
+
+def _opacidade_progress_tracker(n: int) -> float:
+    """Bucket de intensidade do Progress Tracker — 0 trades = célula vazia,
+    escala até 1.0 (calibrado contra o limiar de overtrading já documentado
+    no estudo de estratégias vencedoras: 5+ trades/dia é o ponto onde os
+    dias começam a virar prejuízo)."""
+    if n <= 0:
+        return 0.0
+    if n <= 2:
+        return 0.25
+    if n <= 4:
+        return 0.5
+    if n <= 6:
+        return 0.75
+    return 1.0
+
+
+def _bloco_progress_tracker(por_dia: dict, tema: str = 'light') -> dmc.Card:
+    """Progress Tracker (item F, fase 7, `spec_redesenho_tradezella.md`) —
+    heatmap estilo GitHub contribution graph, últimas 52 semanas terminando
+    hoje. Intensidade = Nº de trades operados naquele dia (decisão do
+    Jesué, 2026-07-30: "analise o padrão do TradeZella e implemente da
+    mesma forma" — usa `por_dia['n']`, que já existe em
+    `calcular_estatisticas`, em vez de inventar uma leitura de disciplina/
+    aderência sem regra formal cadastrada — mesma cautela já documentada em
+    `calcular_score_confiabilidade`)."""
+    p = PALETA_GAUGE.get(tema, PALETA_GAUGE['light'])
+    hoje = date.today()
+    # Python: segunda=0..domingo=6 -> aqui queremos domingo=0..sábado=6
+    # (primeiro dia da semana = domingo, mesma convenção do resto do Diário).
+    indice_domingo = (hoje.weekday() + 1) % 7
+    domingo_atual = hoje - timedelta(days=indice_domingo)
+    n_semanas = 52
+    domingo_inicio = domingo_atual - timedelta(weeks=n_semanas - 1)
+
+    def _cor_celula(n: int) -> str:
+        op = _opacidade_progress_tracker(n)
+        return _hex_para_rgba(p['green'], op) if op > 0 else 'rgba(128,128,128,0.08)'
+
+    colunas_semana, rotulos_mes = [], []
+    mes_ja_rotulado = None
+    for semana in range(n_semanas):
+        domingo_semana = domingo_inicio + timedelta(weeks=semana)
+        celulas = []
+        rotulo_mes = ''
+        for offset in range(7):
+            dia = domingo_semana + timedelta(days=offset)
+            if dia > hoje:
+                celulas.append(html.Div(style={'width': '11px', 'height': '11px'}))
+                continue
+            n = por_dia.get(dia.isoformat(), {}).get('n', 0)
+            celulas.append(html.Div(title=f"{dia.strftime('%d/%m/%Y')}: {n} trade(s)", style={
+                'width': '11px', 'height': '11px', 'borderRadius': '2px', 'background': _cor_celula(n),
+            }))
+            if dia.day <= 7 and dia.month != mes_ja_rotulado:
+                rotulo_mes = _NOMES_MES[dia.month][:3]
+                mes_ja_rotulado = dia.month
+        rotulos_mes.append(rotulo_mes)
+        colunas_semana.append(html.Div(celulas, style={'display': 'flex', 'flexDirection': 'column', 'gap': '2px'}))
+
+    linha_meses = html.Div([
+        html.Div(rotulo, style={'width': '11px', 'fontSize': '9px', 'color': p['text2'], 'flexShrink': '0'})
+        for rotulo in rotulos_mes
+    ], style={'display': 'flex', 'gap': '2px', 'marginBottom': '4px'})
+
+    legenda = html.Div([
+        html.Span('Menos', style={'fontSize': '10px', 'color': p['text2'], 'marginRight': '6px'}),
+        *[html.Div(style={'width': '11px', 'height': '11px', 'borderRadius': '2px', 'marginRight': '3px',
+                           'background': (_hex_para_rgba(p['green'], op) if op > 0 else 'rgba(128,128,128,0.08)')})
+          for op in (0.0, 0.25, 0.5, 0.75, 1.0)],
+        html.Span('Mais', style={'fontSize': '10px', 'color': p['text2'], 'marginLeft': '3px'}),
+    ], style={'display': 'flex', 'alignItems': 'center', 'marginTop': '8px'})
+
+    return dmc.Card([
+        dmc.Text('Progress Tracker', size='sm', fw=600, mb='sm'),
+        html.Div([linha_meses, html.Div(colunas_semana, style={'display': 'flex', 'gap': '2px'})],
+                  style={'overflowX': 'auto', 'paddingBottom': '4px'}),
+        legenda,
+        _bloco_o_que_fazer(
+            'Cada célula é um dia — quanto mais escura, mais trades reais você operou nele. '
+            'Últimas 52 semanas até hoje.',
+            dt.feedback_progress_tracker(por_dia)),
+    ], withBorder=True, shadow='sm', radius='lg', p='lg', mb='md', className='tz-card', w='100%')
+
+
+def _construir_diario_estatisticas(stats_geral: dict, scores: dict, tema: str = 'light') -> html.Div:
+    """Shell montado 1x por ativação da aba — ver
+    `diario_app_98.py::_construir_diario98_estatisticas` pro raciocínio
+    completo (mesma estrutura, só a casca visual muda).
+
+    Os botões de navegação do calendário (◀/▶/"Ver Ano Inteiro") moram AQUI,
+    criados uma única vez, e NÃO dentro de `diario-periodo-conteudo`/
+    `diario-resto-periodo-conteudo` (que `atualizar_periodo_estatisticas`
+    reconstrói a cada troca de mês/ano/toggle). Causa raiz do bug relatado
+    em 2026-07-12 (calendário pulando pra mês/ano aparentemente aleatório e
+    o toggle "Ano Corrente" às vezes não fazendo nada): um `html.Button`
+    recriado do zero nasce com `n_clicks=0`, e como esse prop é Input do
+    callback de navegação, o Dash detectava essa queda pra 0 como "mais um
+    clique" e disparava a navegação sozinha — cada clique real gerava 0-2
+    cliques fantasmas extras, em direção imprevisível pro usuário. Com os
+    botões fixos aqui e só `children`/`style` atualizados por callback
+    (nunca o componente inteiro), `n_clicks` nunca mais reseta."""
+    if stats_geral['num_operacoes'] == 0:
+        return _placeholder_aba('Estatísticas (nenhum trade real lançado ainda)')
+
+    hoje = date.today()
+    mes_inicial = f"{hoje.year:04d}-{hoje.month:02d}"
+    # ActionIcon circular com ícone Tabler — correção 2026-08-01 (glifos
+    # Unicode ◀▶ como ícone de botão liam como "site velho dos anos 2000",
+    # ver spec_redesenho_tradezella.md seção "Regra permanente").
+    def _botao_cal_nav(icone, id_botao):
+        return dmc.ActionIcon(DashIconify(icon=icone, width=16), id=id_botao, n_clicks=0,
+                               variant='subtle', color='gray', radius='xl', size='md')
+    return html.Div([
+        dcc.Store(id='diario-calendario-mes', data=mes_inicial),
+        dcc.Store(id='diario-modo-ano', data=False),
+        # Stats configuráveis por dia no calendário (item F, fase 4) —
+        # persiste entre sessões (mesmo padrão de `store-tema`), já que é
+        # preferência de exibição, não estado de navegação.
+        dcc.Store(id='store-calendario-stats-visiveis', data=_STATS_CALENDARIO_PADRAO, storage_type='local'),
+
+        html.Div(id='diario-cards-conteudo'),
+
+        # Composição assimétrica real (item F, Fase 2.6 — `dmc.Grid`, não
+        # mais uma pilha vertical de blocos full-width): coluna estreita à
+        # esquerda (Evolução de Saldo, Anticovardia Score, Progress
+        # Tracker, Desempenho por Duração — todos empilhados), coluna
+        # larga à direita (Calendário + Trades Recentes) — mesma
+        # composição do Dashboard real do TradeZella (`image1.png` do docx
+        # de referência). UM ÚNICO grid (2026-07-31, feedback recorrente
+        # de "espaço vazio"): tentativas anteriores usavam grids
+        # SEPARADOS pra cada par de blocos (Evolução+Score / Calendário,
+        # depois Progress Tracker / Trades Recentes) — cada par forçado a
+        # bater altura exata sempre sobrava vão (esticando o menor, se
+        # `align='stretch'`, ou deixando fundo vazio abaixo dele, se
+        # `align='flex-start'`). Empilhar TUDO relacionado numa coluna só
+        # deixa as duas colunas fluírem em alturas totais parecidas — sem
+        # forçar par a par — e ainda aproveita o conteúdo real (Progress
+        # Tracker, Duração da Operação) pra preencher a coluna esquerda em
+        # vez de forçá-la a esticar vazia. O resto do conteúdo exclusivo
+        # do Super Quant (Vencedora/Perdedora, Melhor por X, breakdowns,
+        # Confiabilidade, Mentor de IA) continua existindo, só que ABAIXO
+        # deste grid — decisão do Jesué: "mantenha o que já temos,
+        # adicione o que o TradeZella agrega".
+        dmc.Grid([
+            dmc.GridCol([
+                html.Div(id='diario-resto-periodo-conteudo'),
+                _bloco_anticovardia_score(tema),
+                _bloco_discipline_score(tema),
+                _bloco_duracao_performance(tema),
+            ], span={'base': 12, 'md': 5}),
+            dmc.GridCol(
+                html.Div([_bloco_tradezella('Calendário', html.Div([
+                    html.Div([
+                        html.Div([
+                            _botao_cal_nav('tabler:chevron-left', 'btn-diario-cal-mes-prev'),
+                            html.Span(_NOMES_MES[hoje.month], id='diario-calendario-label-mes', style={
+                                'margin': '0 8px', 'fontSize': '12px', 'fontFamily': FONTS['display'],
+                                'fontWeight': '700',
+                            }),
+                            _botao_cal_nav('tabler:chevron-right', 'btn-diario-cal-mes-next'),
+                        ], style={'display': 'flex', 'alignItems': 'center', 'marginRight': '16px'}),
+                        html.Div([
+                            _botao_cal_nav('tabler:chevron-left', 'btn-diario-cal-ano-prev'),
+                            html.Span(str(hoje.year), id='diario-calendario-label-ano', style={
+                                'margin': '0 8px', 'fontSize': '12px', 'fontFamily': FONTS['display'],
+                                'fontWeight': '700',
+                            }),
+                            _botao_cal_nav('tabler:chevron-right', 'btn-diario-cal-ano-next'),
+                        ], style={'display': 'flex', 'alignItems': 'center'}),
+                        html.Span('Ano Inteiro', style={
+                            'marginLeft': 'auto', 'marginRight': '8px', 'fontSize': '11px', 'color': C['text2'],
+                            'fontFamily': FONTS['display'],
+                        }),
+                        html.Button(html.Div(id='diario-modo-ano-bolinha', style=_estilo_toggle_bolinha(False)),
+                                    id='btn-diario-modo-ano', n_clicks=0, style=_estilo_toggle_trilho(False)),
+                        # Config de stats por dia (item F, fase 4) — botão
+                        # estático (mesmo raciocínio de `btn-diario-
+                        # checklist`: nunca recriado pela própria callback,
+                        # só o `children` do painel abaixo muda) que
+                        # abre/fecha um `dcc.Checklist`.
+                        dmc.Button('Stats', id='btn-diario-cal-config', n_clicks=0,
+                                   leftSection=DashIconify(icon='tabler:adjustments-horizontal', width=14),
+                                   variant='subtle', color='gray', size='xs', ml='8px'),
+                    ], style={
+                        # `flexWrap`: 4 mês + ano viraram grupos separados
+                        # (feedback 2026-07-12) — a fileira ficou mais larga
+                        # que o botão único de antes e, sem wrap, estourava a
+                        # largura do iframe do Diário (dashboard.py embute em
+                        # 100% de largura), forçando scroll horizontal que
+                        # por sua vez empurrava a página inteira a precisar
+                        # de scroll vertical também. Com wrap, em telas
+                        # estreitas o toggle só desce pra 2ª linha.
+                        'display': 'flex', 'flexWrap': 'wrap', 'alignItems': 'center',
+                        'rowGap': '8px', 'marginBottom': '8px',
+                    }),
+                    html.Div(id='diario-cal-config-conteudo'),
+                    html.Div(id='diario-calendario-grid'),
+                ])),
+                # Trades Recentes (item F, 2026-07-31 — "você não está
+                # mostrando o bloco de trades recentes no dashboard, como
+                # é no TradeZella") + Progress Tracker (item F, fase 7)
+                # empilhados logo abaixo do Calendário nesta MESMA coluna
+                # direita — sempre ALL-TIME (não filtra por período do
+                # calendário acima), mesma convenção de `stats_geral`/
+                # `scores` abaixo. Progress Tracker fica nesta coluna (não
+                # na esquerda, com Duração da Operação) pra equilibrar a
+                # altura total das duas colunas — verificado ao vivo via
+                # `getBoundingClientRect`: as duas fecham a 31px uma da
+                # outra nesta combinação, contra ~586px quando os dois
+                # ficavam juntos na esquerda.
+                _bloco_trades_recentes(tema),
+                _bloco_progress_tracker(stats_geral['por_dia'], tema),
+                ]), span={'base': 12, 'md': 7},
+            ),
+        ], gutter='md', mb='md', align='flex-start'),
+
+        # `stats_geral` é o SEM filtro de período (ver a chamada em
+        # `montar_sub_aba_diario`), igual ao `scores` — os dois lados da
+        # tabela fundida precisam falar do mesmo recorte.
+        #
+        # "Análise de Estratégia" (2026-07-30) fica ACIMA de "Confiabilidade
+        # por Estratégia", pedido explícito do docx — os dois são ALL-TIME,
+        # mesmo recorte (stats_geral/scores computados 1x na entrada da aba).
+        _bloco_tradezella('Análise de Estratégia', _bloco_analise_estrategia(stats_geral, tema)),
+        _bloco_tradezella('Confiabilidade por Estratégia',
+                          _tabela_score_confiabilidade(scores, stats_geral['por_estrategia'])),
+
+        _bloco_status_badges(),
+    ])
+
+
+def _detalhe_estrategia_expandido(tag: str) -> html.Div:
+    """Conteúdo da linha expandida — ver `dt.detalhe_estrategia` (a conta
+    mora lá, compartilhada entre os 2 skins).
+
+    Visual em "mini dashboard" (2026-07-30, feedback: "no detalhamento da
+    estratégia ao clicar na seta, melhore a visualização, faça em formato
+    de blocos como se fosse um mini dashboard") — antes era uma fileira só
+    de 13 métricas soltas, sem agrupamento. Reaproveita a MESMA linguagem
+    visual dos grupos rotulados criados pro topo de Estatísticas
+    (`_grupo_cards_estatistica`) em vez de inventar um estilo novo."""
+    d = dt.detalhe_estrategia(tag)
+    if not d['n']:
+        return html.Div('Sem trades reais neste setup.',
+                        style={'padding': '10px', 'fontSize': '11px', 'color': C['text2']})
+
+    def metrica(rotulo, valor, cor=None):
+        return _card_estatistica(rotulo, valor, cor=cor)
+
+    payoff = f"{d['payoff']:.2f}" if d['payoff'] is not None else '—'
+    grupo_resultado = _grupo_cards_estatistica('Resultado', [
+        metrica('Operações', str(d['n'])),
+        metrica('Saldo', f"R$ {d['saldo_total']:+.2f}", C['green'] if d['saldo_total'] > 0 else C['red']),
+        metrica('Wins', str(d['n_win']), C['green']),
+        metrica('Losses', str(d['n_loss']), C['red']),
+        metrica('Zero a zero', str(d['zero_a_zero'])),
+        metrica('Expectativa', f"R$ {d['expectativa']:+.2f}", C['green'] if d['expectativa'] > 0 else C['red']),
+    ])
+    grupo_qualidade = _grupo_cards_estatistica('Qualidade', [
+        metrica('Taxa de Acerto', f"{d['taxa_acerto'] * 100:.1f}%"),
+        metrica('Payoff', payoff),
+        metrica('Max Gain', f"R$ {d['max_gain']:+.2f}", C['green']),
+        metrica('Max Loss', f"R$ {d['max_loss']:+.2f}", C['red']),
+        metrica('Drawdown Máx.', f"R$ {d['drawdown_maximo_reais']:+.2f}", C['red']),
+        metrica('Seq. Wins', str(d['maior_sequencia_win'])),
+        metrica('Seq. Losses', str(d['maior_sequencia_loss'])),
+    ])
+    return html.Div([
+        html.Div([grupo_resultado, grupo_qualidade],
+                 style={'display': 'flex', 'gap': '12px', 'flexWrap': 'wrap', 'marginBottom': '12px'}),
+        html.Div([
+            _mini_recorte('Por direção', d['por_direcao']),
+            _mini_recorte('Por janela', d['por_janela']),
+            _mini_recorte('Por ativo', d['por_ativo']),
+        ], style={'display': 'flex', 'gap': '18px', 'flexWrap': 'wrap', 'marginBottom': '10px'}),
+        html.Div([
+            html.Span(f"Período: {d['primeiro']} a {d['ultimo']}", style={'marginRight': '16px'}),
+            html.Span(f"Melhor: #{d['melhor_trade']['id_trade']} "
+                      f"({d['melhor_trade']['ativo']}, R$ {d['melhor_trade']['saldo']:+.2f})",
+                      style={'marginRight': '16px', 'color': C['green']}),
+            html.Span(f"Pior: #{d['pior_trade']['id_trade']} "
+                      f"({d['pior_trade']['ativo']}, R$ {d['pior_trade']['saldo']:+.2f})",
+                      style={'color': C['red']}),
+        ], style={'fontSize': '11px', 'color': C['text2']}),
+    ], style={'padding': '12px 14px', 'background': C['bg'],
+              'borderLeft': f'2px solid {C["gold"]}', 'marginBottom': '6px'})
+
+
+def _mapa_categorias_estrategias() -> dict:
+    """slug -> rótulo da categoria (Tendência/Reversão/Lateralidade), ou '—'
+    quando não classificada. Usado pela coluna Categoria de "Confiabilidade
+    por Estratégia" (2026-07-30, feedback: "o bloco de estratégias não
+    mudou nada" — a categoria só aparecia na aba Estratégias, não onde o
+    Jesué de fato olha o desempenho)."""
+    df = dt.listar_estrategias(somente_ativas=False)
+    return {
+        l['slug']: dt.ROTULO_CATEGORIA_ESTRATEGIA.get(l.get('categoria'), '—')
+        for _, l in df.iterrows()
+    }
+
+
+def _mini_recorte(titulo: str, dados: dict) -> html.Div:
+    """Coluninha 'chave → n / saldo' usada dentro do detalhe expandido de
+    uma estratégia (por direção, por janela, por ativo)."""
+    if not dados:
+        return html.Div()
+    linhas = [
+        html.Div([
+            html.Span(str(k).replace('_', ' ').title(), style={'flex': '1', 'fontSize': '11px'}),
+            html.Span(str(v['n']), style={'width': '28px', 'textAlign': 'right',
+                                          'fontSize': '11px', 'fontFamily': FONTS['body']}),
+            html.Span(f"R$ {v['saldo']:+.0f}", style={
+                'width': '78px', 'textAlign': 'right', 'fontSize': '11px', 'fontFamily': FONTS['body'],
+                'color': C['green'] if v['saldo'] > 0 else (C['red'] if v['saldo'] < 0 else C['text2']),
+            }),
+        ], style={'display': 'flex', 'padding': '3px 0'})
+        for k, v in dados.items()
+    ]
+    return html.Div([
+        html.Div(titulo, style={'fontSize': '11px', 'color': C['text2'], 'marginBottom': '3px',
+                                'fontWeight': '600'}),
+        html.Div(linhas),
+    ], style={'flex': '1', 'minWidth': '190px'})
+
+
 app = dash.Dash(
     __name__,
     title='Super Quant — Anticovardia',
@@ -2034,7 +3933,7 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
 )
 
-app.layout = html.Div([
+app.layout = dmc.MantineProvider(id='mantine-provider-dashboard', defaultColorScheme='light', children=html.Div([
 
     # Google Fonts
     html.Link(rel='stylesheet',
@@ -2104,8 +4003,13 @@ app.layout = html.Div([
     # padrão de diario-overlay-detalhe em diario_app_classico.py).
     dcc.Store(id='store-tracado-editar'),
 
-    # Store da aba ativa do cabeçalho (QUANT LAB/BACKTESTING/DIÁRIO/CONFIGURAÇÕES)
-    dcc.Store(id='store-aba-ativa', data='lab'),
+    # Store da seção ativa do menu lateral (rollout TradeZella, 2026-07-31)
+    # — "Dashboard" (ex-Estatísticas) é a nova home/página inicial.
+    dcc.Store(id='store-aba-ativa', data='dashboard'),
+    # Menu retrátil (2026-07-31) — só a trilha de ícones fica visível
+    # quando True (painel de rótulos recolhido + `navbar` do AppShell
+    # encolhido, ver `alternar_menu_colapsado`).
+    dcc.Store(id='store-menu-colapsado', data=True),
 
     # Tema claro/escuro (2026-07-17) — `storage_type='local'` persiste no
     # localStorage do navegador, sobrevive a reload/restart do servidor.
@@ -2117,6 +4021,20 @@ app.layout = html.Div([
     # na carga inicial, não só depois do 1º clique da sessão).
     dcc.Store(id='store-tema', data='light', storage_type='local'),
     dcc.Store(id='store-tema-dummy'),
+
+    # Dummy Output da ponte de seção pro iframe do Diário (rollout
+    # TradeZella, 2026-07-31) — ver clientside_callback perto de
+    # `atualizar_painel_principal` e `assets/secao_diario.js`.
+    dcc.Store(id='store-secao-dummy'),
+    dcc.Store(id='store-hist-filtro-dummy'),
+
+    # Filtro de data do Histórico vindo do clique num dia do calendário do
+    # Dashboard (rollout TradeZella, 2026-07-31) — `clicar_dia_calendario`
+    # escreve aqui (não pode mais escrever direto em `diario-hist-filtro-
+    # data-calendario`, que agora mora no processo FILHO); um
+    # clientside_callback repassa por postMessage, ver `assets/
+    # secao_diario.js`.
+    dcc.Store(id='store-historico-filtro-data-calendario'),
 
     # Interval rápido — 1s: atualiza preço, candle atual, fluxo
     dcc.Interval(id='interval-live', interval=1_000, n_intervals=0),
@@ -2131,38 +4049,93 @@ app.layout = html.Div([
     dcc.Interval(id='interval-reconciliacao', interval=300_000, n_intervals=0),
 
     # =========================================================================
-    # CABEÇALHO — navegação em 4 abas
+    # MENU LATERAL (rollout TradeZella, 2026-07-31) — `dmc.AppShell` real,
+    # navbar de DUAS colunas (ver comentário de `_GRUPOS_MENU`): trilha de
+    # ícones fixa (`rail-{grupo}`, sempre visível) + painel de rótulos
+    # (`menu-painel-labels`, só os `dmc.NavLink` do grupo ativo aparecem,
+    # os outros ficam `display:none` — nunca desmontados). `btn-menu-
+    # colapsar` (☰) recolhe o painel inteiro E encolhe o `navbar` do
+    # próprio `dmc.AppShell` (Output direto no prop `navbar`, não só CSS)
+    # pra sobrar só a trilha, o "retrátil" pedido. Mesma disciplina de
+    # sempre: nenhum elemento clicável é recriado, só `active`/`style`
+    # mudam via callback (`atualizar_menu_ativo`/`alternar_menu_colapsado`).
+    dmc.AppShell([
+        dmc.AppShellHeader(
+            html.Div([
+                html.Span('SUPER QUANT', style={
+                    'fontSize': '15px', 'fontWeight': '700',
+                    'fontFamily': FONTS['display'], 'color': C['gold'],
+                    'letterSpacing': '0.1em',
+                }),
+                html.Span(' · ANTICOVARDIA', style={
+                    'fontSize': '11px', 'color': C['text2'],
+                    'fontFamily': FONTS['display'],
+                }),
+            ], style={'display': 'flex', 'alignItems': 'center', 'height': '100%', 'padding': '0 20px'}),
+        ),
+        dmc.AppShellNavbar(
+            html.Div([
+                # TRILHA — ícones fixos, um por grupo, sempre visíveis
+                # mesmo com o painel de rótulos recolhido.
+                html.Div([
+                    html.Button(DashIconify(icon='tabler:menu-2', width=20),
+                                id='btn-menu-colapsar', n_clicks=0, title='Recolher/expandir menu', style={
+                        'width': '38px', 'height': '32px', 'border': 'none',
+                        'background': 'transparent', 'color': C['text2'], 'cursor': 'pointer',
+                        'marginBottom': '8px', 'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center',
+                    }),
+                    *[html.Button(DashIconify(icon=icone, width=20), id=f'rail-{grupo}', n_clicks=0, title=nome,
+                                  style=_estilo_rail_botao(grupo == 'dashboard'))
+                      for grupo, nome, icone, _ in _GRUPOS_MENU],
+                ], style={
+                    'width': '52px', 'flexShrink': 0, 'display': 'flex', 'flexDirection': 'column',
+                    'alignItems': 'center', 'gap': '4px', 'paddingTop': '4px',
+                    'borderRight': f'1px solid {C["border"]}',
+                }),
+                # PAINEL DE RÓTULOS — só os itens do grupo ativo aparecem
+                # (os demais NavLink existem sempre, só com display:none —
+                # ver `atualizar_menu_ativo`). Recolhido POR PADRÃO (feedback
+                # do Jesué: "o menu deve iniciar no modo retraído, e ao
+                # expandir deve mostrar todos os itens") — só a trilha
+                # aparece até o usuário clicar em ☰. `alternar_menu_
+                # colapsado` troca este estilo E o `navbar` do AppShell.
+                html.Div([
+                    dmc.NavLink(label=_ROTULOS_SECAO[secao], leftSection=DashIconify(icon=_ICONES_SECAO[secao], width=18),
+                                id=f'tab-{secao}', n_clicks=0, active=(secao == 'dashboard'), variant='light',
+                                style={} if secao == 'dashboard' else {'display': 'none'})
+                    for secao in _TODAS_SECOES
+                ], id='menu-painel-labels', style={'display': 'none'}),
+            ], style={'display': 'flex', 'height': '100%'}),
+            p=0,
+        ),
+        dmc.AppShellMain(
     # =========================================================================
-    html.Div([
-        html.Div([
-            html.Span('SUPER QUANT', style={
-                'fontSize': '15px', 'fontWeight': '700',
-                'fontFamily': FONTS['display'], 'color': C['gold'],
-                'letterSpacing': '0.1em',
-            }),
-            html.Span(' · ANTICOVARDIA', style={
-                'fontSize': '11px', 'color': C['text2'],
-                'fontFamily': FONTS['display'],
-            }),
-        ]),
-        html.Div([
-            *[html.Button(label, id=f'tab-{key}', n_clicks=0,
-                          style=_estilo_aba(key, 'lab'))
-              for label, key in [
-                ('QUANT LAB', 'lab'),
-                ('BACKTESTING', 'back'),
-                ('DIÁRIO', 'diary'),
-                ('CONFIGURAÇÕES', 'config'),
-            ]],
-        ], style={'display': 'flex', 'gap': '4px'}),
+    # CONTEÚDO PRINCIPAL
+    # =========================================================================
+    html.Div(id='conteudo-principal', children=[
 
-        # Status de conexão fixo no cabeçalho
+      # DASHBOARD (ex-Estatísticas do Diário) — nova página inicial
+      # (rollout TradeZella, 2026-07-31: "Tire a aba Estatísticas de dentro
+      # do Diário, e torne-o a página inicial do Dashboard"). Casca estática
+      # construída 1x aqui (mesmo padrão do Hero/Quant Lab abaixo) — os
+      # botões de navegação do calendário moram dentro dela, nunca
+      # recriados; `atualizar_periodo_estatisticas` só troca `children`/
+      # `style` de placeholders internos.
+      html.Div(id='painel-dashboard', children=[
+          _construir_diario_estatisticas(dt.calcular_estatisticas(), dt.calcular_score_confiabilidade(), 'light'),
+      ]),
+
+      html.Div(id='painel-quantlab', style={'display': 'none'}, children=[
+
+        # Seletor WIN / WDO + status de conexão/contrato/atualização — só
+        # fazem sentido dentro do Quant Lab agora (rollout TradeZella,
+        # 2026-07-31: "essas informações agora só fazem sentido dentro do
+        # Quant Lab"), não mais um cabeçalho global visível em qualquer
+        # aba. MESMOS ids de sempre (`atualizar_dashboard`, tick de 1s,
+        # não muda nada) — só a posição na árvore mudou. Estático, nunca
+        # recriado (só `style` muda via `atualizar_estilo_ativo_
+        # selecionado`) — ver docstring de `construir_hero`.
         html.Div([
-            # Seletor WIN / WDO — movido do hero pro cabeçalho em 2026-07-15
-            # (fica visível em qualquer aba, não só no Quant Lab). Estático,
-            # nunca recriado (só o `style` de cada botão muda, via callback
-            # dedicado `atualizar_estilo_ativo_selecionado`) — ver docstring
-            # de `construir_hero` sobre por que isso é obrigatório.
             html.Div([
                 html.Button('WIN', id='btn-win', n_clicks=0,
                             className='btn-ativo',
@@ -2170,7 +4143,7 @@ app.layout = html.Div([
                 html.Button('WDO', id='btn-wdo', n_clicks=0,
                             className='btn-ativo',
                             style=_estilo_botao_ativo('WDO', 'WIN')),
-            ], style={'display': 'flex', 'gap': '6px', 'justifyContent': 'flex-end', 'marginBottom': '6px'}),
+            ], style={'display': 'flex', 'gap': '6px', 'marginBottom': '6px'}),
             html.Span(id='status-conexao', children='Inicializando...',
                       style={'fontSize': '11px', 'color': C['text2'],
                              'fontFamily': FONTS['display']}),
@@ -2188,22 +4161,7 @@ app.layout = html.Div([
             # horários distorcem a leitura de S/R (ver CHANGELOG.md).
             html.Span(id='status-calendario', children='',
                       style={'fontSize': '10px', 'fontFamily': FONTS['display']}),
-        ], style={'textAlign': 'right'}),
-
-    ], style={
-        'display': 'flex', 'justifyContent': 'space-between',
-        'alignItems': 'center', 'padding': '12px 28px',
-        'borderBottom': f'1px solid {C["border"]}',
-        'background': C['panel'], 'position': 'sticky',
-        'top': '0', 'zIndex': '100',
-    }),
-
-    # =========================================================================
-    # CONTEÚDO PRINCIPAL
-    # =========================================================================
-    html.Div(id='conteudo-principal', children=[
-
-      html.Div(id='painel-quantlab', children=[
+        ], style={'marginBottom': '16px'}),
 
         # HERO
         html.Div([
@@ -2264,7 +4222,7 @@ app.layout = html.Div([
         html.Div([
             secao('PRICE ACTION'),
             html.Div([
-                html.Button('🖱 Cursor', id='btn-tracado-cursor',
+                html.Button([_icone('tabler:pointer', tamanho=13), ' Cursor'], id='btn-tracado-cursor',
                             className='tracado-tool-btn tracado-tool-ativa',
                             **{'data-tracado-tool': 'cursor'}),
                 html.Button('— Nível S/R', id='btn-tracado-horizontal',
@@ -2437,9 +4395,9 @@ app.layout = html.Div([
 
     ], style={
         'padding': '24px 28px',
-        'maxWidth': '1600px',
-        'margin': '0 auto',
     }),
+        ),
+    ], id='appshell-principal', header={'height': 60}, navbar={'width': 52, 'breakpoint': 'sm'}, padding=0),
 
     # =========================================================================
     # CHAT FLUTUANTE — Mentor IA (ícone no canto inferior direito)
@@ -2450,12 +4408,13 @@ app.layout = html.Div([
 
     # Botão flutuante
     html.Div([
-        html.Button('✦', id='btn-chat-toggle', n_clicks=0, style={
+        html.Button(_icone('tabler:sparkles', tamanho=26, cor=C['bg']), id='btn-chat-toggle', n_clicks=0, style={
             'width': '56px', 'height': '56px',
             'borderRadius': '50%',
             'background': f'linear-gradient(135deg, {C["gold"]}, #A07840)',
             'border': 'none', 'cursor': 'pointer',
-            'fontSize': '22px', 'color': C['bg'],
+            'display': 'flex', 'alignItems': 'center', 'justifyContent': 'center',
+            'color': C['bg'],
             'fontWeight': '700', 'boxShadow': '0 4px 20px rgba(200,169,110,0.4)',
             'transition': 'transform 0.2s',
         }),
@@ -2471,7 +4430,7 @@ app.layout = html.Div([
         # Header — altura fixa 52px
         html.Div([
             html.Div([
-                html.Span('✦ ', style={'color': C['gold']}),
+                html.Span(_icone('tabler:sparkles', tamanho=14, cor=C['gold']), style={'marginRight': '4px'}),
                 html.Span('MENTOR IA', style={
                     'fontSize': '13px', 'fontWeight': '700',
                     'fontFamily': FONTS['display'], 'color': C['text'],
@@ -2635,7 +4594,7 @@ app.layout = html.Div([
     'minHeight': '100vh',
     'color': C['text'],
     'fontFamily': FONTS['body'],
-})
+}))
 
 
 # =============================================================================
@@ -2873,6 +4832,18 @@ app.clientside_callback(
     Input('store-tema', 'data'),
 )
 
+# Ponte DMC (rollout TradeZella, 2026-07-31) — `dmc.MantineProvider` tem
+# sistema de tema PRÓPRIO (`forceColorScheme`), independente do `C`/CSS
+# vars já existente. Sem isso, componentes DMC (AppShell/NavLink/Card)
+# ficariam sempre no esquema default enquanto o resto da página troca por
+# CSS var — os dois sistemas precisam ouvir o MESMO `store-tema` (mesmo
+# padrão já usado em `diario_app_classico.py`).
+app.clientside_callback(
+    "function(tema) { return tema || 'light'; }",
+    Output('mantine-provider-dashboard', 'forceColorScheme'),
+    Input('store-tema', 'data'),
+)
+
 
 # Modo Aprendizagem (Fase 3.1, 2026-07-21) — DIFERENTE do tema: precisa de
 # round-trip de servidor de verdade (escreve em config_operacional.py, lido
@@ -2907,7 +4878,8 @@ def rodar_recalibracao_callback(n_clicks):
     try:
         aprendizagem.rodar_recalibracao()
     except Exception as e:
-        return html.Div(f'⚠ Erro ao recalibrar: {str(e)[:150]}', style={'fontSize': '12px', 'color': C['red']})
+        return html.Div(_texto_com_icone('tabler:alert-triangle', f'Erro ao recalibrar: {str(e)[:150]}'),
+                         style={'fontSize': '12px', 'color': C['red'], 'display': 'flex', 'alignItems': 'center', 'gap': '4px'})
     return _texto_log_recalibracao()
 
 @app.callback(
@@ -3172,13 +5144,14 @@ def criar_tracado_por_preco_callback(_n_clicks, preco, ativo):
     if not ativo:
         return no_update, no_update, no_update, no_update
     if preco is None or (isinstance(preco, str) and not preco.strip()):
-        return no_update, no_update, no_update, '⚠ Informe um preço.'
+        return no_update, no_update, no_update, _texto_com_icone('tabler:alert-triangle', 'Informe um preço.')
     try:
         preco_float = float(str(preco).replace(',', '.'))
     except ValueError:
-        return no_update, no_update, no_update, '⚠ Preço inválido.'
+        return no_update, no_update, no_update, _texto_com_icone('tabler:alert-triangle', 'Preço inválido.')
     tracados.criar_tracado(ativo, 'horizontal', preco_float)
-    return '', tracados.listar_tracados(ativo).to_dict('records'), None, f'✔ Linha criada em {preco_float:,.0f}.'
+    return ('', tracados.listar_tracados(ativo).to_dict('records'), None,
+            _texto_com_icone('tabler:check', f'Linha criada em {preco_float:,.0f}.'))
 
 
 @app.callback(
@@ -3463,9 +5436,9 @@ def atualizar_dashboard(n_intervals, ativo, candle_atual, timeline_expandida, te
     if atualizando:
         status = '● Atualizando...'
     elif erro:
-        status = f'⚠ {erro}'
+        status = _texto_com_icone('tabler:alert-triangle', erro)
     elif df_ativo is None:
-        status = '⚠ Base não encontrada'
+        status = _texto_com_icone('tabler:alert-triangle', 'Base não encontrada')
     else:
         status = f'● {len(df_ativo):,} candles'
 
@@ -3477,8 +5450,8 @@ def atualizar_dashboard(n_intervals, ativo, candle_atual, timeline_expandida, te
     cal_str, cal_style = '', {'fontSize': '10px', 'fontFamily': FONTS['display'], 'color': C['text2']}
     evento_ativo = cal_eco.janela_de_noticia_ativa(agora_dt, margem_minutos=30)
     if evento_ativo:
-        cal_str = f"⚠ JANELA DE NOTÍCIA: {evento_ativo['nome']}"
-        cal_style = {**cal_style, 'color': C['red'], 'fontWeight': '700'}
+        cal_str = _texto_com_icone('tabler:alert-triangle', f"JANELA DE NOTÍCIA: {evento_ativo['nome']}", tamanho=11)
+        cal_style = {**cal_style, 'color': C['red'], 'fontWeight': '700', 'display': 'flex', 'alignItems': 'center', 'gap': '4px'}
     else:
         proximos = cal_eco.proximos_eventos(agora_dt, janela_horas_antes=0, janela_horas_depois=48)
         if proximos:
@@ -3602,7 +5575,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
     # Preloader enquanto a IA processa
     preloader = html.Div([
         html.Div([
-            html.Span('✦ ', style={'color': C['gold'], 'fontSize': '11px'}),
+            html.Span(_icone('tabler:sparkles', tamanho=11, cor=C['gold']), style={'marginRight': '4px'}),
             html.Span('...', style={
                 'color': C['text2'], 'fontStyle': 'italic',
                 'animation': 'pulse 1s infinite',
@@ -3633,7 +5606,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
             sufixo_modelo = f' ({modelo_limitado})' if modelo_limitado else ''
             msg_ia = html.Div([
                 html.Div([
-                    html.Span('⏱ ', style={'color': C['yellow']}),
+                    html.Span(_icone('tabler:clock', tamanho=13, cor=C['yellow']), style={'marginRight': '4px'}),
                     html.Span(f'Limite de requisições atingido{sufixo_modelo}. Aguarde {segundos_espera}s antes de enviar novamente.',
                               style={'color': C['yellow']}),
                 ], style={
@@ -3645,13 +5618,13 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
             ], style={'display': 'flex', 'justifyContent': 'flex-start'})
 
             tokens_str = ''
-            status_str = f'⏱ Aguarde {segundos_espera}s · Limite da API atingido'
+            status_str = _texto_com_icone('tabler:clock', f'Aguarde {segundos_espera}s · Limite da API atingido')
 
         elif isinstance(resposta_bruta, dict) and resposta_bruta.get('erro'):
             msg_ia = html.Div([
                 html.Div([
-                    html.Span(f'⚠ {resposta_bruta["erro"]}',
-                              style={'color': C['red']}),
+                    html.Span(_texto_com_icone('tabler:alert-triangle', resposta_bruta["erro"]),
+                              style={'color': C['red'], 'display': 'inline-flex', 'alignItems': 'center', 'gap': '4px'}),
                 ], style={
                     'background': 'var(--bolha-erro)', 'borderRadius': '10px 10px 10px 2px',
                     'padding': '10px 14px', 'fontSize': '13px',
@@ -3660,7 +5633,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
                 }),
             ], style={'display': 'flex', 'justifyContent': 'flex-start'})
             tokens_str = ''
-            status_str = '⚠ Erro na API'
+            status_str = _texto_com_icone('tabler:alert-triangle', 'Erro na API')
 
         else:
             resposta = resposta_bruta.get('texto', '')
@@ -3670,7 +5643,7 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
 
             msg_ia = html.Div([
                 html.Div([
-                    html.Span('✦ ', style={'color': C['gold'], 'fontSize': '11px'}),
+                    html.Span(_icone('tabler:sparkles', tamanho=11, cor=C['gold']), style={'marginRight': '4px'}),
                     html.Span(resposta, style={'whiteSpace': 'pre-wrap', 'lineHeight': '1.6'}),
                 ], style={
                     'background': 'var(--bolha-neutra)', 'borderRadius': '10px 10px 10px 2px',
@@ -3686,11 +5659,11 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
 
     except Exception as e:
         msg_ia = html.Div([
-            html.Div(f'⚠ Erro inesperado: {str(e)[:60]}',
+            html.Div(_texto_com_icone('tabler:alert-triangle', f'Erro inesperado: {str(e)[:60]}'),
                      style={'color': C['red'], 'fontSize': '13px',
-                            'fontFamily': FONTS['body']}),
+                            'fontFamily': FONTS['body'], 'display': 'flex', 'alignItems': 'center', 'gap': '4px'}),
         ], style={'display': 'flex'})
-        status_str = '⚠ Erro inesperado'
+        status_str = _texto_com_icone('tabler:alert-triangle', 'Erro inesperado')
 
     novo_historico = (historico_atual or []) + [msg_usuario, msg_ia]
 
@@ -3698,39 +5671,82 @@ def enviar_mensagem_chat(n_clicks, texto, historico_atual, ativo, modelo):
 
 
 # -----------------------------------------------------------------------------
-# CABEÇALHO — troca de aba real (QUANT LAB/BACKTESTING/DIÁRIO/CONFIGURAÇÕES)
+# MENU LATERAL — troca de seção real (rollout TradeZella, 2026-07-31)
 # -----------------------------------------------------------------------------
-# Primeira vez que essas 4 abas viram funcionais de verdade — antes eram só
-# decoração (sem callback nenhum, `conteudo-principal` sempre mostrava o
-# mesmo conteúdo). Mesma disciplina do seletor de ativo: nunca recriar os
-# botões, só trocar `style`/`display` (evita o bug histórico de reset de
-# `n_clicks` documentado no CHANGELOG.md de 2026-07-04).
-
-_ABAS_CABECALHO = ['lab', 'back', 'diary', 'config']
+# Navbar de duas colunas (trilha de ícones + painel de rótulos, ver
+# `_GRUPOS_MENU` perto do `app.layout`). Mesma disciplina de sempre
+# (seletor de ativo, abas antigas): nunca recriar o `dmc.NavLink`/botão de
+# trilha, só trocar `active`/`style`/`display` (evita o bug histórico de
+# reset de `n_clicks` documentado no CHANGELOG.md de 2026-07-04).
 
 
 @app.callback(
     Output('store-aba-ativa', 'data'),
-    [Input(f'tab-{chave}', 'n_clicks') for chave in _ABAS_CABECALHO],
+    [Input(f'rail-{grupo}', 'n_clicks') for grupo in _GRUPOS_CHAVES]
+    + [Input(f'tab-{secao}', 'n_clicks') for secao in _TODAS_SECOES],
     prevent_initial_call=True,
 )
 def selecionar_aba(*_n_clicks):
+    """Clique num ícone da TRILHA navega pra 1ª seção do grupo (a única,
+    pros grupos diretos; `bem_estar` pra Coaching — ver `_GRUPO_PARA_SECOES`).
+    Clique num rótulo do PAINEL navega pra aquela seção específica (só
+    Coaching tem 2 rótulos visíveis ao mesmo tempo; os outros grupos têm 1
+    só, redundante com o próprio ícone da trilha, mas inofensivo)."""
     ctx = callback_context
     if not ctx.triggered:
         return no_update
-    botao_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    return botao_id.replace('tab-', '')
+    origem = ctx.triggered[0]['prop_id'].split('.')[0]
+    if origem.startswith('rail-'):
+        grupo = origem[len('rail-'):]
+        return _GRUPO_PARA_SECOES[grupo][0]
+    return origem[len('tab-'):]
 
 
 @app.callback(
-    [Output(f'tab-{chave}', 'style') for chave in _ABAS_CABECALHO],
+    [Output(f'tab-{secao}', 'active') for secao in _TODAS_SECOES],
+    [Output(f'tab-{secao}', 'style') for secao in _TODAS_SECOES],
+    [Output(f'rail-{grupo}', 'style') for grupo in _GRUPOS_CHAVES],
     Input('store-aba-ativa', 'data'),
 )
-def atualizar_estilo_aba_ativa(aba_ativa):
-    return [_estilo_aba(chave, aba_ativa) for chave in _ABAS_CABECALHO]
+def atualizar_menu_ativo(aba_ativa):
+    """Realça o ícone da trilha do grupo ativo e mostra SÓ os rótulos desse
+    grupo no painel ao lado (os das outras seções ficam com `display:none`
+    — nunca desmontados, mesmo padrão de `atualizar_painel_principal`)."""
+    grupo_ativo = _SECAO_PARA_GRUPO.get(aba_ativa)
+    ativos = [secao == aba_ativa for secao in _TODAS_SECOES]
+    estilos_rotulo = [{} if _SECAO_PARA_GRUPO[secao] == grupo_ativo else {'display': 'none'}
+                       for secao in _TODAS_SECOES]
+    estilos_trilha = [_estilo_rail_botao(grupo == grupo_ativo) for grupo in _GRUPOS_CHAVES]
+    return (*ativos, *estilos_rotulo, *estilos_trilha)
 
 
 @app.callback(
+    Output('appshell-principal', 'navbar'),
+    Output('menu-painel-labels', 'style'),
+    Output('store-menu-colapsado', 'data'),
+    Input('btn-menu-colapsar', 'n_clicks'),
+    State('store-menu-colapsado', 'data'),
+    prevent_initial_call=True,
+)
+def alternar_menu_colapsado(n_clicks, colapsado_atual):
+    """☰ — recolhe/expande o menu (pedido do Jesué: "menu retrátil").
+    Encolher só o painel de rótulos (CSS) não bastava pra parecer
+    retraído de verdade — o `navbar` do `dmc.AppShell` também precisa
+    encolher (`Output` direto no prop, substitui o dict inteiro), senão
+    sobra um vão vazio entre a trilha e o conteúdo principal."""
+    if not n_clicks:
+        return no_update, no_update, no_update
+    colapsado_novo = not bool(colapsado_atual)
+    navbar = {'width': 52 if colapsado_novo else 260, 'breakpoint': 'sm'}
+    estilo_painel = (
+        {'display': 'none'} if colapsado_novo else
+        {'flex': 1, 'display': 'flex', 'flexDirection': 'column', 'gap': '2px', 'padding': '8px'}
+    )
+    return navbar, estilo_painel, colapsado_novo
+
+
+@app.callback(
+    Output('painel-dashboard', 'style'),
     Output('painel-quantlab', 'style'),
     Output('painel-diario', 'style'),
     Output('painel-back', 'style'),
@@ -3738,10 +5754,320 @@ def atualizar_estilo_aba_ativa(aba_ativa):
     Input('store-aba-ativa', 'data'),
 )
 def atualizar_painel_principal(aba_ativa):
-    def _estilo(chave):
-        return {} if chave == aba_ativa else {'display': 'none'}
-    return (_estilo('lab'), _estilo('diary'),
-            _estilo('back'), _estilo('config'))
+    """`maxWidth`/`margin:auto` (2026-07-31, correção do Jesué: "veja essas
+    margens muito largas") mora AQUI agora, por painel — antes era um
+    único `maxWidth:1600px` em `conteudo-principal` (pai de TODOS os
+    painéis), o que também espremia o Diário (grid/galeria querem a
+    largura CHEIA da tela). Dashboard/Quant Lab/Backtesting/Configurações
+    continuam centrados numa largura de leitura confortável; só o Diário
+    (`_ABAS_DIARIO_FILHO`) fica sem esse teto."""
+    def _estilo(mostrar, com_max_width=True):
+        base = {'maxWidth': '1600px', 'margin': '0 auto'} if com_max_width else {}
+        if not mostrar:
+            base = {**base, 'display': 'none'}
+        return base
+    return (
+        _estilo(aba_ativa == 'dashboard'),
+        _estilo(aba_ativa == 'lab'),
+        _estilo(aba_ativa in _ABAS_DIARIO_FILHO, com_max_width=False),
+        _estilo(aba_ativa == 'back'),
+        _estilo(aba_ativa == 'config'),
+    )
+
+
+# Ponte de seção pro iframe do Diário (Task #34, rollout TradeZella) —
+# mesmo princípio de `assets/tema.js` (postMessage entre os 2 processos
+# Dash, portas diferentes = origens diferentes, sem Store compartilhado):
+# quando a seção ativa é uma das 6 que ainda moram no filho, avisa o
+# iframe qual delas mostrar (o filho escreve em `store-diario-sub-aba`
+# via `assets/secao_diario.js`, que troca a sub-aba renderizada por
+# `montar_sub_aba_diario`). Guardar `window.SQ_SECAO.atual` permite ao
+# filho pedir a seção atual de novo se o iframe recarregar depois do pai
+# (mesmo "pedir" já usado pro tema).
+app.clientside_callback(
+    """
+    function(secaoAtiva) {
+        window.SQ_SECAO = window.SQ_SECAO || {};
+        var secoesFilho = ['historico', 'estrategias', 'posicao', 'padroes', 'bem_estar'];
+        if (secoesFilho.indexOf(secaoAtiva) === -1) return '';
+        window.SQ_SECAO.atual = secaoAtiva;
+        var iframe = document.querySelector('#painel-diario iframe');
+        if (iframe) iframe.contentWindow.postMessage({tipo: 'sq-secao', secao: secaoAtiva}, '*');
+        return '';
+    }
+    """,
+    Output('store-secao-dummy', 'data'),
+    Input('store-aba-ativa', 'data'),
+)
+
+# Ponte do filtro de data do calendário pro Histórico (rollout TradeZella,
+# 2026-07-31) — ver `clicar_dia_calendario` (clique num dia do calendário
+# do Dashboard) e `assets/secao_diario.js` (lado que recebe, no filho).
+app.clientside_callback(
+    """
+    function(dataFiltro) {
+        if (!dataFiltro) return '';
+        var iframe = document.querySelector('#painel-diario iframe');
+        if (iframe) iframe.contentWindow.postMessage({tipo: 'sq-hist-filtro-data', data: dataFiltro}, '*');
+        return '';
+    }
+    """,
+    Output('store-hist-filtro-dummy', 'data'),
+    Input('store-historico-filtro-data-calendario', 'data'),
+    prevent_initial_call=True,
+)
+
+
+
+
+# -----------------------------------------------------------------------------
+# CALLBACKS DO DASHBOARD (ex-Estatísticas) — relocados de
+# diario_app_classico.py (rollout TradeZella, 2026-07-31). Mesmos corpos,
+# só registrados contra o `app` deste processo agora.
+# -----------------------------------------------------------------------------
+
+@app.callback(
+    Output('diario-mentor-ia-conteudo', 'children'),
+    Output('btn-gerar-mentor-ia', 'children'),
+    Input('btn-gerar-mentor-ia', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def gerar_mentor_ia(n_clicks):
+    """Gera (ou regenera) a análise do Mentor de IA. Bloqueante — mesma
+    convenção do chat de IA (`enviar_mensagem_chat` em dashboard.py): não
+    há um segundo round-trip, o callback só retorna quando a resposta real
+    (ou erro) chega. `dcc.Loading` cobre a espera."""
+    if not n_clicks:
+        return no_update, no_update
+    resumo = dt.montar_resumo_para_mentor_ia()
+    resultado = ai_analyst.gerar_analise_evolucao_operacional(resumo)
+    if resultado.get('erro'):
+        conteudo = html.Div(_texto_com_icone('tabler:alert-triangle', resultado['erro']),
+                             style={'fontSize': '12px', 'color': C['red'], 'display': 'flex', 'alignItems': 'center', 'gap': '4px'})
+        return conteudo, no_update
+    cache = ai_analyst.carregar_analise_diaria()
+    return _conteudo_mentor_ia(cache), 'Gerar nova análise'
+
+
+@app.callback(
+    Output('diario-detalhe-estrategia-selecionada', 'children'),
+    Input('grid-confiabilidade-estrategia', 'cellClicked'),
+    State('grid-confiabilidade-estrategia', 'rowData'),
+    prevent_initial_call=True,
+)
+def atualizar_detalhe_estrategia_grid(cell_clicked, row_data):
+    """Clique numa linha do AG Grid "Confiabilidade por Estratégia" (item
+    F, Fase 2.6) — substitui a seta ▶/▼ por linha (`alternar_detalhe_
+    estrategia`, agora removida). Sempre re-renderiza o MESMO painel fixo
+    (`diario-detalhe-estrategia-selecionada`), nunca um id por linha.
+
+    2026-08-02: usa `cell_clicked['rowIndex']` pra indexar direto no
+    `State` de `rowData`, NÃO `cell_clicked['data']` — essa versão do
+    dash-ag-grid nunca inclui `data` no payload de `cellClicked` (só
+    value/colId/rowIndex/rowId/timestamp), então o código antigo sempre
+    caía no `no_update` silenciosamente (mesma causa raiz do bug irmão
+    em `atualizar_detalhe_historico_grid`, diario_app_classico.py).
+
+    Tentativa de corrigir com `getRowId` foi REVERTIDA — ver comentário
+    em `_tabela_score_confiabilidade`, colapsou a grade inteira pra 1
+    linha (`params.data.tag` sempre avaliava `undefined` dentro do
+    `getRowId`, motivo ainda não identificado). Mesma limitação
+    conhecida do bug irmão: se o usuário ordenar a grade pelo
+    cabeçalho (client-side), `rowIndex` diverge da ordem do `rowData`
+    guardado no State — clique pode pegar a linha errada nesse caso."""
+    if not cell_clicked or not row_data:
+        return no_update
+    row_index = cell_clicked.get('rowIndex')
+    if row_index is None or not (0 <= row_index < len(row_data)):
+        return no_update
+    linha = row_data[row_index]
+    tag = linha.get('tag')
+    if not tag or not linha.get('n'):
+        return None
+    return _detalhe_estrategia_expandido(tag)
+
+
+@app.callback(
+    Output('diario-calendario-mes', 'data'),
+    Input('btn-diario-cal-mes-prev', 'n_clicks'),
+    Input('btn-diario-cal-mes-next', 'n_clicks'),
+    Input('btn-diario-cal-ano-prev', 'n_clicks'),
+    Input('btn-diario-cal-ano-next', 'n_clicks'),
+    State('diario-calendario-mes', 'data'),
+    prevent_initial_call=True,
+)
+def navegar_calendario_classico(n_mes_prev, n_mes_next, n_ano_prev, n_ano_next, mes_atual):
+    """Setas de mês e de ano são controles TOTALMENTE separados (feedback
+    2026-07-12: um único par de setas reaproveitado pros dois modos —
+    trocando de significado conforme `diario-modo-ano` — fazia o usuário
+    clicar esperando andar um mês e o calendário pular um ano inteiro,
+    3 vezes reportado mesmo depois de rotular os botões dinamicamente. A
+    seta de mês SEMPRE anda mês a mês (com rollover de ano) e a de ano
+    SEMPRE anda ano a ano, não importa qual grade (`diario-modo-ano`) está
+    sendo exibida — `modo_ano` não é mais lido aqui, só decide o que
+    `atualizar_periodo_estatisticas` desenha embaixo."""
+    ctx = callback_context
+    if not ctx.triggered or not mes_atual:
+        return no_update
+    trigger = ctx.triggered[0]
+    if not trigger['value']:
+        # Um clique de verdade SEMPRE incrementa `n_clicks` (nunca zera
+        # sozinho) — um trigger com valor 0 só pode vir do próprio botão
+        # tendo sido recriado (Dash reseta `n_clicks` de um componente
+        # novo pra 0), nunca de uma ação do usuário. Guarda defensiva:
+        # com os botões agora fixos (nunca recriados, ver
+        # `_construir_diario_estatisticas`) isso não deveria mais
+        # acontecer, mas custa nada blindar contra o mesmo bug voltando
+        # se algum código futuro recriar os botões de novo por engano.
+        return no_update
+    ano, mes = (int(x) for x in mes_atual.split('-'))
+    origem = trigger['prop_id'].split('.')[0]
+    if origem in ('btn-diario-cal-mes-prev', 'btn-diario-cal-mes-next'):
+        passo = -1 if origem == 'btn-diario-cal-mes-prev' else 1
+        mes += passo
+        if mes == 0:
+            mes, ano = 12, ano - 1
+        elif mes == 13:
+            mes, ano = 1, ano + 1
+    else:
+        passo = -1 if origem == 'btn-diario-cal-ano-prev' else 1
+        ano += passo
+    return f"{ano:04d}-{mes:02d}"
+
+
+@app.callback(
+    Output('diario-modo-ano', 'data'),
+    Input('btn-diario-modo-ano', 'n_clicks'),
+    State('diario-modo-ano', 'data'),
+    prevent_initial_call=True,
+)
+def alternar_modo_ano(n_clicks, modo_atual):
+    if not n_clicks:  # ver comentário em navegar_calendario_classico
+        return no_update
+    return not bool(modo_atual)
+
+
+@app.callback(
+    Output('diario-cal-config-conteudo', 'children'),
+    Output('btn-diario-cal-config', 'children'),
+    Input('btn-diario-cal-config', 'n_clicks'),
+    State('btn-diario-cal-config', 'children'),
+    State('store-calendario-stats-visiveis', 'data'),
+    prevent_initial_call=True,
+)
+def alternar_config_calendario(n_clicks, rotulo_atual, stats_visiveis):
+    """Abre/fecha o painel "Display stats" do calendário (item F, fase 4)
+    — mesma mecânica do checklist pré-trade: o próprio rótulo do botão é
+    o estado, nunca recriado por esta callback. Rótulo texto puro ("Stats"/
+    "Fechar", sem glifo ⚙/✕) desde 2026-08-01."""
+    if not n_clicks:
+        return no_update, no_update
+    if rotulo_atual == 'Stats':
+        return _conteudo_config_calendario(stats_visiveis or _STATS_CALENDARIO_PADRAO), 'Fechar'
+    return None, 'Stats'
+
+
+@app.callback(
+    Output('colapso-analise-estrategia-detalhes', 'style'),
+    Output('btn-analise-estrategia-detalhes', 'children'),
+    Input('btn-analise-estrategia-detalhes', 'n_clicks'),
+    State('btn-analise-estrategia-detalhes', 'children'),
+    prevent_initial_call=True,
+)
+def alternar_detalhes_analise_estrategia(n_clicks, rotulo_atual):
+    """Abre/fecha os detalhes de "Análise de Estratégia" (2026-07-31,
+    feedback: "deixe Vencedora/Perdedora e Mentor de IA visíveis, o resto
+    contraído") — mesma mecânica de `alternar_config_calendario`/
+    `alternar_modo_ano`: o próprio rótulo do botão (texto "Ver detalhes"/
+    "Ocultar detalhes" — sem seta Unicode desde 2026-08-01) é o estado,
+    só o `style` (`display`) alterna, conteúdo sempre presente no DOM
+    (ver docstring de `_bloco_analise_estrategia` — `dmc.Collapse` tem bug
+    real de não abrir via callback nesta versão, descartado)."""
+    if not n_clicks:
+        return no_update, no_update
+    if rotulo_atual == 'Ver detalhes':
+        return {'display': 'block'}, 'Ocultar detalhes'
+    return {'display': 'none'}, 'Ver detalhes'
+
+
+@app.callback(
+    Output('store-calendario-stats-visiveis', 'data'),
+    Input('diario-cal-config-itens', 'value'),
+    prevent_initial_call=True,
+)
+def atualizar_stats_visiveis_calendario(valores):
+    return valores or []
+
+
+@app.callback(
+    Output('diario-cards-conteudo', 'children'),
+    Output('diario-calendario-grid', 'children'),
+    Output('diario-calendario-label-mes', 'children'),
+    Output('diario-calendario-label-ano', 'children'),
+    Output('btn-diario-modo-ano', 'style'),
+    Output('diario-modo-ano-bolinha', 'style'),
+    Output('diario-resto-periodo-conteudo', 'children'),
+    Input('diario-calendario-mes', 'data'),
+    Input('diario-modo-ano', 'data'),
+    Input('store-calendario-stats-visiveis', 'data'),
+    State('store-tema', 'data'),
+)
+def atualizar_periodo_estatisticas(mes_atual, modo_ano, stats_visiveis, tema_atual):
+    """Recalcula estatísticas + calendário a cada troca de mês/ano/toggle —
+    ver `diario_app_98.py::atualizar_periodo_estatisticas_98` pro raciocínio
+    completo. Só atualiza `children`/`style` de componentes que já existem
+    (criados 1x em `_construir_diario_estatisticas`) — NUNCA substitui os
+    botões de navegação inteiros, pra não repetir o bug de `n_clicks`
+    resetando (ver comentário lá). Os labels de mês/ano são atualizados
+    SEMPRE, independente de `modo_ano` — as setas de mês e ano ficam
+    visíveis e funcionais nos dois modos de grade (ver
+    `navegar_calendario_classico`), só a grade abaixo (dias vs meses) muda.
+
+    `store-calendario-stats-visiveis` (item F, fase 4) também é Input —
+    marcar/desmarcar uma stat no calendário precisa remontar a grade na
+    hora, sem esperar trocar de mês."""
+    if not mes_atual:
+        return (no_update,) * 7
+    ano, mes = (int(x) for x in mes_atual.split('-'))
+    modo_ano = bool(modo_ano)
+    if modo_ano:
+        stats = dt.calcular_estatisticas(ano=ano)
+        grade = _grade_calendario_anual(stats['por_mes'], ano, tema_atual or 'light')
+    else:
+        stats = dt.calcular_estatisticas(ano=ano, mes=mes)
+        detalhe_dias = dt.detalhe_dias_calendario(ano=ano, mes=mes)
+        grade = _grade_calendario(stats['por_dia'], detalhe_dias, ano, mes, stats_visiveis, tema_atual or 'light')
+    return (
+        _cards_ou_vazio_estatisticas(stats, tema_atual or 'light', ano=ano, mes=None if modo_ano else mes),
+        grade,
+        _NOMES_MES[mes],
+        str(ano),
+        _estilo_toggle_trilho(modo_ano),
+        _estilo_toggle_bolinha(modo_ano),
+        _resto_periodo_estatisticas(stats, tema_atual or 'light'),
+    )
+
+
+# Output mudou de `store-diario-sub-aba` (Store do FILHO) pra
+# `store-aba-ativa` (Store do PAI) + um novo `store-historico-filtro-
+# data-calendario` — a Estatística (Dashboard) e o Histórico agora vivem
+# em PROCESSOS Dash diferentes (rollout TradeZella, 2026-07-31), então uma
+# única callback Python não pode mais escrever direto nos dois; o
+# clientside_callback da ponte de seção (perto de `atualizar_painel_
+# principal`) repassa a data pro iframe via postMessage.
+@app.callback(
+    Output('store-aba-ativa', 'data', allow_duplicate=True),
+    Output('store-historico-filtro-data-calendario', 'data'),
+    Input({'type': 'diario-cal-dia', 'index': ALL}, 'n_clicks'),
+    prevent_initial_call=True,
+)
+def clicar_dia_calendario(n_clicks_lista):
+    ctx = callback_context
+    if not ctx.triggered or not any(n_clicks_lista or []):
+        return no_update, no_update
+    prop_id = ctx.triggered[0]['prop_id'].rsplit('.', 1)[0]
+    componente_id = json.loads(prop_id)
+    return 'historico', componente_id['index']
 
 
 # =============================================================================

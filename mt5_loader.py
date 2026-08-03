@@ -24,7 +24,20 @@ import config_backtest as cfg
 # -----------------------------------------------------------------------------
 
 def conectar():
-    if not mt5.initialize():
+    """
+    2026-08-02, bug real: `mt5.initialize()` sem `timeout=` usa o default
+    interno do pacote (dezenas de segundos) — quando o terminal está aberto
+    mas sem conexão com o servidor da corretora (ver `checar_conectividade`),
+    a chamada bloqueia por esse tempo todo. Como `MetaTrader5` é uma extensão
+    C que não libera o GIL durante essa espera, o processo Python INTEIRO
+    trava nesse período (não só a thread que chamou) — foi a causa raiz de
+    "o dashboard não carrega" enquanto a conta 13372735/BancoBTGPactual-PRD
+    estava sem rede. `timeout` curto não resolve a causa raiz (rede/servidor
+    da corretora), mas limita o estrago: uma falha vira uma `ConnectionError`
+    rápida (já tratada em `dashboard.py::carregar_bases`) em vez de travar o
+    app inteiro por um minuto a cada ciclo de 30s.
+    """
+    if not mt5.initialize(timeout=5_000):
         raise ConnectionError(f"Falha ao conectar no MT5: {mt5.last_error()}")
     print(f"[mt5_loader] Conectado ao MT5 (build {mt5.terminal_info().build})")
 
@@ -85,6 +98,21 @@ def checar_conectividade(ticker_teste: str = "WINQ26") -> dict:
         resultado['status'] = 'ok'
 
     return resultado
+
+
+def obter_info_conta() -> dict | None:
+    """Resumo da conta conectada (login/servidor/saldo/patrimônio/margem
+    livre) — usado pelo cabeçalho de conexão em Posição (Playbook,
+    2026-08-02). `None` se não houver conexão ativa no momento da chamada
+    (chamador deve já ter garantido `mt5.initialize()` bem-sucedido)."""
+    info = mt5.account_info()
+    if info is None:
+        return None
+    return {
+        'login': info.login, 'servidor': info.server, 'nome': info.name,
+        'saldo': info.balance, 'patrimonio': info.equity,
+        'margem_livre': info.margin_free, 'moeda': info.currency,
+    }
 
 
 def exigir_conexao_saudavel(ticker_teste: str = "WINQ26", latencia_max_ms: float = 2000):

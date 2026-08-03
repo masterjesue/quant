@@ -415,6 +415,42 @@ cards + "gráficos não mudaram" + pergunta sobre o Fator de Recuperação) —
   inspeção de `fig.data` das 2 figuras Plotly da página + nenhum erro no
   console.
 
+## Regra permanente — nenhum glifo Unicode como ícone (2026-08-01)
+
+Correção do Jesué com screenshot do popup de imagem: "esses cantos
+quadrados, essa fonte com emoji (próximo/anterior)... parecem ter saído de
+um site velho dos anos 2000. Eu me pergunto se você realmente entendeu o
+conceito de UX que eu pedi." Causa raiz: caracteres Unicode (◀▶‹›✕⛶) usados
+como texto de botão (`html.Button('◀ Anterior', ...)`) — herança do Diário
+antigo (pré-TradeZella), nunca varrida quando o resto virou DMC/Tabler.
+Isso contradiz o padrão já adotado no menu lateral (`dash_iconify`, ícones
+Tabler) — inconsistência real, não só gosto.
+
+**Regra, daqui pra frente, em qualquer componente novo ou tocado no
+Diário/Dashboard**: nenhum glifo Unicode (setas, ✕, ⛶, emoji) vira ícone de
+botão/controle. Só `DashIconify(icon='tabler:...')` dentro de
+`dmc.Button`/`dmc.ActionIcon` (`leftSection`/`rightSection` ou filho único
+de um `ActionIcon` circular). Exceção explícita: `_estrela_rating` (★/☆)
+continua usando os caracteres de estrela reais — ali eles SÃO o widget
+(rating de 1-5 estrelas clicáveis, convenção universal de app, pedido
+explícito do Jesué em 2026-07-11), não um substituto pra ícone de ação.
+`html.Button` cru só é aceitável quando o controle é 100% client-side sem
+callback Python (ex: `data-zoom-acao` do zoom de imagem) — mesmo assim, o
+CONTEÚDO visual dele (ícone) segue a mesma regra: `DashIconify` ou, se
+tiver que ser `html.Button` puro por essa razão, uma classe CSS dedicada
+que reproduza visualmente um `ActionIcon` (ver `.diario-zoom-btn-icone` em
+`assets/style.css`), nunca texto+glifo cru.
+
+Varredura feita em 2026-08-01 (`diario_app_classico.py`): popup de imagem
+(Fechar/Anterior/Próxima → `dmc.ActionIcon` + `tabler:x`/`chevron-left`/
+`chevron-right`; zoom +/-/Ajustar → `tabler:zoom-in`/`zoom-out`/`maximize`
+via `.diario-zoom-btn-icone`), paginação da Galeria e navegação do Day View
+(`‹›` → `dmc.Button` com `leftSection`/`rightSection` de chevron), botão
+Editar do Drawer de detalhe (`✎` → `tabler:pencil`), coluna "Ação" da grid
+do Histórico (`🔍 Ver` → texto plano `Ver`, sem emoji — célula de AG Grid
+não hospeda componente Dash/ícone SVG sem um cell renderer JS dedicado,
+fora de escopo proporcional aqui).
+
 **Bloco Trades Recentes** (2026-07-31, feedback: "você não está mostrando
 o bloco de trades recentes no dashboard, como é no TradeZella") —
 adicionado `dt.trades_recentes(n=8)` (só trades reais, ordena por

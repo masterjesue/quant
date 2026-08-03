@@ -316,6 +316,28 @@
     content: '★';
 }
 
+/* Ícones de rating do Check-in do Dia (Água/Exercício/Alimentação,
+   2026-08-03, pedido do Jesué: "copinhos"/"halteres"/"maçãs" em vez de
+   estrela) — mesma mecânica de .diario-estrela (nota 1-5 clicável), mas
+   emoji já é colorido por natureza, então o estado "não marcado" usa
+   dessaturação/opacidade em vez de trocar o glifo. */
+.diario-icone-rating {
+    cursor: pointer;
+    font-size: 20px;
+    line-height: 1;
+    user-select: none;
+    filter: grayscale(1);
+    opacity: 0.35;
+    transition: filter 0.1s ease, opacity 0.1s ease;
+}
+.diario-icone-rating.ativa {
+    filter: none;
+    opacity: 1;
+}
+.diario-icone-agua::before { content: '🥤'; }
+.diario-icone-exercicio::before { content: '🏋️'; }
+.diario-icone-alimentacao::before { content: '🍎'; }
+
 /* Barra de ferramentas de desenho — aba "Traçados" (ver assets/lwchart.js).
    Estado "ativa" é alternado via classList direto no JS (não recriado por
    callback Dash — mesmo motivo de window_manager.js não usar Dash pra
@@ -370,6 +392,30 @@
     -webkit-user-drag: none;
     transform-origin: 0 0;
     will-change: transform;
+}
+
+/* Botões de zoom do popup de imagem (+/-/Ajustar) — precisam continuar
+   `html.Button` cru (client-side puro via data-zoom-acao, ver
+   assets/diario_zoom.js, sem callback Python), mas devem parecer o mesmo
+   `dmc.ActionIcon` circular usado ao lado (Fechar/Anterior/Próxima) —
+   correção 2026-08-01, feedback: "cantos quadrados, fonte com emoji...
+   site velho dos anos 2000". Sem borda quadrada, ícone Tabler centralizado,
+   hover suave igual ao ActionIcon do Mantine. */
+.diario-zoom-btn-icone {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 999px;
+    border: none;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    transition: background-color 0.1s ease;
+}
+.diario-zoom-btn-icone:hover {
+    background: rgba(127, 127, 127, 0.15);
 }
 
 /* Widget de tags "de verdade" (ver assets/tag_input.js /
@@ -574,4 +620,29 @@
     width: min(1400px, 100%);
     max-height: 100%;
     min-height: 0;
+}
+
+/* -------------------------------------------------------------------------
+   dmc.Drawer/dmc.Modal embutidos no iframe do Diário — MESMO problema
+   documentado acima pro `_overlay()` antigo, achado de novo em 2026-07-31
+   ao converter os pop-ups do Diário pra Drawer/Modal reais:
+   `.mantine-Drawer-inner`/`-overlay` e `.mantine-Modal-inner`/`-overlay`
+   TODOS usam `position: fixed` (confirmado via getComputedStyle em teste
+   isolado pros dois componentes) — dentro do iframe auto-crescido, isso
+   ancora na altura TOTAL do conteúdo, não no que está visível. Mesma
+   correção pros 2: troca pra `position: absolute` usando as MESMAS custom
+   properties (`--sq-vp-topo`/`--sq-vp-altura`) que `assets/diario_
+   overlay_viewport.js` já calcula e publica em `.diario-embutido` —
+   nenhum JS novo precisou ser escrito, só reaproveitar o que já existia.
+   Só `top`/`height`/`position` mudam; `right`/`left`/`width`/`justify-
+   content` continuam com as regras próprias do Mantine.
+   ------------------------------------------------------------------------- */
+.diario-embutido .mantine-Drawer-inner,
+.diario-embutido .mantine-Drawer-overlay,
+.diario-embutido .mantine-Modal-inner,
+.diario-embutido .mantine-Modal-overlay {
+    position: absolute !important;
+    top: var(--sq-vp-topo, 0px) !important;
+    height: var(--sq-vp-altura, 100vh) !important;
+    bottom: auto !important;
 }

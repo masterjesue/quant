@@ -152,17 +152,16 @@
     aplicarAcao(alvo.getAttribute('data-zoom-acao'));
   });
 
-  // Teclado: + / - / 0 enquanto um pop-up de imagem estiver aberto, e Esc
-  // fechando (o Esc dispara o clique no backdrop, que a callback Python já
-  // trata — evita duplicar a lógica de fechamento aqui).
+  // Teclado: + / - / 0 enquanto um pop-up de imagem estiver aberto. Esc
+  // NÃO é tratado aqui (2026-07-31, migração pra `dmc.Modal` real) — o
+  // Modal já fecha sozinho no Esc (`closeOnEscape`, padrão do Mantine) e
+  // sincroniza `opened` de volta pra `False`, que `sincronizar_fechamento_
+  // imagem` (Python) já escuta. Tratar Esc aqui de novo seria duplicar
+  // um fechamento que o próprio componente já faz.
   document.addEventListener('keydown', function (evento) {
     if (!containerVisivel()) return;
     if (evento.key === '+' || evento.key === '=') aplicarAcao('mais');
     else if (evento.key === '-' || evento.key === '_') aplicarAcao('menos');
     else if (evento.key === '0') aplicarAcao('reset');
-    else if (evento.key === 'Escape') {
-      var fundo = document.querySelector('.diario-overlay-backdrop');
-      if (fundo) fundo.click();
-    }
   });
 })();

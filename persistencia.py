@@ -534,21 +534,28 @@ def carregar_padroes_comportamentais() -> pd.DataFrame | None:
 
 
 # -----------------------------------------------------------------------------
-# ESTRATÉGIAS / PRESETS R:R / TAGS SETUP-ERRO (cadastro editável, aba
-# "Estratégias" — feedback diário.txt, 2026-07-11) — ao contrário das tabelas
-# acima (recomputáveis a qualquer momento), estas são editadas diretamente
-# pelo usuário (CRUD), então levam trava própria (mesmo padrão de
-# `lock_diario`) — escrita disparada por clique, não por um ciclo automático,
-# então quem chama deve mostrar erro/retry visível se ocupada. Uma trava só
-# cobre as 3 tabelas (mesma tela "Estratégias", nunca editadas
-# concorrentemente por dois escritores).
+# ESTRATÉGIAS / CHECKLIST PRÉ-TRADE / GERENCIAMENTO DE RISCO / TAGS
+# SETUP-ERRO / TAGS EMOCIONAIS (cadastro editável, aba "Estratégias" —
+# feedback diário.txt, 2026-07-11) — ao contrário das tabelas acima
+# (recomputáveis a qualquer momento), estas são editadas diretamente pelo
+# usuário (CRUD), então levam trava própria (mesmo padrão de `lock_diario`)
+# — escrita disparada por clique, não por um ciclo automático, então quem
+# chama deve mostrar erro/retry visível se ocupada. Uma trava só cobre as 5
+# tabelas (mesma tela "Estratégias", nunca editadas concorrentemente por
+# dois escritores). Os antigos "Presets R:R" (`diario_rr_presets.parquet`)
+# foram substituídos pelo cadastro de Gerenciamento de Risco abaixo — o
+# arquivo antigo fica intocado em disco, dado superado.
 
 def _caminho_estrategias() -> Path:
     return cfg.PASTA_BASE_PROCESSADA / "diario_estrategias.parquet"
 
 
-def _caminho_rr_presets() -> Path:
-    return cfg.PASTA_BASE_PROCESSADA / "diario_rr_presets.parquet"
+def _caminho_checklist_pretrade() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_checklist_pretrade.parquet"
+
+
+def _caminho_gerenciamento_risco() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_gerenciamento_risco.parquet"
 
 
 def _caminho_tags_setup_erro() -> Path:
@@ -610,13 +617,25 @@ def carregar_estrategias() -> pd.DataFrame | None:
     return pd.read_parquet(caminho)
 
 
-def salvar_rr_presets(df: pd.DataFrame):
+def salvar_checklist_pretrade(df: pd.DataFrame):
     cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(_caminho_rr_presets(), index=False)
+    df.to_parquet(_caminho_checklist_pretrade(), index=False)
 
 
-def carregar_rr_presets() -> pd.DataFrame | None:
-    caminho = _caminho_rr_presets()
+def carregar_checklist_pretrade() -> pd.DataFrame | None:
+    caminho = _caminho_checklist_pretrade()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def salvar_gerenciamento_risco(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_gerenciamento_risco(), index=False)
+
+
+def carregar_gerenciamento_risco() -> pd.DataFrame | None:
+    caminho = _caminho_gerenciamento_risco()
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)
@@ -734,6 +753,36 @@ def carregar_posicoes_abertas() -> pd.DataFrame | None:
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# STATUS DE CONEXÃO MT5 — cabeçalho de conexão em Posição (Playbook,
+# 2026-08-03). Quem fala com o MT5 ao vivo é SÓ a thread de fundo do
+# dashboard.py (processo PAI, ver `carregar_bases`) — o processo FILHO
+# (`diario_app_classico.py`, onde Posição realmente vive) nunca conecta no
+# MT5 diretamente, mesmo padrão já usado por `posicoes_abertas.parquet`
+# (pai escreve, filho só lê). 1 linha só, sem trava dedicada: um único
+# escritor (a mesma thread que já escreve `contrato_win`/`contrato_wdo` em
+# memória), leituras são só `pd.read_parquet` tolerante a arquivo ausente.
+def _caminho_status_conexao() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "status_conexao_mt5.parquet"
+
+
+def salvar_status_conexao(dados: dict):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame([dados])
+    _salvar_parquet_atomico(_caminho_status_conexao(), df)
+
+
+def carregar_status_conexao() -> dict | None:
+    caminho = _caminho_status_conexao()
+    if not caminho.exists():
+        return None
+    try:
+        df = pd.read_parquet(caminho)
+    except Exception:
+        return None
+    return df.iloc[0].to_dict() if not df.empty else None
 
 
 # -----------------------------------------------------------------------------
@@ -882,6 +931,66 @@ def salvar_checkin_diario(df: pd.DataFrame):
 
 def carregar_checkin_diario() -> pd.DataFrame | None:
     caminho = _caminho_checkin_diario()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# CHECKLIST PRÉ-TRADE DIÁRIO (Playbook, 2026-08-02) — o "foi feito hoje?" do
+# guarda-corpo de Posição. Mesmo formato de check-in: upsert por DATA, 1
+# linha por dia. Trava própria (não reaproveita `lock_checkin_diario`) pra
+# não gerar contenção entre saves de Bem-Estar e o guarda-corpo em Posição,
+# que podem acontecer no mesmo instante em processos/abas diferentes.
+
+def _caminho_checklist_pretrade_dia() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_checklist_pretrade_dia.parquet"
+
+
+def _caminho_checklist_pretrade_dia_lock() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / '.checklist_pretrade_dia.lock'
+
+
+@contextmanager
+def lock_checklist_pretrade_dia():
+    """Mesmo mecanismo de `lock_checkin_diario()` (criação atômica via O_EXCL)."""
+    caminho = _caminho_checklist_pretrade_dia_lock()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+
+    if caminho.exists():
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+        except FileNotFoundError:
+            idade = 0
+        if idade > _LOCK_STALE_SEGUNDOS:
+            try:
+                caminho.unlink()
+            except FileNotFoundError:
+                pass
+
+    try:
+        fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        try:
+            caminho.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def salvar_checklist_pretrade_dia(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_checklist_pretrade_dia(), index=False)
+
+
+def carregar_checklist_pretrade_dia() -> pd.DataFrame | None:
+    caminho = _caminho_checklist_pretrade_dia()
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)
