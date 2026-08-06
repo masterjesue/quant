@@ -17,6 +17,7 @@
 import json
 import os
 import time
+from datetime import date
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -24,8 +25,22 @@ import config_backtest as cfg
 
 _LOCK_STALE_SEGUNDOS = 120
 
+# Toggles de notificação (item 1D do upgrade de 2026-08-04) — cada chave é
+# um tipo de evento do sino no menu lateral, liga/desliga em Configurações.
+_NOTIFICACOES_PADRAO = {
+    'posicao_aberta': True,
+    'pendencia_diario': True,
+    'pendencia_coaching': True,
+    'sinal_quantlab': True,
+}
+
 _PADRAO = {
     'modo_aprendizagem': False,
+    'notificacoes': _NOTIFICACOES_PADRAO,
+    # Carimbo gravado 1x (ver `garantir_primeiro_uso`) — só alimenta o
+    # tier visual do rodapé do menu (`diario_trade.nivel_conta`), nunca
+    # crítico pro resto do sistema.
+    'primeiro_uso': None,
 }
 
 
@@ -84,7 +99,13 @@ def carregar() -> dict:
             dados = json.load(f)
     except (json.JSONDecodeError, OSError):
         return dict(_PADRAO)
-    return {**_PADRAO, **dados}
+    mesclado = {**_PADRAO, **dados}
+    # Mescla rasa dedicada pra 'notificacoes' — sem isso, um arquivo salvo
+    # antes de um tipo de evento novo ser adicionado perderia esse toggle
+    # (sobrescrito pelo dict antigo inteiro, em vez de só as chaves que já
+    # existiam nele).
+    mesclado['notificacoes'] = {**_NOTIFICACOES_PADRAO, **dados.get('notificacoes', {})}
+    return mesclado
 
 
 def _salvar(dados: dict):
@@ -113,3 +134,43 @@ def definir_modo_aprendizagem(ativo: bool) -> bool:
         dados['modo_aprendizagem'] = bool(ativo)
         _salvar(dados)
         return True
+
+
+def notificacoes_config() -> dict:
+    """Toggles atuais de notificação — leitura rápida pro sino do menu e
+    pra tela de Configurações."""
+    return dict(carregar()['notificacoes'])
+
+
+def definir_notificacao(chave: str, ativo: bool) -> bool:
+    """Liga/desliga 1 tipo de notificação (`chave` em `_NOTIFICACOES_
+    PADRAO`). Mesmo contrato de retorno de `definir_modo_aprendizagem`."""
+    with _lock() as adquirida:
+        if not adquirida:
+            return False
+        dados = carregar()
+        notificacoes = dict(dados['notificacoes'])
+        notificacoes[chave] = bool(ativo)
+        dados['notificacoes'] = notificacoes
+        _salvar(dados)
+        return True
+
+
+def garantir_primeiro_uso() -> str:
+    """Data (ISO) do primeiro uso registrado — grava a data de hoje na 1ª
+    chamada e nunca mais sobrescreve. Só alimenta o tier visual do rodapé
+    do menu (`diario_trade.nivel_conta`), nunca é dado crítico — se a
+    trava estiver ocupada, devolve a data de hoje mesmo sem persistir
+    (o próximo processo a chamar tenta gravar de novo)."""
+    dados = carregar()
+    if dados.get('primeiro_uso'):
+        return dados['primeiro_uso']
+    hoje = date.today().isoformat()
+    with _lock() as adquirida:
+        if not adquirida:
+            return hoje
+        dados = carregar()
+        if not dados.get('primeiro_uso'):
+            dados['primeiro_uso'] = hoje
+            _salvar(dados)
+        return dados['primeiro_uso']

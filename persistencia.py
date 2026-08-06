@@ -535,16 +535,19 @@ def carregar_padroes_comportamentais() -> pd.DataFrame | None:
 
 # -----------------------------------------------------------------------------
 # ESTRATÉGIAS / CHECKLIST PRÉ-TRADE / GERENCIAMENTO DE RISCO / TAGS
-# SETUP-ERRO / TAGS EMOCIONAIS (cadastro editável, aba "Estratégias" —
-# feedback diário.txt, 2026-07-11) — ao contrário das tabelas acima
-# (recomputáveis a qualquer momento), estas são editadas diretamente pelo
-# usuário (CRUD), então levam trava própria (mesmo padrão de `lock_diario`)
-# — escrita disparada por clique, não por um ciclo automático, então quem
-# chama deve mostrar erro/retry visível se ocupada. Uma trava só cobre as 5
-# tabelas (mesma tela "Estratégias", nunca editadas concorrentemente por
-# dois escritores). Os antigos "Presets R:R" (`diario_rr_presets.parquet`)
-# foram substituídos pelo cadastro de Gerenciamento de Risco abaixo — o
-# arquivo antigo fica intocado em disco, dado superado.
+# SETUP-ERRO / TAGS EMOCIONAIS / SESSÕES / JANELAS (cadastro editável, aba
+# "Estratégias" — feedback diário.txt, 2026-07-11) — ao contrário das
+# tabelas acima (recomputáveis a qualquer momento), estas são editadas
+# diretamente pelo usuário (CRUD), então levam trava própria (mesmo padrão
+# de `lock_diario`) — escrita disparada por clique, não por um ciclo
+# automático, então quem chama deve mostrar erro/retry visível se ocupada.
+# Uma trava só cobre todas as tabelas desta seção (mesma tela
+# "Estratégias", nunca editadas concorrentemente por dois escritores). Os
+# antigos "Presets R:R" (`diario_rr_presets.parquet`) foram substituídos
+# pelo cadastro de Gerenciamento de Risco abaixo — o arquivo antigo fica
+# intocado em disco, dado superado. Sessões/Janelas adicionadas em
+# 2026-08-04 — substituem `cfg.JANELAS_PREGAO` (constante fixa) por
+# catálogo editável, ver `diario_trade.listar_janelas`/`listar_sessoes`.
 
 def _caminho_estrategias() -> Path:
     return cfg.PASTA_BASE_PROCESSADA / "diario_estrategias.parquet"
@@ -665,6 +668,38 @@ def carregar_tags_emocionais() -> pd.DataFrame | None:
     return pd.read_parquet(caminho)
 
 
+def _caminho_sessoes() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_sessoes.parquet"
+
+
+def _caminho_janelas() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_janelas.parquet"
+
+
+def salvar_sessoes(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_sessoes(), index=False)
+
+
+def carregar_sessoes() -> pd.DataFrame | None:
+    caminho = _caminho_sessoes()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def salvar_janelas(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_janelas(), index=False)
+
+
+def carregar_janelas() -> pd.DataFrame | None:
+    caminho = _caminho_janelas()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
 # -----------------------------------------------------------------------------
 # POSIÇÕES ABERTAS (rascunho ao vivo do Diário) — ver plano em
 # C:\Users\jesue\.claude\plans\analise-o-bloco-de-glimmering-marble.md
@@ -739,11 +774,27 @@ def lock_posicoes_abertas(tentativas: int = 1, espera_segundos: float = 0.15):
             pass
 
 
+def _com_conta_padrao(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Shim de migração (2026-08-04, integração cTrader) — todo parquet de
+    posição/trade salvo antes da coluna `conta` existir (só havia MT5)
+    não tem essa coluna. Preenche com `"MT5"` na LEITURA, sem reescrever o
+    arquivo sozinho (o próximo save natural já grava a coluna de verdade).
+    Usado por `carregar_posicoes_abertas`/`carregar_tickets_finalizados`/
+    `carregar_tickets_ignorados`/`carregar_ordens_pendentes` — as 4 tabelas
+    onde `id_posicao`/ticket passa a ser escopado por `(conta, id)` em vez
+    de globalmente único (ver diario_trade.py)."""
+    if df is None or 'conta' in df.columns:
+        return df
+    df = df.copy()
+    df['conta'] = 'MT5'
+    return df
+
+
 def salvar_posicoes_abertas(df: pd.DataFrame):
     """Salva a tabela de posições abertas/rascunhos — escrita atômica
     (dois escritores possíveis, ver comentário da seção)."""
     cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
-    _salvar_parquet_atomico(_caminho_posicoes_abertas(), df)
+    _salvar_parquet_atomico(_caminho_posicoes_abertas(), _com_conta_padrao(df))
 
 
 def carregar_posicoes_abertas() -> pd.DataFrame | None:
@@ -752,7 +803,7 @@ def carregar_posicoes_abertas() -> pd.DataFrame | None:
     caminho = _caminho_posicoes_abertas()
     if not caminho.exists():
         return None
-    return pd.read_parquet(caminho)
+    return _com_conta_padrao(pd.read_parquet(caminho))
 
 
 # -----------------------------------------------------------------------------
@@ -802,14 +853,14 @@ def _caminho_tickets_finalizados() -> Path:
 
 def salvar_tickets_finalizados(df: pd.DataFrame):
     cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
-    _salvar_parquet_atomico(_caminho_tickets_finalizados(), df)
+    _salvar_parquet_atomico(_caminho_tickets_finalizados(), _com_conta_padrao(df))
 
 
 def carregar_tickets_finalizados() -> pd.DataFrame | None:
     caminho = _caminho_tickets_finalizados()
     if not caminho.exists():
         return None
-    return pd.read_parquet(caminho)
+    return _com_conta_padrao(pd.read_parquet(caminho))
 
 
 # -----------------------------------------------------------------------------
@@ -832,14 +883,14 @@ def _caminho_tickets_ignorados() -> Path:
 
 def salvar_tickets_ignorados(df: pd.DataFrame):
     cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
-    _salvar_parquet_atomico(_caminho_tickets_ignorados(), df)
+    _salvar_parquet_atomico(_caminho_tickets_ignorados(), _com_conta_padrao(df))
 
 
 def carregar_tickets_ignorados() -> pd.DataFrame | None:
     caminho = _caminho_tickets_ignorados()
     if not caminho.exists():
         return None
-    return pd.read_parquet(caminho)
+    return _com_conta_padrao(pd.read_parquet(caminho))
 
 
 # -----------------------------------------------------------------------------
@@ -858,7 +909,7 @@ def _caminho_ordens_pendentes() -> Path:
 def salvar_ordens_pendentes(df: pd.DataFrame):
     """Salva a tabela de ordens pendentes (escrita atômica)."""
     cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
-    _salvar_parquet_atomico(_caminho_ordens_pendentes(), df)
+    _salvar_parquet_atomico(_caminho_ordens_pendentes(), _com_conta_padrao(df))
 
 
 def carregar_ordens_pendentes() -> pd.DataFrame | None:
@@ -866,7 +917,88 @@ def carregar_ordens_pendentes() -> pd.DataFrame | None:
     caminho = _caminho_ordens_pendentes()
     if not caminho.exists():
         return None
+    return _com_conta_padrao(pd.read_parquet(caminho))
+
+
+# -----------------------------------------------------------------------------
+# EVENTOS DE ORDENS PENDENTES (2026-08-03, pedido do Jesué) — log APPEND-ONLY
+# de criação/alteração de preço/remoção de ordens pendentes, detectado a cada
+# ciclo de sincronização (comparando o snapshot novo com o anterior, ver
+# `diario_trade.detectar_eventos_ordens_pendentes`/`sincronizar_ordens_
+# pendentes`). Motivação: a conta do Jesué é hedging e não usa SL/TP nativo
+# do MT5 (`sl`/`tp` sempre `None` em posições e ordens, confirmado
+# empiricamente) — o único jeito de capturar "quando/como ele ajustou o
+# stop/alvo" é observar as ordens pendentes (limitadas/stop) mudando de
+# preço/sumindo/aparecendo ao longo do tempo. Nunca escreve retroativo — só
+# alimenta a partir de agora, cada ciclo adiciona linhas novas, nunca reescreve
+# as antigas. Mesmo escritor único do sync principal (sem lock dedicado,
+# mesmo raciocínio de `salvar_ordens_pendentes` acima), escrita sempre
+# atômica.
+# -----------------------------------------------------------------------------
+
+def _caminho_eventos_ordens() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "eventos_ordens_pendentes.parquet"
+
+
+def salvar_eventos_ordens_append(df_novos_eventos: pd.DataFrame):
+    """Acrescenta linhas ao log de eventos (nunca sobrescreve as antigas).
+    Não faz nada se `df_novos_eventos` estiver vazio — evita reescrever o
+    arquivo (e mexer no mtime) num ciclo sem nenhuma mudança real."""
+    if df_novos_eventos is None or df_novos_eventos.empty:
+        return
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    existente = carregar_eventos_ordens()
+    combinado = (pd.concat([existente, df_novos_eventos], ignore_index=True)
+                 if existente is not None and not existente.empty else df_novos_eventos)
+    _salvar_parquet_atomico(_caminho_eventos_ordens(), combinado)
+
+
+def carregar_eventos_ordens() -> pd.DataFrame | None:
+    """Carrega o log de eventos de ordens pendentes. None se ainda não existir
+    (nenhum evento registrado desde que este recurso foi ligado)."""
+    caminho = _caminho_eventos_ordens()
+    if not caminho.exists():
+        return None
     return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# QUALIDADE DE EXECUÇÃO (2026-08-04) — companion table chaveada por
+# `id_trade`, nunca escrita dentro de `diario_trades.parquet` diretamente
+# (aditivo, sem risco pro arquivo principal do diário). Uma linha por trade
+# real: quantos pontos o preço de entrada/saída ficou do melhor preço
+# disponível nos 30s ao redor do fill, calculado a partir do tick real do
+# MT5. `calculado_em` sempre presente mesmo quando o resultado é "não deu
+# pra calcular" (tick indisponível pra aquele contrato/data) — marca a
+# tentativa pra não ficar re-tentando pra sempre o mesmo trade antigo a
+# cada ciclo de sync.
+# -----------------------------------------------------------------------------
+
+def _caminho_qualidade_execucao() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "qualidade_execucao.parquet"
+
+
+def carregar_qualidade_execucao() -> pd.DataFrame | None:
+    caminho = _caminho_qualidade_execucao()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def salvar_qualidade_execucao_upsert(df_novas: pd.DataFrame):
+    """Upsert por `id_trade` — substitui a linha antiga do mesmo trade se
+    houver (permite recalcular), soma as novas. Não faz nada se
+    `df_novas` estiver vazio."""
+    if df_novas is None or df_novas.empty:
+        return
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    existente = carregar_qualidade_execucao()
+    if existente is not None and not existente.empty:
+        existente = existente[~existente["id_trade"].isin(df_novas["id_trade"])]
+        combinado = pd.concat([existente, df_novas], ignore_index=True)
+    else:
+        combinado = df_novas
+    _salvar_parquet_atomico(_caminho_qualidade_execucao(), combinado)
 
 
 # -----------------------------------------------------------------------------
@@ -996,6 +1128,61 @@ def carregar_checklist_pretrade_dia() -> pd.DataFrame | None:
     return pd.read_parquet(caminho)
 
 
+def _caminho_conquistas_dia() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / "diario_conquistas_dia.parquet"
+
+
+def _caminho_conquistas_dia_lock() -> Path:
+    return cfg.PASTA_BASE_PROCESSADA / '.conquistas_dia.lock'
+
+
+@contextmanager
+def lock_conquistas_dia():
+    """Mesmo mecanismo de `lock_checklist_pretrade_dia()` (criação atômica
+    via O_EXCL) — log append-only de conquistas do plano (meta de ganho/
+    prejuízo do dia, 2026-08-06), base pra gamificação futura."""
+    caminho = _caminho_conquistas_dia_lock()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+
+    if caminho.exists():
+        try:
+            idade = time.time() - caminho.stat().st_mtime
+        except FileNotFoundError:
+            idade = 0
+        if idade > _LOCK_STALE_SEGUNDOS:
+            try:
+                caminho.unlink()
+            except FileNotFoundError:
+                pass
+
+    try:
+        fd = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.close(fd)
+    except FileExistsError:
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        try:
+            caminho.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def salvar_conquistas_dia(df: pd.DataFrame):
+    cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_caminho_conquistas_dia(), index=False)
+
+
+def carregar_conquistas_dia() -> pd.DataFrame | None:
+    caminho = _caminho_conquistas_dia()
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
 def salvar_roda_vida(df: pd.DataFrame):
     cfg.PASTA_BASE_PROCESSADA.mkdir(parents=True, exist_ok=True)
     df.to_parquet(_caminho_roda_vida(), index=False)
@@ -1074,3 +1261,45 @@ def carregar_tracados() -> pd.DataFrame | None:
     if not caminho.exists():
         return None
     return pd.read_parquet(caminho)
+
+
+# -----------------------------------------------------------------------------
+# TICK HISTÓRICO — particionado por dia (protótipo de backtesting tick a tick)
+# -----------------------------------------------------------------------------
+# Diferente de `salvar_candles` (um arquivo monolítico regravado inteiro a
+# cada update), tick é particionado UM ARQUIVO POR DIA DE PREGÃO: um dia já
+# fechado nunca muda, então nunca precisa ser reescrito — reescrever um
+# monolito a cada backfill incremental não escalaria no volume de tick (ver
+# spec_prototipo_backtesting_tick.md, Parte 1). Backfill é sempre decoupled
+# do ciclo de 30s do dashboard/`--atualizar` — só roda sob demanda.
+
+def _caminho_ticks_dia(ativo: str, dia) -> Path:
+    """`dia` aceita `datetime.date`, `datetime.datetime` ou string 'YYYY-MM-DD'."""
+    if isinstance(dia, str):
+        dia_str = dia
+    else:
+        dia_str = pd.Timestamp(dia).strftime('%Y-%m-%d')
+    return cfg.PASTA_BASE_PROCESSADA / "ticks" / ativo / f"{dia_str}.parquet"
+
+
+def salvar_ticks_dia(ativo: str, dia, df: pd.DataFrame):
+    """Salva os ticks de UM dia de pregão. Escrita atômica — mesmo idioma de
+    `_salvar_parquet_atomico` usado pelos candles."""
+    caminho = _caminho_ticks_dia(ativo, dia)
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    _salvar_parquet_atomico(caminho, df)
+    print(f"[persistencia] {ativo} {caminho.stem}: {len(df)} ticks salvos em {caminho}")
+
+
+def carregar_ticks_dia(ativo: str, dia) -> pd.DataFrame | None:
+    """Carrega os ticks de um dia já salvo. Retorna None se aquele dia ainda
+    não teve backfill (não é erro — só significa "ainda não buscado")."""
+    caminho = _caminho_ticks_dia(ativo, dia)
+    if not caminho.exists():
+        return None
+    return pd.read_parquet(caminho)
+
+
+def ticks_dia_existe(ativo: str, dia) -> bool:
+    """Checa se o dia já tem backfill de tick salvo, sem precisar carregar o arquivo."""
+    return _caminho_ticks_dia(ativo, dia).exists()

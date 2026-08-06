@@ -318,13 +318,18 @@
 
 /* Ícones de rating do Check-in do Dia (Água/Exercício/Alimentação,
    2026-08-03, pedido do Jesué: "copinhos"/"halteres"/"maçãs" em vez de
-   estrela) — mesma mecânica de .diario-estrela (nota 1-5 clicável), mas
-   emoji já é colorido por natureza, então o estado "não marcado" usa
-   dessaturação/opacidade em vez de trocar o glifo. */
+   estrela) — mesma mecânica de .diario-estrela (nota 1-5 clicável). O
+   glifo em si não é mais emoji via `content` (corrigido 2026-08-03 —
+   regra "sem emojis" cobria justo o widget que motivou o pedido, e essa
+   varredura de CSS tinha ficado de fora da varredura em *.py); agora é um
+   `DashIconify` (Tabler) de verdade renderizado como filho do `html.Span`
+   em `_icone_rating` (diario_app_classico.py) — o `filter`/`opacity`
+   abaixo continuam funcionando normalmente sobre o SVG filho. */
 .diario-icone-rating {
     cursor: pointer;
-    font-size: 20px;
-    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     user-select: none;
     filter: grayscale(1);
     opacity: 0.35;
@@ -334,9 +339,6 @@
     filter: none;
     opacity: 1;
 }
-.diario-icone-agua::before { content: '🥤'; }
-.diario-icone-exercicio::before { content: '🏋️'; }
-.diario-icone-alimentacao::before { content: '🍎'; }
 
 /* Barra de ferramentas de desenho — aba "Traçados" (ver assets/lwchart.js).
    Estado "ativa" é alternado via classList direto no JS (não recriado por
@@ -645,4 +647,82 @@
     top: var(--sq-vp-topo, 0px) !important;
     height: var(--sq-vp-altura, 100vh) !important;
     bottom: auto !important;
+}
+
+/* -------------------------------------------------------------------------
+   Menu lateral — fusão trilha+painel (2026-08-04, correção do Jesué sobre
+   o rollout TradeZella original: "você colocou esse menu extra ao lado...
+   não quero dessa forma"). Cada grupo é 1 linha só (`.sq-menu-item`,
+   ícone+texto), que anima de "só ícone" (`.sq-menu-recolhido`) pra "ícone
+   + texto" (`.sq-menu-expandido`) via `max-width`/`opacity` no texto —
+   nunca um segundo elemento/painel ao lado. Árvore de sub-páginas
+   (`.sq-arvore`, hoje só Coaching) usa o truque `grid-template-rows`
+   0fr→1fr pra animar altura sem JS calcular pixel nenhum.
+   ------------------------------------------------------------------------- */
+.sq-menu-coluna {
+    transition: width 0.25s ease;
+}
+.sq-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    padding: 8px 12px;
+    border-radius: 8px;
+    text-align: left;
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 13px;
+    box-sizing: border-box;
+}
+.sq-menu-item:hover {
+    background: var(--border);
+}
+.sq-menu-icone {
+    flex-shrink: 0;
+}
+.sq-menu-texto {
+    white-space: nowrap;
+    overflow: hidden;
+    max-width: 160px;
+    opacity: 1;
+    transition: max-width 0.25s ease, opacity 0.15s ease 0.05s;
+}
+.sq-menu-chevron {
+    flex-shrink: 0;
+    margin-left: auto;
+    transition: transform 0.2s ease, max-width 0.25s ease, opacity 0.1s ease;
+}
+.sq-chevron-aberto {
+    transform: rotate(90deg);
+}
+.sq-menu-recolhido .sq-menu-texto,
+.sq-menu-recolhido .sq-menu-chevron {
+    max-width: 0;
+    opacity: 0;
+    transition: max-width 0.2s ease, opacity 0.1s ease;
+}
+.sq-menu-recolhido .sq-arvore {
+    display: none;
+}
+.sq-arvore {
+    display: grid;
+    grid-template-rows: 0fr;
+    transition: grid-template-rows 0.25s ease;
+    margin-left: 18px;
+}
+.sq-arvore-aberta {
+    grid-template-rows: 1fr;
+}
+.sq-arvore-inner {
+    overflow: hidden;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.sq-submenu-item {
+    font-size: 12px !important;
 }

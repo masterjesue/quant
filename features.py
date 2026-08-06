@@ -16,6 +16,7 @@ import numpy as np
 from datetime import time
 
 import config_backtest as cfg
+import diario_trade
 
 
 # =============================================================================
@@ -2284,19 +2285,46 @@ def calcular_buildup_e_double_pressure(df: pd.DataFrame, janela: int = 8) -> pd.
 # BLOCO 7 — TEMPORAL
 # =============================================================================
 
-def calcular_temporal(df: pd.DataFrame) -> pd.DataFrame:
+def calcular_temporal(df: pd.DataFrame, ativo: str) -> pd.DataFrame:
+    """`janela_pregao`/`sessao` vêm do cadastro editável (aba Estratégias —
+    `diario_trade.listar_janelas`/`listar_sessoes`, 2026-08-04), não mais de
+    `cfg.JANELAS_PREGAO` fixo — permite Sessão/Janela por ativo (B3 09h-17h
+    pra WIN/WDO/BIT, Londres/NY etc pro que o Jesué cadastrar pra
+    XAUUSD/EURUSD). Catálogo é carregado UMA vez por chamada (não por
+    candle) — só o match linha-a-linha roda por candle, mesmo custo de
+    antes. Detecção sempre automática por horário do candle, nunca input
+    manual."""
     df = df.copy()
+
+    janelas = diario_trade.listar_janelas(ativo=ativo)
+    sessoes = diario_trade.listar_sessoes(ativo=ativo)
+
+    def _primeiro_match(t, catalogo, rotulo_vazio):
+        for _, linha in catalogo.iterrows():
+            h_i, m_i = map(int, linha['hora_inicio'].split(':'))
+            h_f, m_f = map(int, linha['hora_fim'].split(':'))
+            inicio, fim = time(h_i, m_i), time(h_f, m_f)
+            # Sessões de forex cruzam meia-noite (ex: Sydney 19:00-04:00,
+            # 2026-08-06) — hora_fim < hora_inicio marca "vira o dia", casa
+            # se t está depois do início OU antes do fim, não entre os dois.
+            # B3/WIN/WDO/BIT nunca cruzam meia-noite, então esse ramo nunca
+            # muda o comportamento deles (`inicio <= fim` sempre verdadeiro
+            # pra eles) — sem regressão no caminho já validado.
+            match = (inicio <= t < fim) if inicio <= fim else (t >= inicio or t < fim)
+            if match:
+                return linha['slug']
+        return rotulo_vazio
 
     def _janela(dt):
         t = dt.time() if hasattr(dt, 'time') else dt
-        for nome, (inicio_str, fim_str) in cfg.JANELAS_PREGAO.items():
-            h_i, m_i = map(int, inicio_str.split(':'))
-            h_f, m_f = map(int, fim_str.split(':'))
-            if time(h_i, m_i) <= t < time(h_f, m_f):
-                return nome
-        return 'fora_pregao'
+        return _primeiro_match(t, janelas, 'fora_pregao')
+
+    def _sessao(dt):
+        t = dt.time() if hasattr(dt, 'time') else dt
+        return _primeiro_match(t, sessoes, 'fora_sessao')
 
     df['janela_pregao'] = df['datetime'].apply(_janela)
+    df['sessao']        = df['datetime'].apply(_sessao)
     df['dia_semana']    = pd.to_datetime(df['datetime']).dt.day_name()
     return df
 
@@ -2329,7 +2357,7 @@ def calcular_fluxo_agregado(df: pd.DataFrame, janela: int = 20) -> pd.DataFrame:
 # PIPELINE COMPLETO
 # =============================================================================
 
-def calcular_todos_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
+def calcular_todos_features(df: pd.DataFrame, ativo: str, verbose: bool = True) -> pd.DataFrame:
     n = len(df)
     if verbose:
         print(f"[features] Calculando features para {n} candles...")
@@ -2383,7 +2411,7 @@ def calcular_todos_features(df: pd.DataFrame, verbose: bool = True) -> pd.DataFr
     etapas.append(("Pivô imediato (tático)", calcular_pivo_imediato))
     etapas += [
         ("Build-up e double pressure",  calcular_buildup_e_double_pressure),
-        ("Temporal",                    calcular_temporal),
+        ("Temporal",                    lambda d: calcular_temporal(d, ativo)),
         ("Fluxo agregado",              calcular_fluxo_agregado),
     ]
     if cfg.AUTO_DETECCAO_SR_ATIVA:
@@ -2428,7 +2456,7 @@ if __name__ == '__main__':
     else:
         print(f"Base carregada: {len(df)} candles")
         t0 = _time.time()
-        df_features = calcular_todos_features(df)
+        df_features = calcular_todos_features(df, ativo='WIN')
         t1 = _time.time()
         print(f"\nTempo total: {t1-t0:.1f}s")
         print(df_features[['datetime','tipo_candle','estado_tendencia',

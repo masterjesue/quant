@@ -25,7 +25,7 @@ import math
 # `_sincronizar_posicoes_background` nos dois arquivos). Pegar pelo nome
 # aqui reaproveita o handler existente sem reconfigurar nada.
 _log_sync = logging.getLogger('sync_posicoes')
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -176,7 +176,25 @@ COLUNAS_TAGS_SETUP_ERRO = ["id", "slug", "nome", "tipo", "ativo", "criado_em"]
 # checklist, NÃO ligado a estratégia (é o ritual diário de pré-mercado,
 # igual pra qualquer setup). `padrao=True` marca qual checklist o guarda-
 # corpo de Posição usa quando não há escolha explícita — só 1 por vez.
-COLUNAS_CHECKLIST_PRETRADE = ["id", "slug", "nome", "itens", "padrao", "ativo", "criado_em"]
+# 2026-08-03 (pedido do Jesué): os limites de "quantos trades por dia" do
+# guarda-corpo (`status_do_dia`) eram constantes fixas do sistema
+# (`cfg.DIARIO_LIMITE_TRADES_DIA`/`DIARIO_TRADES_DIA_CRITICO`/
+# `DIARIO_LIMITE_STOPS_DIA`) — agora viram campos editáveis AQUI, no
+# cadastro do Checklist Pré-Trade (o "plano" do Jesué, não uma regra do
+# sistema). `None` num checklist antigo (criado antes desta migração) cai
+# pro valor de `config_backtest.py` como default — ver `status_do_dia`.
+COLUNAS_CHECKLIST_PRETRADE = [
+    "id", "slug", "nome", "itens", "padrao", "ativo", "criado_em",
+    "limite_trades_dia", "limite_critico_trades_dia", "limite_stops_dia",
+    # 2026-08-06 — 3 requisitos pedidos junto (ver [[project_reorg_cadastro_
+    # checklist_pretrade]] na memória): (1) limite de trades/dia por ATIVO
+    # (dict {ativo: limite}; a soma vira `limite_trades_dia` quando
+    # preenchido — ver `status_do_dia`); (2)/(3) metas em R$ do dia —
+    # prejuízo (peso MÁXIMO de alerta, sobrepõe os outros motivos) e ganho
+    # (conquista, não é alerta). `None`/`{}` em qualquer um destes cai pro
+    # comportamento anterior (sem essas metas ativas).
+    "limite_trades_por_ativo", "meta_prejuizo_dia", "meta_ganho_dia",
+]
 
 # Gerenciamento de Risco (Playbook, 2026-08-02; corrigido 2026-08-03) —
 # cadastro SEPARADO e reutilizável (substitui os antigos R:R Presets).
@@ -279,6 +297,9 @@ def listar_checklists_pretrade(somente_ativos: bool = True) -> pd.DataFrame:
             "id": 1, "slug": "padrao", "nome": "Checklist Padrão",
             "itens": list(cfg.DIARIO_CHECKLIST_PRE_TRADE),
             "padrao": True, "ativo": True, "criado_em": datetime.now(),
+            "limite_trades_dia": cfg.DIARIO_LIMITE_TRADES_DIA,
+            "limite_critico_trades_dia": cfg.DIARIO_TRADES_DIA_CRITICO,
+            "limite_stops_dia": cfg.DIARIO_LIMITE_STOPS_DIA,
         }], columns=COLUNAS_CHECKLIST_PRETRADE)
         persistencia.salvar_checklist_pretrade(df)
     df = df.reindex(columns=COLUNAS_CHECKLIST_PRETRADE)
@@ -303,7 +324,22 @@ def obter_checklist_pretrade(id_checklist=None) -> dict | None:
     return (padrao if not padrao.empty else df).iloc[0].to_dict()
 
 
-def criar_checklist_pretrade(nome: str, itens: list[str] | None = None, padrao: bool = False) -> int | None:
+def criar_checklist_pretrade(nome: str, itens: list[str] | None = None, padrao: bool = False,
+                              limite_trades_dia: int | None = None,
+                              limite_critico_trades_dia: int | None = None,
+                              limite_stops_dia: int | None = None,
+                              limite_trades_por_ativo: dict | None = None,
+                              meta_prejuizo_dia: float | None = None,
+                              meta_ganho_dia: float | None = None) -> int | None:
+    """`limite_*` em branco cai pro default de `config_backtest.py` — só
+    existe pra quem quiser um plano diferente do default do sistema.
+
+    `limite_trades_por_ativo` ({ativo: limite}, 2026-08-06): quando tem
+    pelo menos 1 entrada com valor, a SOMA dessas entradas substitui
+    `limite_trades_dia` — ver `status_do_dia`. `meta_prejuizo_dia`/`meta_
+    ganho_dia` (R$, sempre positivos aqui — o sinal de prejuízo é aplicado
+    na comparação, não no cadastro) ficam `None` por padrão (metas
+    opcionais, sem essas o guarda-corpo se comporta como antes)."""
     with persistencia.lock_estrategias() as adquirida:
         if not adquirida:
             return None
@@ -313,10 +349,22 @@ def criar_checklist_pretrade(nome: str, itens: list[str] | None = None, padrao: 
         eh_primeiro = df.empty
         if padrao or eh_primeiro:
             df["padrao"] = False
+        limite_por_ativo_limpo = {k: int(v) for k, v in (limite_trades_por_ativo or {}).items() if v}
         nova = {
             "id": _proximo_id(df), "slug": _slugificar(nome), "nome": nome.strip(),
             "itens": list(itens or []), "padrao": bool(padrao or eh_primeiro),
             "ativo": True, "criado_em": datetime.now(),
+            "limite_trades_dia": (sum(limite_por_ativo_limpo.values()) if limite_por_ativo_limpo
+                                   else (limite_trades_dia if limite_trades_dia is not None else cfg.DIARIO_LIMITE_TRADES_DIA)),
+            "limite_critico_trades_dia": limite_critico_trades_dia if limite_critico_trades_dia is not None else cfg.DIARIO_TRADES_DIA_CRITICO,
+            "limite_stops_dia": limite_stops_dia if limite_stops_dia is not None else cfg.DIARIO_LIMITE_STOPS_DIA,
+            # `None` (não `{}`) quando vazio — um dict vazio em TODAS as
+            # linhas faz o pyarrow falhar ao gravar Parquet ("Cannot write
+            # struct type with no child field"), já que não há nenhuma
+            # chave em lugar nenhum pra inferir o schema da coluna.
+            "limite_trades_por_ativo": limite_por_ativo_limpo or None,
+            "meta_prejuizo_dia": float(meta_prejuizo_dia) if meta_prejuizo_dia not in (None, "") else None,
+            "meta_ganho_dia": float(meta_ganho_dia) if meta_ganho_dia not in (None, "") else None,
         }
         df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
         persistencia.salvar_checklist_pretrade(df.reindex(columns=COLUNAS_CHECKLIST_PRETRADE))
@@ -380,6 +428,7 @@ def obter_gerenciamento_risco(id_gerenciamento) -> dict | None:
     df = persistencia.carregar_gerenciamento_risco()
     if df is None or df.empty:
         return None
+    df = df.reindex(columns=COLUNAS_GERENCIAMENTO_RISCO)
     try:
         linhas = df[df["id"] == int(id_gerenciamento)]
     except (TypeError, ValueError):
@@ -412,6 +461,11 @@ def criar_gerenciamento_risco(nome: str, ativo_mercado: str, alvo_pontos: float,
         df = persistencia.carregar_gerenciamento_risco()
         if df is None:
             df = pd.DataFrame(columns=COLUNAS_GERENCIAMENTO_RISCO)
+        # Reindex antes de qualquer acesso por coluna — parquets criados
+        # antes de 2026-08-03 (pré "risco por ATIVO") não têm
+        # `ativo_mercado`/`padrao` e quebravam aqui com KeyError → 500
+        # (bug real "gerenciamento de risco não salva", achado 2026-08-05).
+        df = df.reindex(columns=COLUNAS_GERENCIAMENTO_RISCO)
         eh_primeiro_do_ativo = df.empty or not (df["ativo_mercado"] == ativo_mercado).any()
         vira_padrao = bool(padrao or eh_primeiro_do_ativo)
         if vira_padrao and not df.empty:
@@ -439,6 +493,7 @@ def editar_gerenciamento_risco(id_gerenciamento: int, **campos) -> bool:
         df = persistencia.carregar_gerenciamento_risco()
         if df is None or id_gerenciamento not in set(df["id"]):
             return False
+        df = df.reindex(columns=COLUNAS_GERENCIAMENTO_RISCO)
         idx = df.index[df["id"] == id_gerenciamento][0]
         for chave, valor in campos.items():
             if chave in COLUNAS_GERENCIAMENTO_RISCO:
@@ -457,6 +512,7 @@ def definir_gerenciamento_risco_padrao(id_gerenciamento: int) -> bool:
         df = persistencia.carregar_gerenciamento_risco()
         if df is None or id_gerenciamento not in set(df["id"]):
             return False
+        df = df.reindex(columns=COLUNAS_GERENCIAMENTO_RISCO)
         ativo_mercado = df.loc[df["id"] == id_gerenciamento, "ativo_mercado"].iloc[0]
         df.loc[df["ativo_mercado"] == ativo_mercado, "padrao"] = False
         df.loc[df["id"] == id_gerenciamento, "padrao"] = True
@@ -625,6 +681,143 @@ def desativar_tag_emocional(id_tag: int) -> bool:
     return editar_tag_emocional(id_tag, ativo=False)
 
 
+# Sessão (Londres, NY, Tóquio etc) / Janela (recorte tático de horário —
+# substitui `cfg.JANELAS_PREGAO`), 2026-08-04. Cadastro editável na aba
+# Estratégias, mesmo idioma CRUD do resto desta seção — vale pra
+# WIN/WDO/BIT também, não só pros ativos cTrader (XAUUSD/EURUSD). A
+# detecção de qual Sessão/Janela um candle/trade cai é SEMPRE automática
+# por timestamp (ver `features.calcular_temporal`) — nunca seleção manual
+# do usuário; `ativos` aqui só filtra quais linhas do catálogo entram na
+# comparação de horário pra um dado ativo. `ativos=[]` (lista vazia)
+# significa "vale pra qualquer ativo".
+COLUNAS_SESSOES = ["id", "slug", "nome", "hora_inicio", "hora_fim", "ativos", "ativo", "criado_em"]
+COLUNAS_JANELAS = ["id", "slug", "nome", "hora_inicio", "hora_fim", "sessao_id", "ativos", "ativo", "criado_em"]
+
+# Seed migrado de `cfg.JANELAS_PREGAO` na 1ª chamada de `listar_janelas` —
+# preserva o `janela_pregao` de qualquer trade/candle já existente de
+# WIN/WDO/BIT byte a byte, sem exigir recadastro manual. Sessão fica SEM
+# seed (lista vazia) de propósito: o Jesué ainda não tem uma rotina de
+# forex definida, cadastra Londres/NY/etc pela UI conforme for descobrindo
+# o que funciona — não é a este código inventar isso por ele.
+_JANELAS_SEED_ATIVOS = ["WIN", "WDO", "BIT"]
+
+
+def _filtrar_por_ativo(df: pd.DataFrame, ativo: str | None) -> pd.DataFrame:
+    """Uma linha vale pro `ativo` pedido se `ativos` está vazio (= todos) ou
+    contém `ativo`. `ativo=None` não filtra nada (usado pela UI de cadastro,
+    que lista tudo independente de ativo)."""
+    if ativo is None or df.empty:
+        return df
+    # `len(linha) == 0` em vez de `not linha` — depois de um round-trip por
+    # Parquet, a coluna de lista volta como numpy array, e `not array` com
+    # mais de 1 elemento levanta ValueError (verdade ambígua).
+    return df[df["ativos"].apply(lambda linha: len(linha) == 0 or ativo in linha)]
+
+
+def listar_sessoes(somente_ativas: bool = True, ativo: str | None = None) -> pd.DataFrame:
+    df = persistencia.carregar_sessoes()
+    if df is None:
+        df = pd.DataFrame(columns=COLUNAS_SESSOES)
+        persistencia.salvar_sessoes(df)
+    df = df.reindex(columns=COLUNAS_SESSOES)
+    if somente_ativas:
+        df = df[df["ativo"].astype(bool)]
+    return _filtrar_por_ativo(df, ativo).sort_values("hora_inicio").reset_index(drop=True)
+
+
+def criar_sessao(nome: str, hora_inicio: str, hora_fim: str, ativos: list[str] | None = None) -> int | None:
+    with persistencia.lock_estrategias() as adquirida:
+        if not adquirida:
+            return None
+        df = persistencia.carregar_sessoes()
+        if df is None:
+            df = pd.DataFrame(columns=COLUNAS_SESSOES)
+        nova = {
+            "id": _proximo_id(df), "slug": _slugificar(nome), "nome": nome.strip(),
+            "hora_inicio": hora_inicio, "hora_fim": hora_fim, "ativos": list(ativos or []),
+            "ativo": True, "criado_em": datetime.now(),
+        }
+        df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
+        persistencia.salvar_sessoes(df.reindex(columns=COLUNAS_SESSOES))
+        return nova["id"]
+
+
+def editar_sessao(id_sessao: int, **campos) -> bool:
+    with persistencia.lock_estrategias() as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_sessoes()
+        if df is None or id_sessao not in set(df["id"]):
+            return False
+        idx = df.index[df["id"] == id_sessao][0]
+        for chave, valor in campos.items():
+            if chave in COLUNAS_SESSOES:
+                df.at[idx, chave] = valor
+        persistencia.salvar_sessoes(df)
+        return True
+
+
+def desativar_sessao(id_sessao: int) -> bool:
+    return editar_sessao(id_sessao, ativo=False)
+
+
+def listar_janelas(somente_ativas: bool = True, ativo: str | None = None) -> pd.DataFrame:
+    """Semeia as 5 janelas de `cfg.JANELAS_PREGAO` na 1ª chamada (tabela
+    ainda não existe em disco), escopadas a WIN/WDO/BIT — mesmo padrão de
+    `listar_estrategias`."""
+    df = persistencia.carregar_janelas()
+    if df is None:
+        agora = datetime.now()
+        df = pd.DataFrame([
+            {"id": i + 1, "slug": slug, "nome": slug.replace("_", " ").title(),
+             "hora_inicio": inicio, "hora_fim": fim, "sessao_id": None,
+             "ativos": list(_JANELAS_SEED_ATIVOS), "ativo": True, "criado_em": agora}
+            for i, (slug, (inicio, fim)) in enumerate(cfg.JANELAS_PREGAO.items())
+        ], columns=COLUNAS_JANELAS)
+        persistencia.salvar_janelas(df)
+    df = df.reindex(columns=COLUNAS_JANELAS)
+    if somente_ativas:
+        df = df[df["ativo"].astype(bool)]
+    return _filtrar_por_ativo(df, ativo).sort_values("hora_inicio").reset_index(drop=True)
+
+
+def criar_janela(nome: str, hora_inicio: str, hora_fim: str, sessao_id: int | None = None,
+                  ativos: list[str] | None = None) -> int | None:
+    with persistencia.lock_estrategias() as adquirida:
+        if not adquirida:
+            return None
+        df = persistencia.carregar_janelas()
+        if df is None:
+            df = pd.DataFrame(columns=COLUNAS_JANELAS)
+        nova = {
+            "id": _proximo_id(df), "slug": _slugificar(nome), "nome": nome.strip(),
+            "hora_inicio": hora_inicio, "hora_fim": hora_fim, "sessao_id": sessao_id,
+            "ativos": list(ativos or []), "ativo": True, "criado_em": datetime.now(),
+        }
+        df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
+        persistencia.salvar_janelas(df.reindex(columns=COLUNAS_JANELAS))
+        return nova["id"]
+
+
+def editar_janela(id_janela: int, **campos) -> bool:
+    with persistencia.lock_estrategias() as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_janelas()
+        if df is None or id_janela not in set(df["id"]):
+            return False
+        idx = df.index[df["id"] == id_janela][0]
+        for chave, valor in campos.items():
+            if chave in COLUNAS_JANELAS:
+                df.at[idx, chave] = valor
+        persistencia.salvar_janelas(df)
+        return True
+
+
+def desativar_janela(id_janela: int) -> bool:
+    return editar_janela(id_janela, ativo=False)
+
+
 # -----------------------------------------------------------------------------
 # CHECK-IN DIÁRIO / RODA DA VIDA / ESCALA HAWKINS (aba "Bem-Estar", feedback
 # diário.txt 2026-07-11) — primeiro caso do projeto de tabela chaveada por
@@ -699,6 +892,50 @@ def salvar_checklist_pretrade_dia(data, id_checklist: int, marcados: list[int], 
         return True
 
 
+COLUNAS_CONQUISTAS_DIA = ["data", "tipo", "valor_referencia", "criado_em"]
+
+
+def registrar_conquista_dia(data, tipo: str, valor_referencia: float | None = None) -> bool:
+    """Log append-only de conquistas do plano (2026-08-06, pedido do Jesué:
+    "contabilizar as conquistas de meta batida") — HOJE só alimenta
+    `status_do_dia` (meta de ganho do dia batida); base pra gamificação
+    FUTURA (score/ranking) que ele quer construir depois — não constrói a
+    gamificação agora, só deixa a conquista registrada pra não precisar de
+    migração retroativa quando ela vier. Idempotente por (data, tipo):
+    `status_do_dia` é chamado repetidamente (poll a cada 6s do guarda-
+    corpo) e não deve duplicar a mesma conquista do mesmo dia."""
+    if isinstance(data, str):
+        data = date.fromisoformat(data)
+    with persistencia.lock_conquistas_dia() as adquirida:
+        if not adquirida:
+            return False
+        df = persistencia.carregar_conquistas_dia()
+        if df is None:
+            df = pd.DataFrame(columns=COLUNAS_CONQUISTAS_DIA)
+        if not df.empty and ((df["data"] == data) & (df["tipo"] == tipo)).any():
+            return True
+        nova = {
+            "data": data, "tipo": tipo,
+            "valor_referencia": float(valor_referencia) if valor_referencia is not None else None,
+            "criado_em": datetime.now(),
+        }
+        df = pd.concat([df, pd.DataFrame([nova])], ignore_index=True)
+        persistencia.salvar_conquistas_dia(df.reindex(columns=COLUNAS_CONQUISTAS_DIA))
+        return True
+
+
+def listar_conquistas_dia(data=None) -> pd.DataFrame:
+    df = persistencia.carregar_conquistas_dia()
+    if df is None:
+        return pd.DataFrame(columns=COLUNAS_CONQUISTAS_DIA)
+    df = df.reindex(columns=COLUNAS_CONQUISTAS_DIA)
+    if data is not None:
+        if isinstance(data, str):
+            data = date.fromisoformat(data)
+        df = df[df["data"] == data]
+    return df.sort_values("criado_em").reset_index(drop=True)
+
+
 def _calcular_duracao_sono(hora_dormir, hora_acordar) -> float | None:
     """Duração do sono em horas a partir de texto 'HH:MM' — assume que
     cruza a meia-noite se a hora de acordar for numericamente menor (ex.:
@@ -717,8 +954,20 @@ def _calcular_duracao_sono(hora_dormir, hora_acordar) -> float | None:
 
 
 def salvar_checkin_dia(data, campos: dict) -> bool:
-    """Upsert por data — remove o check-in existente daquele dia (se
-    houver) e grava o novo, nunca duplica linha."""
+    """Upsert por data — atualiza o check-in existente daquele dia (se
+    houver) e grava o resultado, nunca duplica linha.
+
+    BUG REAL corrigido em 2026-08-03: a versão anterior fazia um REPLACE
+    cego — começava de um dict todo `None` e só sobrepunha as chaves
+    presentes em `campos`, então qualquer campo que a chamada não
+    mencionasse (ex.: `gratidao_1..5`, que o callback do formulário nem
+    inclui) era APAGADO, mesmo já tendo um valor salvo. Um teste feito
+    direto contra o parquet de produção (só com `observacoes='teste'` no
+    `campos`) apagou o check-in real de 2026-08-02/03 do Jesué (sono, café,
+    água, exercício, alimentação, gratidão — tudo virou `None`, sem
+    backup). Agora funde com a linha existente: só os campos PRESENTES em
+    `campos` (mesmo que `None`, se explicitamente passado) sobrescrevem;
+    qualquer campo ausente do dict mantém o valor já salvo."""
     if isinstance(data, str):
         data = date.fromisoformat(data)
     with persistencia.lock_checkin_diario() as adquirida:
@@ -727,8 +976,10 @@ def salvar_checkin_dia(data, campos: dict) -> bool:
         df = persistencia.carregar_checkin_diario()
         if df is None:
             df = pd.DataFrame(columns=COLUNAS_CHECKIN_DIARIO)
+        linha_existente = df[df["data"] == data]
+        nova = (linha_existente.iloc[0].to_dict() if not linha_existente.empty
+                else {coluna: None for coluna in COLUNAS_CHECKIN_DIARIO})
         df = df[df["data"] != data]
-        nova = {coluna: None for coluna in COLUNAS_CHECKIN_DIARIO}
         nova["data"] = data
         nova.update({k: v for k, v in campos.items() if k in COLUNAS_CHECKIN_DIARIO})
         nova["sono_duracao_horas"] = _calcular_duracao_sono(nova.get("sono_hora_dormir"), nova.get("sono_hora_acordar"))
@@ -911,6 +1162,15 @@ def calcular_nivel_hawkins(checkin: dict | None, medias_emocionais_dia: dict | N
 
 FONTE_MANUAL = "manual"
 FONTE_IMPORTADO = "importado_xlsm"
+# Extrato "Histórico" da plataforma cTrader/Spotware (2026-08-05) — ver
+# `ctrader_importar_extrato.py`. Distinto de `FONTE_IMPORTADO` (que é a
+# migração única e congelada do `diario.xlsm`).
+FONTE_IMPORTADO_CTRADER = "importado_ctrader"
+# Export "Operações" do ProfitPro (2026-08-05) — ver `profit_importar_extrato.py`.
+# Preparado defensivamente a pedido do Jesué ("caso seja necessário"): o
+# WIN/WDO já é sincronizado ao vivo via MT5 hoje, então este caminho serve
+# pra backfill/reconciliação manual, não é o fluxo do dia a dia.
+FONTE_IMPORTADO_PROFIT = "importado_profit"
 
 # Ordem canônica de colunas de `diario_trades.parquet` — mantém o schema
 # estável entre migração e lançamento manual.
@@ -922,6 +1182,12 @@ COLUNAS_DIARIO = [
     "tipo_operacao", "alvo_pontos", "stop_pontos", "lote",
     "preco_entrada", "preco_saida", "tipo_saida", "is_simulated",
     "resultado_pontos", "saldo_operacao_reais",
+    # USD nativo (2026-08-05, ativos cTrader) — `saldo_operacao_reais`
+    # continua SEMPRE preenchido (convertido via `converter_usd_para_reais`,
+    # proxy WDO) pra estatísticas consolidadas não precisarem saber de
+    # moeda; esta coluna só preserva o valor original em dólar. None pra
+    # todo trade BRL (WIN/WDO/BIT).
+    "saldo_operacao_usd",
     "resumo_operacional", "obs",
     "imagem_arquivo",
     "nivel_sr_referencia", "nivel_sr_tipo", "nivel_sr_forte",
@@ -1060,6 +1326,141 @@ def registrar_trade(
         return trade["id_trade"]
 
 
+# ---------------------------------------------------------------------------
+# Moeda/câmbio (2026-08-05) — parte mínima da Fase 4 do plano de integração
+# cTrader trazida pra agora: Jesué já opera XAUUSD e precisa lançar esses
+# trades no Diário antes da conversão dupla-moeda completa (seletor de
+# ativo, cards em US$ etc.) existir. Decisão travada com ele nesta mesma
+# integração: taxa de câmbio USD->BRL usa o preço do WDO como proxy (não
+# API externa), no horário mais próximo do trade — nunca recalculada depois.
+# ---------------------------------------------------------------------------
+
+def taxa_wdo_proxima(momento) -> float | None:
+    """Preço do WDO (fechamento do candle M5 mais próximo de `momento`),
+    convertido pra reais-por-dólar. Escala /1000 confirmada empiricamente
+    (WDO fechando a 5162.0 pontos == R$5,162/USD, condizente com a cotação
+    real do dólar). None se não houver candle de WDO carregado."""
+    if momento is None:
+        return None
+    df_wdo = persistencia.carregar_candles("WDO")
+    if df_wdo is None or df_wdo.empty:
+        return None
+    alvo = pd.Timestamp(momento)
+    idx = (df_wdo["datetime"] - alvo).abs().idxmin()
+    return float(df_wdo.loc[idx, "close"]) / 1000.0
+
+
+def converter_usd_para_reais(valor_usd, momento) -> float | None:
+    """`saldo_operacao_reais` pra um trade em ativo USD — ver `taxa_wdo_proxima`.
+    None se `valor_usd` for None ou não houver taxa disponível (nunca grava
+    um zero enganoso no lugar de "não sei converter")."""
+    if valor_usd is None:
+        return None
+    taxa = taxa_wdo_proxima(momento)
+    if taxa is None:
+        return None
+    return round(float(valor_usd) * taxa, 2)
+
+
+def resolver_janela_sessao(ativo: str, momento) -> tuple[str | None, str | None]:
+    """Mesmo casamento hora_inicio<=t<hora_fim de `features.calcular_temporal`,
+    mas pra um único timestamp — usado pela Importação de extrato (que já
+    tem o horário exato de fechamento do trade, ao contrário do Novo Trade
+    manual, que só pede a Janela por dropdown). Duplica a lógica de matching
+    em vez de importar `features.py` aqui (import circular: `features.py`
+    já importa `diario_trade`). (None, None) se `momento` for None."""
+    if momento is None:
+        return None, None
+    t = pd.Timestamp(momento).time()
+    janelas = listar_janelas(ativo=ativo)
+    sessoes = listar_sessoes(ativo=ativo)
+
+    def _match(catalogo):
+        for _, linha in catalogo.iterrows():
+            h_i, m_i = map(int, linha['hora_inicio'].split(':'))
+            h_f, m_f = map(int, linha['hora_fim'].split(':'))
+            inicio, fim = time(h_i, m_i), time(h_f, m_f)
+            # Sessões de forex cruzam meia-noite (Sydney 19:00-04:00 etc,
+            # 2026-08-06) — mesmo tratamento de wraparound de
+            # `features.calcular_temporal._primeiro_match`.
+            match = (inicio <= t < fim) if inicio <= fim else (t >= inicio or t < fim)
+            if match:
+                return linha['slug']
+        return None
+
+    return _match(janelas), _match(sessoes)
+
+
+# ---------------------------------------------------------------------------
+# Importação de extrato cTrader (2026-08-05) — ver `ctrader_importar_extrato.py`
+# pro parsing do arquivo em si. Este bloco só cuida de gravar no Diário o
+# que já foi parseado/revisado.
+# ---------------------------------------------------------------------------
+
+def trade_ja_importado(ativo: str, datetime_saida, preco_entrada: float,
+                        preco_saida: float, lote: float) -> bool:
+    """True se um trade com esses mesmos fatos de execução já existe no
+    Diário — evita duplicar ao reimportar um extrato/CSV que já cobre um
+    período parcialmente conhecido. Casamento por preços+lote exatos e
+    horário de saída a até 1 minuto de diferença (a fonte tem milissegundos;
+    tolerância cobre qualquer arredondamento no round-trip pelo parquet).
+
+    Checa contra QUALQUER trade já gravado, não só os de uma importação
+    anterior — WIN/WDO já chegam ao Diário sozinhos via sincronização MT5
+    ao vivo (`fonte_registro='manual'`, igual a um lançamento manual, sem
+    tag própria), então um import de CSV do ProfitPro precisa enxergar
+    esses também pra não duplicar. Filtrar por `fonte_registro` aqui seria
+    um furo de segurança pra esse caso."""
+    df = listar_trades(ativo=ativo)
+    if df is None or df.empty:
+        return False
+    candidatos = df[
+        (df["preco_entrada"].round(5) == round(float(preco_entrada), 5))
+        & (df["preco_saida"].round(5) == round(float(preco_saida), 5))
+        & (df["lote"].round(4) == round(float(lote), 4))
+    ]
+    if candidatos.empty:
+        return False
+    alvo = pd.Timestamp(datetime_saida)
+    datas = pd.to_datetime(candidatos["datetime_saida"], errors="coerce")
+    return bool((datas - alvo).abs().le(pd.Timedelta(minutes=1)).any())
+
+
+def importar_trades_lote(linhas: list[dict]) -> list[int]:
+    """Grava em lote trades já revisados no módulo de Importação (cTrader ou
+    ProfitPro — ver `ctrader_importar_extrato.py`/`profit_importar_extrato.py`)
+    — mesma tabela do Novo Trade manual (`novo_trade`/`registrar_trade`), mas
+    com UMA única trava pro lote inteiro (ao contrário de N chamadas a
+    `registrar_trade`, que adquiririam/liberariam a trava uma vez por
+    trade). Cada item de `linhas` é um dict de campos prontos pra
+    `novo_trade(**campos)` — já deve trazer o `fonte_registro` certo pra
+    origem (`FONTE_IMPORTADO_CTRADER`/`FONTE_IMPORTADO_PROFIT`). Retorna a
+    lista de `id_trade` atribuídos, na mesma ordem de `linhas` (vazia se a
+    trava estava ocupada)."""
+    if not linhas:
+        return []
+    with persistencia.lock_diario() as adquirida:
+        if not adquirida:
+            return []
+        df_atual = persistencia.carregar_diario()
+        proximo = _proximo_id_trade(df_atual)
+        novos = []
+        ids = []
+        for campos in linhas:
+            trade = novo_trade(**campos)
+            trade["id_trade"] = proximo
+            ids.append(proximo)
+            proximo += 1
+            novos.append(trade)
+        df_novo = pd.DataFrame(novos)[COLUNAS_DIARIO]
+        df_final = (
+            pd.concat([df_atual, df_novo], ignore_index=True)
+            if df_atual is not None else df_novo
+        )
+        persistencia.salvar_diario(df_final)
+        return ids
+
+
 # Campos que a edição de um trade JÁ GRAVADO pode tocar (ver
 # `atualizar_trade`). É uma allowlist de propósito, não uma denylist: tudo
 # que descreve a EXECUÇÃO (preços, resultado, saldo, lote, datas, tickets,
@@ -1075,6 +1476,14 @@ CAMPOS_EDITAVEIS_TRADE = (
     "tags_setup_erro", "tags_emocionais", "sentimento_mercado",
     "emo_confianca", "emo_humor", "emo_energia", "emo_atencao", "emo_presenca",
     "emo_equilibrio", "emo_disciplina",
+    # 2026-08-06, pedido do Jesué ("preciso poder inserir prints ao editar
+    # um trade importado") — só o NOME do arquivo já salvo em disco por
+    # `salvar_imagem` (a imagem em si nunca passa por aqui). Diferente do
+    # resto desta lista, isto não é "leitura/opinião" no sentido estrito,
+    # mas também não é um FATO DE EXECUÇÃO vindo do MT5/corretora (a
+    # justificativa do porquê esta allowlist existe) — é um anexo do
+    # usuário, seguro de reescrever a qualquer momento.
+    "imagem_arquivo",
 )
 
 # Subconjunto de `CAMPOS_EDITAVEIS_TRADE` guardado como lista no parquet.
@@ -1378,7 +1787,8 @@ def feedback_progress_tracker(por_dia: dict) -> dict:
 
 
 def evolucao_metricas_expandida(df: pd.DataFrame | None = None,
-                                 ano: int | None = None, mes: int | None = None) -> dict:
+                                 ano: int | None = None, mes: int | None = None,
+                                 ativo: str | None = None) -> dict:
     """Evolução dia-a-dia (janela EXPANSIVA — cada ponto usa todos os
     trades até aquele dia inclusive, dentro do recorte ano/mês) de Payoff/
     Fator de Recuperação/Expectativa — pro mini-gráfico + variação % dos
@@ -1402,6 +1812,11 @@ def evolucao_metricas_expandida(df: pd.DataFrame | None = None,
         if mes is not None:
             mascara &= data_op_dt.dt.month == mes
         reais = reais[mascara]
+    col_valor = "saldo_operacao_reais"
+    if ativo:
+        reais = reais[reais["ativo"] == ativo]
+        if cfg.MOEDA_ATIVO.get(ativo) == "USD":
+            col_valor = "saldo_operacao_usd"
     if reais.empty:
         return {"datas": [], "payoff": [], "fator_recuperacao": [], "expectativa": []}
 
@@ -1420,7 +1835,7 @@ def evolucao_metricas_expandida(df: pd.DataFrame | None = None,
     reais = reais.copy()
     reais["data_op"] = pd.to_datetime(reais["data_op"])
     reais = reais.sort_values("data_op")
-    saldo = reais["saldo_operacao_reais"].astype(float)
+    saldo = reais[col_valor].astype(float)
     is_win = saldo > 0
     is_loss = saldo < 0
 
@@ -1477,28 +1892,34 @@ def evolucao_metricas_expandida(df: pd.DataFrame | None = None,
     }
 
 
-def feedback_expectativa(valores: list) -> dict:
+def feedback_expectativa(valores: list, moeda: str = "BRL") -> dict:
     """Veredito DINÂMICO pro card Expectativa Matemática (2026-07-31,
     pedido: "se ainda sobrar espaço vazio, coloque um breve feedback") —
     compara o valor ATUAL contra o melhor/pior nível já alcançado na
     série expansiva (mesmo espírito de `feedback_duracao_performance`,
-    nunca texto fixo)."""
+    nunca texto fixo).
+
+    `moeda` (Fase 4 da integração cTrader, 2026-08-06) — símbolo montado
+    inline (não importa `metricas.formatar_moeda` aqui de propósito:
+    `features.py` importa `diario_trade`, e `metricas.py` importa
+    `features` — importar `metricas` neste módulo criaria import circular)."""
+    simbolo = {"BRL": "R$", "USD": "US$"}.get(moeda, moeda)
     validos = [v for v in valores if v is not None]
     if len(validos) < 2:
         return {"tem_dado": False, "mensagem": "Amostra insuficiente ainda."}
     atual, melhor, pior = validos[-1], max(validos), min(validos)
     if atual >= melhor - 1e-9:
-        acao = f"Expectativa no MELHOR nível já registrado (R$ {atual:+.2f}/trade) — o que está funcionando agora."
+        acao = f"Expectativa no MELHOR nível já registrado ({simbolo} {atual:+.2f}/trade) — o que está funcionando agora."
         cor = "green"
     elif atual <= pior + 1e-9:
-        acao = (f"Expectativa no PIOR nível já registrado (R$ {atual:+.2f}/trade, contra R$ {melhor:+.2f} no "
+        acao = (f"Expectativa no PIOR nível já registrado ({simbolo} {atual:+.2f}/trade, contra {simbolo} {melhor:+.2f} no "
                 f"melhor momento) — reavalie setup e gestão antes de continuar operando.")
         cor = "red"
     elif atual > 0:
-        acao = f"Expectativa positiva (R$ {atual:+.2f}/trade) — ainda distante do melhor nível (R$ {melhor:+.2f})."
+        acao = f"Expectativa positiva ({simbolo} {atual:+.2f}/trade) — ainda distante do melhor nível ({simbolo} {melhor:+.2f})."
         cor = "green"
     else:
-        acao = f"Expectativa negativa (R$ {atual:+.2f}/trade) — nem no pior nível (R$ {pior:+.2f}), mas exige atenção."
+        acao = f"Expectativa negativa ({simbolo} {atual:+.2f}/trade) — nem no pior nível ({simbolo} {pior:+.2f}), mas exige atenção."
         cor = "yellow"
     return {"tem_dado": True, "atual": atual, "melhor": melhor, "pior": pior, "acao_texto": acao, "cor_acao": cor}
 
@@ -1597,6 +2018,30 @@ def calcular_anticovardia_score(df: pd.DataFrame | None = None) -> dict:
     }
     score = sum(eixos.values()) / len(eixos)
     return {"score": score, "eixos": eixos}
+
+
+# Limiares do "nível" visual no rodapé do menu lateral (item 1 do upgrade
+# de 2026-08-04, "upgrade geral parte 1.docx") — Starter/Pro/Black/
+# Platinum, cruzando dias de uso (desde `config_operacional.garantir_
+# primeiro_uso`) e quantidade de trades reais. É "capricho visual"
+# (pedido explícito do Jesué, sem sistema de login de verdade ainda) —
+# limiares são um primeiro palpite, revisáveis depois de ver na tela,
+# mesmo espírito de ANTICOVARDIA_CAP_*/SCORE_CAP_* acima.
+NIVEL_CAP_TRADES = {"starter": 0, "pro": 50, "black": 150, "platinum": 300}
+NIVEL_CAP_DIAS = {"starter": 0, "pro": 14, "black": 45, "platinum": 90}
+_NIVEL_ORDEM = ["platinum", "black", "pro", "starter"]
+_NIVEL_ROTULO = {"starter": "Starter", "pro": "Pro", "black": "Black", "platinum": "Platinum"}
+
+
+def nivel_conta(dias_de_uso: int, n_trades: int) -> dict:
+    """Tier visual (Starter/Pro/Black/Platinum) — sobe de nível quando AMBOS
+    os limiares (dias de uso E nº de trades) do próximo nível são batidos,
+    não só um dos dois (evita subir de nível só por tempo passado sem
+    operar, ou só por volume de trade num único dia)."""
+    for chave in _NIVEL_ORDEM:
+        if dias_de_uso >= NIVEL_CAP_DIAS[chave] and n_trades >= NIVEL_CAP_TRADES[chave]:
+            return {"chave": chave, "rotulo": _NIVEL_ROTULO[chave]}
+    return {"chave": "starter", "rotulo": _NIVEL_ROTULO["starter"]}
 
 
 # -----------------------------------------------------------------------------
@@ -1703,9 +2148,9 @@ def calcular_discipline_score(df: pd.DataFrame | None = None, dias: int | None =
     return {"score": score, "eixos": eixos}
 
 
-def _agrupar_soma_contagem(df: pd.DataFrame, coluna: str) -> dict:
-    """`{valor_da_coluna: {'n': contagem, 'saldo': soma de saldo_operacao_reais}}`, ordenado por saldo desc."""
-    agrupado = df.groupby(coluna)["saldo_operacao_reais"].agg(["count", "sum"])
+def _agrupar_soma_contagem(df: pd.DataFrame, coluna: str, coluna_valor: str = "saldo_operacao_reais") -> dict:
+    """`{valor_da_coluna: {'n': contagem, 'saldo': soma de `coluna_valor`}}`, ordenado por saldo desc."""
+    agrupado = df.groupby(coluna)[coluna_valor].agg(["count", "sum"])
     agrupado = agrupado.sort_values("sum", ascending=False)
     return {
         str(indice): {"n": int(linha["count"]), "saldo": float(linha["sum"])}
@@ -1717,6 +2162,7 @@ def calcular_estatisticas(
     df: pd.DataFrame | None = None,
     ano: int | None = None,
     mes: int | None = None,
+    ativo: str | None = None,
 ) -> dict:
     """
     Estatísticas agregadas equivalentes à aba "Dashboard" da planilha
@@ -1730,6 +2176,15 @@ def calcular_estatisticas(
     mês do calendário e pelo toggle "Ano Corrente" da aba Estatísticas).
     Sem os dois, o cálculo é sobre o histórico inteiro (comportamento
     anterior, preservado).
+
+    `ativo` (novo, Fase 4 da integração cTrader — 2026-08-06) filtra pra um
+    único ativo. Quando esse ativo é nativo em USD (`cfg.MOEDA_ATIVO`), TODA
+    a agregação monetária passa a somar `saldo_operacao_usd` em vez de
+    `saldo_operacao_reais` — o dict de retorno ganha `"moeda"` ("BRL" ou
+    "USD") pra quem renderiza saber qual símbolo usar. Sem `ativo` (visão
+    "Todos", default), o comportamento é idêntico ao de antes: sempre BRL
+    via `saldo_operacao_reais`, que já é homogêneo entre ativos (conversão
+    feita no momento do trade — ver `converter_usd_para_reais`).
 
     Se `df` não for passado, carrega o diário inteiro via `listar_trades()`.
     """
@@ -1747,6 +2202,12 @@ def calcular_estatisticas(
             mascara &= data_op_dt.dt.month == mes
         reais = reais[mascara]
 
+    moeda = "BRL"
+    if ativo:
+        reais = reais[reais["ativo"] == ativo]
+        moeda = cfg.MOEDA_ATIVO.get(ativo, "BRL")
+    col_valor = "saldo_operacao_usd" if moeda == "USD" else "saldo_operacao_reais"
+
     n = len(reais)
 
     vazio = {
@@ -1760,12 +2221,13 @@ def calcular_estatisticas(
         "por_tags_setup_erro": {}, "por_dia": {}, "por_mes": {}, "por_ano": {},
         "drawdown_maximo_reais": 0.0, "fator_recuperacao": None,
         "evolucao_data": [], "evolucao_saldo_acumulado": [],
+        "moeda": moeda,
     }
     if n == 0:
         return vazio
 
     reais = reais.sort_values("data_op")
-    saldo = reais["saldo_operacao_reais"].astype(float)
+    saldo = reais[col_valor].astype(float)
 
     vencedoras = reais[saldo > 0]
     perdedoras = reais[saldo < 0]
@@ -1775,11 +2237,11 @@ def calcular_estatisticas(
     n_be = n - n_win - n_loss
 
     taxa_acerto = n_win / n
-    media_ganho = float(vencedoras["saldo_operacao_reais"].mean()) if n_win else 0.0
-    media_perda = float(perdedoras["saldo_operacao_reais"].mean()) if n_loss else 0.0
+    media_ganho = float(vencedoras[col_valor].mean()) if n_win else 0.0
+    media_perda = float(perdedoras[col_valor].mean()) if n_loss else 0.0
     payoff = abs(media_ganho / media_perda) if media_perda else None
-    soma_ganhos = float(vencedoras["saldo_operacao_reais"].sum()) if n_win else 0.0
-    soma_perdas = float(perdedoras["saldo_operacao_reais"].sum()) if n_loss else 0.0
+    soma_ganhos = float(vencedoras[col_valor].sum()) if n_win else 0.0
+    soma_perdas = float(perdedoras[col_valor].sum()) if n_loss else 0.0
     profit_factor = abs(soma_ganhos / soma_perdas) if soma_perdas else None
     expectativa = taxa_acerto * media_ganho + (1 - taxa_acerto) * media_perda
 
@@ -1795,8 +2257,8 @@ def calcular_estatisticas(
     reais["mes_op"] = data_op_dt_agrupamento.dt.strftime("%Y-%m")
     reais["ano_op"] = data_op_dt_agrupamento.dt.strftime("%Y")
 
-    evolucao = reais[["data_op", "saldo_operacao_reais"]].copy()
-    evolucao["saldo_acumulado"] = evolucao["saldo_operacao_reais"].astype(float).cumsum()
+    evolucao = reais[["data_op", col_valor]].copy()
+    evolucao["saldo_acumulado"] = evolucao[col_valor].astype(float).cumsum()
 
     # Drawdown máximo pico-vale em R$, não em % (desvio deliberado do plano
     # original, que seguia a definição textual do Zella Score). Testado
@@ -1826,8 +2288,8 @@ def calcular_estatisticas(
         # existia, mas sem os dois lados separados não dá pra ver, por
         # exemplo, se o total positivo é grande e os losses é que destroem —
         # ou o contrário.
-        "ganho_total": float(vencedoras["saldo_operacao_reais"].sum()) if n_win else 0.0,
-        "perda_total": float(perdedoras["saldo_operacao_reais"].sum()) if n_loss else 0.0,
+        "ganho_total": float(vencedoras[col_valor].sum()) if n_win else 0.0,
+        "perda_total": float(perdedoras[col_valor].sum()) if n_loss else 0.0,
         "taxa_acerto": taxa_acerto,
         "payoff": payoff,
         "profit_factor": profit_factor,
@@ -1836,18 +2298,19 @@ def calcular_estatisticas(
         "n_win": n_win, "n_loss": n_loss, "n_breakeven": n_be,
         "maior_sequencia_win": _maior_sequencia(sinais, 1),
         "maior_sequencia_loss": _maior_sequencia(sinais, -1),
-        "por_ativo": _agrupar_soma_contagem(reais, "ativo"),
-        "por_janela": _agrupar_soma_contagem(reais, "janela_pregao"),
-        "por_sala": _agrupar_soma_contagem(reais, "sala_analise"),
-        "por_estrategia": _agrupar_soma_contagem(tags_explodidas, "estrategia_tags"),
-        "por_tags_setup_erro": _agrupar_soma_contagem(tags_erro_explodidas, "tags_setup_erro"),
-        "por_dia": _agrupar_soma_contagem(reais, "data_op"),
-        "por_mes": _agrupar_soma_contagem(reais, "mes_op"),
-        "por_ano": _agrupar_soma_contagem(reais, "ano_op"),
+        "por_ativo": _agrupar_soma_contagem(reais, "ativo", col_valor),
+        "por_janela": _agrupar_soma_contagem(reais, "janela_pregao", col_valor),
+        "por_sala": _agrupar_soma_contagem(reais, "sala_analise", col_valor),
+        "por_estrategia": _agrupar_soma_contagem(tags_explodidas, "estrategia_tags", col_valor),
+        "por_tags_setup_erro": _agrupar_soma_contagem(tags_erro_explodidas, "tags_setup_erro", col_valor),
+        "por_dia": _agrupar_soma_contagem(reais, "data_op", col_valor),
+        "por_mes": _agrupar_soma_contagem(reais, "mes_op", col_valor),
+        "por_ano": _agrupar_soma_contagem(reais, "ano_op", col_valor),
         "drawdown_maximo_reais": drawdown_maximo_reais,
         "fator_recuperacao": fator_recuperacao,
         "evolucao_data": evolucao["data_op"].astype(str).tolist(),
         "evolucao_saldo_acumulado": evolucao["saldo_acumulado"].tolist(),
+        "moeda": moeda,
     }
 
 
@@ -1966,7 +2429,7 @@ def calcular_score_confiabilidade(df: pd.DataFrame | None = None, min_amostra: i
 
 
 def detalhe_dias_calendario(df: pd.DataFrame | None = None, ano: int | None = None,
-                             mes: int | None = None) -> dict:
+                             mes: int | None = None, ativo: str | None = None) -> dict:
     """Detalhe por dia pro calendário configurável (item F, fase 4,
     `spec_redesenho_tradezella.md`) — além do saldo que `calcular_estatisticas
     ()['por_dia']` já dá, calcula R-multiple médio do dia, taxa de acerto do
@@ -1989,6 +2452,9 @@ def detalhe_dias_calendario(df: pd.DataFrame | None = None, ano: int | None = No
         if mes is not None:
             mascara &= data_op_dt.dt.month == mes
         reais = reais[mascara]
+
+    if ativo:
+        reais = reais[reais["ativo"] == ativo]
 
     if reais.empty:
         return {}
@@ -2204,6 +2670,13 @@ def status_do_dia(data=None, df: pd.DataFrame | None = None) -> dict:
     simulados. Posições ainda abertas não entram: a decisão que este bloco
     apoia é "abro mais uma?", e uma posição viva ainda não é uma operação
     concluída — mas ela aparece na tela logo acima, então o Jesué a vê.
+
+    2026-08-03 (pedido do Jesué): os limites não são mais constantes fixas
+    do sistema — vêm do Checklist Pré-Trade `padrao` (o "plano" editável
+    pelo próprio Jesué, ver `criar_checklist_pretrade`/
+    `editar_checklist_pretrade`). Um checklist antigo sem esses campos
+    (`None`) cai pro default de `config_backtest.py`, pra nunca quebrar
+    quem já tinha um checklist cadastrado antes desta migração.
     """
     dia = pd.Timestamp(data).date() if data is not None else date.today()
     if df is None:
@@ -2214,40 +2687,82 @@ def status_do_dia(data=None, df: pd.DataFrame | None = None) -> dict:
         datas = df["data_op"].apply(lambda d: pd.Timestamp(d).date() if d is not None else None)
         do_dia = df[datas == dia]
 
+    checklist = obter_checklist_pretrade()
+    def _limite(chave, default):
+        valor = checklist.get(chave) if checklist else None
+        return int(valor) if valor is not None and not (isinstance(valor, float) and pd.isna(valor)) else default
+    limite_trades_dia = _limite("limite_trades_dia", cfg.DIARIO_LIMITE_TRADES_DIA)
+    limite_critico = _limite("limite_critico_trades_dia", cfg.DIARIO_TRADES_DIA_CRITICO)
+    limite_stops = _limite("limite_stops_dia", cfg.DIARIO_LIMITE_STOPS_DIA)
+
+    # Metas em R$ do plano (2026-08-06, pedido do Jesué — ver
+    # [[project_reorg_cadastro_checklist_pretrade]]): opcionais, `None`
+    # quando o checklist não define nenhuma (comportamento idêntico ao
+    # anterior a esta migração).
+    def _meta(chave):
+        valor = checklist.get(chave) if checklist else None
+        return float(valor) if valor is not None and not (isinstance(valor, float) and pd.isna(valor)) else None
+    meta_prejuizo = _meta("meta_prejuizo_dia")
+    meta_ganho = _meta("meta_ganho_dia")
+
     n = len(do_dia)
     saldo = float(do_dia["saldo_operacao_reais"].fillna(0).sum()) if n else 0.0
     stops = int((do_dia["tipo_saida"] == TIPO_SAIDA_STOP).sum()) if n else 0
 
-    if n >= cfg.DIARIO_TRADES_DIA_CRITICO or stops >= cfg.DIARIO_LIMITE_STOPS_DIA:
+    # Meta de prejuízo tem peso MÁXIMO — "isso sim é motivo de alerta
+    # máximo, tem mais peso do que o número de trades no dia" (palavras do
+    # Jesué): sobrepõe o `estado` calculado por contagem, e o motivo lidera
+    # a lista em vez de só se somar aos outros.
+    prejuizo_estourado = meta_prejuizo is not None and saldo <= -meta_prejuizo
+    ganho_batido = meta_ganho is not None and saldo >= meta_ganho
+
+    if prejuizo_estourado or n >= limite_critico or stops >= limite_stops:
         estado = "critico"
-    elif n >= cfg.DIARIO_LIMITE_TRADES_DIA:
+    elif n >= limite_trades_dia:
         estado = "atencao"
     else:
         estado = "livre"
 
     motivos = []
-    if stops >= cfg.DIARIO_LIMITE_STOPS_DIA:
+    if prejuizo_estourado:
+        motivos.append(
+            f"Meta de prejuízo do dia (R$ {meta_prejuizo:.0f}) estourada — saldo em "
+            f"R$ {saldo:+.0f}. Pesa mais que o número de trades: pare por hoje."
+        )
+    if stops >= limite_stops:
         motivos.append(f"{stops} stops no dia — o plano manda encerrar aqui.")
-    if n >= cfg.DIARIO_TRADES_DIA_CRITICO:
+    if n >= limite_critico:
         motivos.append(
-            f"{n}ª operação do dia. Dias com {cfg.DIARIO_TRADES_DIA_CRITICO}+ trades "
-            f"somaram prejuízo em toda a amostra."
+            f"{n}ª operação do dia. Seu plano define {limite_critico}+ trades "
+            f"como o limite crítico do dia."
         )
-    elif n >= cfg.DIARIO_LIMITE_TRADES_DIA:
+    elif n >= limite_trades_dia:
         motivos.append(
-            f"Limite de {cfg.DIARIO_LIMITE_TRADES_DIA} operações/dia atingido. "
-            f"Dias de 1-2 trades são os únicos lucrativos da amostra."
+            f"Limite de {limite_trades_dia} operações/dia (definido no seu plano) atingido."
         )
+
+    # Conquista: meta de ganho batida é positiva, nunca um "motivo" de
+    # alerta — só registrada pra consulta futura (gamificação), sem afetar
+    # `estado`/`motivos`. Meta de prejuízo RESPEITADA fica de fora por ora:
+    # só é conhecível no fim do pregão, e este guarda-corpo é consultado
+    # continuamente ao longo do dia (sem um evento claro de "dia encerrou"
+    # pra disparar o registro sem risco de declarar vitória cedo demais).
+    if ganho_batido:
+        registrar_conquista_dia(dia, "meta_ganho_dia", valor_referencia=saldo)
 
     return {
         "data": str(dia),
         "n_trades": n,
         "n_stops": stops,
         "saldo": saldo,
-        "limite": cfg.DIARIO_LIMITE_TRADES_DIA,
-        "restantes": max(cfg.DIARIO_LIMITE_TRADES_DIA - n, 0),
+        "limite": limite_trades_dia,
+        "restantes": max(limite_trades_dia - n, 0),
         "estado": estado,
         "motivos": motivos,
+        "meta_prejuizo_dia": meta_prejuizo,
+        "meta_ganho_dia": meta_ganho,
+        "prejuizo_estourado": prejuizo_estourado,
+        "ganho_batido": ganho_batido,
     }
 
 
@@ -2410,6 +2925,15 @@ def _parear_hedge_deals(posicoes: pd.DataFrame) -> pd.DataFrame:
     """
     if posicoes.empty:
         return posicoes
+    # Mesma trava de `detectar_pares_hedge` (2026-08-04) — hoje `posicoes`
+    # vem sempre de `mt5_loader.agrupar_posicoes`, ou seja, é sempre MT5 por
+    # construção (a coluna `conta` nem existe nesse df ainda); a checagem
+    # fica aqui só pra não formar par por engano se esta função um dia
+    # passar a receber deals de outra conta.
+    if "conta" in posicoes.columns:
+        posicoes = posicoes[posicoes["conta"] == "MT5"]
+        if posicoes.empty:
+            return posicoes
     orfas = posicoes[posicoes["preco_saida"].isna()].copy()
     fechadas = posicoes[posicoes["preco_saida"].notna()].copy()
     if orfas.empty:
@@ -3803,6 +4327,16 @@ def detectar_pares_hedge(df_posicoes: pd.DataFrame) -> list[dict]:
     if df_posicoes is None or df_posicoes.empty:
         return []
 
+    # Pareamento de hedge só faz sentido pra conta MT5 (hedging) — uma
+    # conta netting (cTrader) nunca produz o artefato de posições opostas
+    # coexistindo que esta função resolve (2026-08-04). Se a coluna não
+    # existir ainda (df antigo/pré-migração), trata tudo como MT5, igual
+    # sempre foi. Linha de outra conta nunca entra num par.
+    if "conta" in df_posicoes.columns:
+        df_posicoes = df_posicoes[df_posicoes["conta"] == "MT5"]
+        if df_posicoes.empty:
+            return []
+
     elegiveis = df_posicoes[df_posicoes["status"].isin(
         [STATUS_POSICAO_ABERTA, STATUS_POSICAO_FECHADA_PENDENTE]
     )]
@@ -4417,16 +4951,83 @@ COLUNAS_ORDENS_PENDENTES = [
     "preco_pedido", "sl", "tp", "datetime_criacao", "comment",
 ]
 
+# Eventos de ordens pendentes (2026-08-02, pedido do Jesué: "eu quero que
+# comece a registrar tudo a partir de agora puxando do MT5" — timing de
+# ajuste de stop/breakeven). Achado real que motivou o desenho abaixo: a
+# conta do Jesué é hedging e NÃO usa SL/TP nativo do MT5 — confirmado
+# empiricamente, `sl`/`tp` vêm `None` tanto em `positions_get()` quanto em
+# `orders_get()`/`history_orders_get()` pra toda posição/ordem real
+# testada. O único sinal objetivo de "ele ajustou o risco" que o MT5
+# realmente expõe é a ORDEM PENDENTE (limitada/stop) que faz o papel de
+# alvo/stop nesta conta — quando ela muda de preço, é o ajuste; quando
+# aparece, é uma nova proteção armada; quando some, foi disparada ou
+# cancelada (não dá pra distinguir só com o snapshot de ordens pendentes —
+# cruzar com `listar_posicoes_abertas`/histórico de trade na hora da
+# análise, não aqui). Log só daqui pra frente, nunca retroativo.
+COLUNAS_EVENTOS_ORDENS_PENDENTES = [
+    "datetime_detectado", "tipo_evento", "ticket", "ativo", "contrato",
+    "tipo_ordem", "preco_anterior", "preco_novo", "volume",
+]
+
+
+def detectar_eventos_ordens_pendentes(df_anterior: pd.DataFrame | None, df_atual: pd.DataFrame) -> pd.DataFrame:
+    """Compara o snapshot de ordens pendentes do ciclo anterior com o atual
+    e retorna as diferenças como eventos ('criada'/'modificada'/'removida').
+    Função PURA (sem I/O) — fácil de testar isolada. `df_anterior=None`
+    (nenhum snapshot persistido ainda — só acontece na primeiríssima vez que
+    este recurso roda) não gera eventos, já que não há base de comparação
+    nenhuma. Um `df_anterior` vazio de verdade (0 ordens no ciclo passado,
+    confirmado) É uma base válida — uma ordem aparecendo a partir daí GERA
+    evento 'criada' normalmente (bug real pego em teste: um `return` cedo
+    demais aqui tratava "vazio" igual a "não sei", perdendo a primeira ordem
+    de cada posição nova)."""
+    if df_anterior is None:
+        return pd.DataFrame(columns=COLUNAS_EVENTOS_ORDENS_PENDENTES)
+    agora = datetime.now()
+    anterior_por_ticket = df_anterior.set_index("ticket").to_dict("index") if not df_anterior.empty else {}
+    atual_por_ticket = df_atual.set_index("ticket").to_dict("index") if not df_atual.empty else {}
+
+    eventos = []
+    for ticket, linha in atual_por_ticket.items():
+        if ticket not in anterior_por_ticket:
+            eventos.append({
+                "datetime_detectado": agora, "tipo_evento": "criada", "ticket": ticket,
+                "ativo": linha["ativo"], "contrato": linha["contrato"], "tipo_ordem": linha["tipo_ordem"],
+                "preco_anterior": None, "preco_novo": linha["preco_pedido"], "volume": linha["volume"],
+            })
+        else:
+            preco_antigo = anterior_por_ticket[ticket]["preco_pedido"]
+            if preco_antigo != linha["preco_pedido"]:
+                eventos.append({
+                    "datetime_detectado": agora, "tipo_evento": "modificada", "ticket": ticket,
+                    "ativo": linha["ativo"], "contrato": linha["contrato"], "tipo_ordem": linha["tipo_ordem"],
+                    "preco_anterior": preco_antigo, "preco_novo": linha["preco_pedido"], "volume": linha["volume"],
+                })
+    for ticket, linha in anterior_por_ticket.items():
+        if ticket not in atual_por_ticket:
+            eventos.append({
+                "datetime_detectado": agora, "tipo_evento": "removida", "ticket": ticket,
+                "ativo": linha["ativo"], "contrato": linha["contrato"], "tipo_ordem": linha["tipo_ordem"],
+                "preco_anterior": linha["preco_pedido"], "preco_novo": None, "volume": linha["volume"],
+            })
+    return pd.DataFrame(eventos, columns=COLUNAS_EVENTOS_ORDENS_PENDENTES)
+
 
 def sincronizar_ordens_pendentes(df_ordens_mt5: pd.DataFrame | None) -> None:
     """Substitui `ordens_pendentes.parquet` pelo snapshot atual de
     `mt5_loader.buscar_ordens_pendentes()`. `None` (falha de MT5) não apaga
     o que já existe — só um DataFrame vazio de verdade (sem ordens agora)
-    zera a tabela."""
+    zera a tabela. Antes de substituir, compara com o snapshot anterior
+    (`detectar_eventos_ordens_pendentes`) e acrescenta qualquer diferença
+    ao log append-only de eventos — nunca reescreve o log, só adiciona."""
     if df_ordens_mt5 is None:
         return
-    persistencia.salvar_ordens_pendentes(df_ordens_mt5[COLUNAS_ORDENS_PENDENTES] if not df_ordens_mt5.empty
-                                          else pd.DataFrame(columns=COLUNAS_ORDENS_PENDENTES))
+    novo_snapshot = (df_ordens_mt5[COLUNAS_ORDENS_PENDENTES] if not df_ordens_mt5.empty
+                      else pd.DataFrame(columns=COLUNAS_ORDENS_PENDENTES))
+    anterior = persistencia.carregar_ordens_pendentes()
+    eventos = detectar_eventos_ordens_pendentes(anterior, novo_snapshot)
+    persistencia.salvar_eventos_ordens_append(eventos)
+    persistencia.salvar_ordens_pendentes(novo_snapshot)
 
 
 def listar_ordens_pendentes() -> pd.DataFrame:
@@ -4436,3 +5037,130 @@ def listar_ordens_pendentes() -> pd.DataFrame:
     if df is None:
         return pd.DataFrame(columns=COLUNAS_ORDENS_PENDENTES)
     return df
+
+
+def listar_eventos_ordens_pendentes() -> pd.DataFrame:
+    """Log de eventos de ordens pendentes (criada/modificada/removida),
+    mais recente primeiro. DataFrame vazio (colunas garantidas) se o
+    recurso ainda não gerou nenhum evento."""
+    df = persistencia.carregar_eventos_ordens()
+    if df is None or df.empty:
+        return pd.DataFrame(columns=COLUNAS_EVENTOS_ORDENS_PENDENTES)
+    return df.sort_values("datetime_detectado", ascending=False).reset_index(drop=True)
+
+
+# -----------------------------------------------------------------------------
+# QUALIDADE DE EXECUÇÃO (2026-08-04) — quantos pontos o preço de entrada/
+# saída ficou do melhor preço disponível nos 30s ao redor do fill, calculado
+# a partir do tick real do MT5. Mesmo cálculo usado no relatório avulso de
+# backtesting tick a tick, agora registrado PRA TODO TRADE REAL a partir de
+# agora (pedido do Jesué: "deve ser registrado a partir de agora e também
+# usado no backtesting como parâmetro de análise") — não é um backfill
+# histórico obrigatório, mas como o tick de trades recentes (~4 meses,
+# ver spec_prototipo_backtesting_tick.md) ainda está disponível, o scan
+# abaixo acaba pegando de graça o que ainda for possível calcular.
+# -----------------------------------------------------------------------------
+
+COLUNAS_QUALIDADE_EXECUCAO = [
+    "id_trade", "ativo", "qualidade_entrada_pts", "amplitude_entrada_pts",
+    "qualidade_saida_pts", "amplitude_saida_pts", "calculado_em",
+]
+
+_JANELA_QUALIDADE_EXECUCAO = timedelta(seconds=30)
+
+
+def calcular_qualidade_execucao_trade(trade: dict) -> dict | None:
+    """Busca tick real ao redor da entrada e da saída de UM trade e calcula
+    a distância (em pontos) entre o preço do fill e o melhor preço que
+    passou na janela de 30s antes/depois. Retorna `None` só se a chamada ao
+    MT5 falhar de verdade (IPC instável) — tick indisponível (contrato
+    antigo, fora da janela de retenção) retorna um dict com os campos de
+    qualidade em `None`, pra marcar a tentativa e não ficar re-checando o
+    mesmo trade morto a cada ciclo (ver `atualizar_qualidade_execucao_pendentes`).
+    """
+    contrato = trade.get("contrato")
+    entrada_dt = trade.get("datetime_entrada")
+    saida_dt = trade.get("datetime_saida")
+    if not contrato or pd.isna(entrada_dt) or pd.isna(saida_dt):
+        return None
+    entrada_dt = pd.Timestamp(entrada_dt).to_pydatetime()
+    saida_dt = pd.Timestamp(saida_dt).to_pydatetime()
+    tipo = trade.get("tipo_operacao")
+    preco_entrada = trade.get("preco_entrada")
+    preco_saida = trade.get("preco_saida")
+
+    def _qualidade_janela(instante, preco_fill, melhor_lado):
+        try:
+            ticks = mt5_loader.buscar_ticks_periodo(
+                contrato, instante - _JANELA_QUALIDADE_EXECUCAO, instante + _JANELA_QUALIDADE_EXECUCAO)
+        except Exception:
+            _log_sync.exception("Falha em buscar_ticks_periodo (qualidade de execução, trade %s)", trade.get("id_trade"))
+            return None, None, False  # falha de MT5 de verdade — não marca tentativa
+        if ticks is None or ticks.empty:
+            return None, None, True  # tick indisponível — marca tentativa, não é erro
+        preco_melhor = ticks["price"].min() if melhor_lado == "min" else ticks["price"].max()
+        amplitude = float(ticks["price"].max() - ticks["price"].min())
+        qualidade = float(preco_fill - preco_melhor) if melhor_lado == "min" else float(preco_melhor - preco_fill)
+        return round(qualidade, 1), round(amplitude, 1), True
+
+    # long: melhor entrada = menor preço da janela; melhor saída = maior.
+    # short: invertido.
+    lado_entrada = "min" if tipo == "long" else "max"
+    lado_saida = "max" if tipo == "long" else "min"
+
+    qual_entrada, amp_entrada, ok_entrada = _qualidade_janela(entrada_dt, preco_entrada, lado_entrada)
+    qual_saida, amp_saida, ok_saida = _qualidade_janela(saida_dt, preco_saida, lado_saida)
+    if not ok_entrada or not ok_saida:
+        return None  # falha real de MT5 em pelo menos uma janela — não marca tentativa, tenta de novo no próximo ciclo
+
+    return {
+        "id_trade": trade["id_trade"], "ativo": trade.get("ativo"),
+        "qualidade_entrada_pts": qual_entrada, "amplitude_entrada_pts": amp_entrada,
+        "qualidade_saida_pts": qual_saida, "amplitude_saida_pts": amp_saida,
+        "calculado_em": datetime.now(),
+    }
+
+
+def atualizar_qualidade_execucao_pendentes(limite: int = 20) -> int:
+    """Varre os trades reais com timestamps completos que ainda não têm
+    linha em `qualidade_execucao.parquet` e calcula pros `limite` mais
+    recentes (prioriza trades novos — o resto do backlog é pego nos
+    próximos ciclos, sem custo de MT5 concentrado num ciclo só). Retorna
+    quantos trades foram processados (calculados OU marcados como
+    indisponíveis) nesta chamada."""
+    df = listar_trades()
+    reais = df[~df["is_simulated"].astype(bool)]
+    reais = reais[reais["datetime_entrada"].notna() & reais["datetime_saida"].notna() & reais["contrato"].notna()]
+    if reais.empty:
+        return 0
+
+    existente = persistencia.carregar_qualidade_execucao()
+    ja_calculados = set(existente["id_trade"]) if existente is not None and not existente.empty else set()
+    pendentes = reais[~reais["id_trade"].isin(ja_calculados)].sort_values("data_op", ascending=False)
+    if pendentes.empty:
+        return 0
+    pendentes = pendentes.head(limite)
+
+    linhas = []
+    for _, trade in pendentes.iterrows():
+        resultado = calcular_qualidade_execucao_trade(trade.to_dict())
+        if resultado is not None:
+            linhas.append(resultado)
+    if linhas:
+        persistencia.salvar_qualidade_execucao_upsert(pd.DataFrame(linhas, columns=COLUNAS_QUALIDADE_EXECUCAO))
+    return len(linhas)
+
+
+def mesclar_qualidade_execucao(df_trades: pd.DataFrame) -> pd.DataFrame:
+    """Left-join de `df_trades` (ex.: saída de `listar_trades()`) com a
+    qualidade de execução calculada, por `id_trade` — pra usar como
+    parâmetro de análise no backtesting sem acoplar os dois arquivos.
+    Trades sem qualidade calculada (ainda não processados, ou tick
+    indisponível) vêm com as colunas de qualidade em `None`."""
+    qualidade = persistencia.carregar_qualidade_execucao()
+    colunas_extra = [c for c in COLUNAS_QUALIDADE_EXECUCAO if c not in ("id_trade", "ativo")]
+    if qualidade is None or qualidade.empty:
+        for col in colunas_extra:
+            df_trades[col] = None
+        return df_trades
+    return df_trades.merge(qualidade[["id_trade"] + colunas_extra], on="id_trade", how="left")

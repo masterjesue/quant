@@ -21,6 +21,9 @@ scratch_*.txt
 # Configurações locais do Claude Code (permissões específicas da máquina)
 .claude/settings.local.json
 
+# Credenciais reais de contas de corretora (cTrader FIX, etc) — nunca versionar
+credenciais_ctrader.py
+
 # Material de referência pesado (PDFs de pesquisa), não faz parte do app
 diario/
 

@@ -52,6 +52,19 @@ ATIVOS = ["WIN", "WDO"]
 # também em `ATIVOS` e as duas listas voltam a coincidir.
 ATIVOS_DIARIO = ATIVOS + ["BIT"]
 
+# Ativos da conta cTrader (IC Markets, ao vivo) — fora de `ATIVOS` por
+# enquanto, mesmo raciocínio do BIT acima: entram em `ATIVOS` só quando o
+# pipeline completo (candle/tick/features) estiver pronto pra eles (ver
+# plano de integração cTrader, 2026-08-04). Nome usado aqui é o mesmo nome
+# do símbolo na cTrader (`ProtoOALightSymbol.symbolName`).
+ATIVOS_CTRADER = ["XAUUSD", "EURUSD"]
+
+# 2026-08-05: Jesué já começou a operar XAUUSD antes da Fase 1 (histórico
+# via Open API) destravar — o Diário (cadastro manual + importação de
+# extrato) precisa listar esses ativos MESMO sem candle/feature pronta,
+# igual BIT já fazia. `ATIVOS_DIARIO` passa a cobrir os dois casos.
+ATIVOS_DIARIO = ATIVOS_DIARIO + ATIVOS_CTRADER
+
 # Contratos pilares identificados na varredura de 30/06/2026 — usados como
 # fonte MT5 complementar (candle + tick) para o período que o CSV não cobre
 # ou para enriquecer com delta histórico onde houver tick disponível.
@@ -619,6 +632,26 @@ PASTA_DIARIO_IMAGENS = PASTA_BASE_PROCESSADA / "diario_imagens"
 # (`VALOR_PONTO.get(ativo, 0.0)`), silenciosamente.
 VALOR_PONTO = {"WIN": 0.20, "WDO": 10.0, "BIT": 0.01}
 
+# Moeda nativa de cada ativo (2026-08-05, parte mínima da Fase 4 do plano
+# de integração cTrader trazida pra agora — sem isso, um saldo em USD
+# somado como se fosse BRL corrompe silenciosamente a Expectativa
+# Matemática/Saldo Líquido consolidados). WIN/WDO/BIT liquidam em BRL na
+# B3; XAUUSD/EURUSD (conta cTrader, IC Markets) em USD. Consumido por
+# `diario_trade.converter_usd_para_reais` — a visão consolidada do Diário
+# sempre converte pra BRL usando o preço do WDO como proxy de câmbio
+# (decisão do Jesué: não usa API de câmbio externa).
+MOEDA_ATIVO = {"WIN": "BRL", "WDO": "BRL", "BIT": "BRL", "XAUUSD": "USD", "EURUSD": "USD"}
+
+# Unidade de pontuação (Alvo/Stop/Resultado) por ativo — 2026-08-05, pedido
+# do Jesué: "o XAUUSD (cTrader) geralmente traz resultados, alvos e stops
+# em pips e não em pontos. Ajuste isso." WIN/WDO/BIT (B3, motor de features
+# próprio) usam "pontos"; XAUUSD/EURUSD (cTrader, cotação decimal) usam
+# "pips" — mesmo precedente de `MOEDA_ATIVO` acima (dict por ativo em vez
+# de constante única), consumido só pra ROTULAR campos na UI (Novo Trade,
+# detalhe do trade, Gerenciamento de Risco) — nunca converte o número em
+# si, é decisão do próprio dado de origem (extrato cTrader já vem em pips).
+UNIDADE_PONTUACAO_ATIVO = {"WIN": "pts", "WDO": "pts", "BIT": "pts", "XAUUSD": "pips", "EURUSD": "pips"}
+
 # Teto de largura (px) aplicado a qualquer imagem salva no diário (upload ou
 # colar do clipboard) — sem isso o volume de `diario_imagens/` cresce sem
 # controle a cada print colado em resolução nativa.
@@ -733,3 +766,30 @@ AJUSTE_FINO_ALLOWLIST = {
     "FATOR_ALVO_COMBUSTIVEL_MIN":  {"limite_variacao": 0.2, "amostra_minima": 50},
     "FATOR_ALVO_COMBUSTIVEL_MAX":  {"limite_variacao": 0.2, "amostra_minima": 50},
 }
+
+# -----------------------------------------------------------------------------
+# BACKTESTING TICK A TICK — protótipo (spec_prototipo_backtesting_tick.md)
+# -----------------------------------------------------------------------------
+# PROVISÓRIO — calibrado empiricamente em 2026-08-03 olhando só a distribuição
+# de amplitude de preço em janelas de 30s sobre o tick real de UM dia
+# (WIN: p50=60pts/p90=140pts; WDO: p50=1.5pts/p90=2.5pts, tick mínimo
+# 5pts/0.5pts respectivamente) — não é validação contra exemplos reais de
+# violino/estopada julgados pelo Jesué olhando o gráfico, que é o padrão de
+# validação deste projeto (ver feedback_empirical_validation). Ajustar assim
+# que houver alguns casos revisados na aba Backtesting.
+
+# Janela ao redor do timestamp exato de entrada/saída usada para julgar
+# "qual era o melhor preço disponível" (qualidade de fill) — curta de
+# propósito: é sobre a EXECUÇÃO, não sobre para onde o mercado foi depois.
+TICK_JANELA_QUALIDADE_SEGUNDOS = 15
+
+# Violino = ida-e-volta rápida (amplitude >= limiar, no intervalo <= janela)
+# — acima do ruído normal de tick, não um movimento direcional real.
+TICK_VIOLINO_LIMIAR_PONTOS = {"WIN": 100.0, "WDO": 2.0}
+TICK_VIOLINO_JANELA_MAX_SEGUNDOS = 45
+
+# "Correto mas estopado": depois do stop batido, o preço precisa reverter
+# pelo menos este tanto na direção da tese original, dentro da janela em
+# minutos, para contar como "a tese estava certa, só o stop foi curto".
+TICK_ESTOPADO_LIMIAR_PONTOS = {"WIN": 80.0, "WDO": 1.5}
+TICK_ESTOPADO_JANELA_MINUTOS = 15

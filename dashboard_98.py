@@ -869,12 +869,15 @@ def construir_market_view(m: dict) -> html.Div:
     t_atual = datetime.now().time()
     janela_nome = 'Fora do pregão'
     proxima_janela = ''
-    for nome, (ini, fim) in cfg.JANELAS_PREGAO.items():
-        h_i, m_i = map(int, ini.split(':'))
-        h_f, m_f = map(int, fim.split(':'))
+    # Cadastro editável (`diario_trade.listar_janelas`, substitui
+    # `cfg.JANELAS_PREGAO` fixo, 2026-08-04); sem filtro de ativo aqui — este
+    # card não recebe o ativo selecionado, mesmo comportamento de antes.
+    for _, linha in diario_trade.listar_janelas().iterrows():
+        h_i, m_i = map(int, linha['hora_inicio'].split(':'))
+        h_f, m_f = map(int, linha['hora_fim'].split(':'))
         if dtime(h_i, m_i) <= t_atual < dtime(h_f, m_f):
-            janela_nome = nome.upper()
-            proxima_janela = f'Vai até {fim}'
+            janela_nome = linha['slug'].upper()
+            proxima_janela = f"Vai até {linha['hora_fim']}"
             break
 
     mapa_janela = {

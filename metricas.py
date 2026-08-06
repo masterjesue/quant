@@ -4,7 +4,12 @@
 # Lógica pura (sem HTML/Dash) compartilhada entre os dois front-ends do
 # Super Quant (dashboard.py — visual clássico, e dashboard_98.py — visual
 # Windows 98) — extraído de dashboard.py pra evitar duplicar cálculo de
-# métricas entre as duas interfaces.
+# métricas entre as duas interfaces. Também guarda utilidades de gráfico
+# puras (sem `go.Figure`/paleta) compartilhadas entre `dashboard.py` e
+# `diario_app_classico.py` — 2 processos Dash separados que já duplicam
+# PALETA_GAUGE/FONTS/`_hex_para_rgba` por design (tokens de estilo, ver
+# `_hex_para_rgba` em cada arquivo), mas não deveriam duplicar ALGORITMO
+# (ver `segmentos_cor_por_sinal` abaixo).
 # =============================================================================
 
 import pandas as pd
@@ -12,6 +17,55 @@ import numpy as np
 
 import config_backtest as cfg
 import features
+
+
+_SIMBOLO_MOEDA = {"BRL": "R$", "USD": "US$"}
+
+
+def simbolo_moeda(moeda: str = "BRL") -> str:
+    """`"R$"`/`"US$"` — símbolo isolado, pra rótulos de grupo/cabeçalho que não formatam um valor."""
+    return _SIMBOLO_MOEDA.get(moeda, moeda)
+
+
+def formatar_moeda(valor: float, moeda: str = "BRL", casas: int = 2, sinal: bool = True) -> str:
+    """`"R$ +123.45"`/`"US$ -8.00"` — símbolo dinâmico por moeda (Fase 4 da
+    integração cTrader, 2026-08-06: aba Estatísticas passou a poder filtrar
+    por ativo, e ativos forex são nativos em USD, não BRL). Único ponto que
+    formata valor monetário na aba Estatísticas do `dashboard.py` — os
+    demais literais "R$" do arquivo (eixos de gráfico de outros painéis,
+    cards fora da Estatísticas) são inerentemente WIN/WDO e ficam fora
+    deste helper."""
+    simbolo = _SIMBOLO_MOEDA.get(moeda, moeda)
+    marca = "+" if sinal else ""
+    return f"{simbolo} {valor:{marca}.{casas}f}"
+
+
+def segmentos_cor_por_sinal(xs: list, ys: list) -> list:
+    """Quebra uma série temporal em segmentos verde (>=0)/vermelho (<0),
+    inserindo um ponto interpolado exatamente no cruzamento de zero — dá o
+    efeito "linha muda de cor exatamente onde cruza o eixo" do equity
+    curve estilo TradeZella (extraído de `dashboard.py::_grafico_evolucao_
+    saldo`, 2026-08-04, pra reuso idêntico em `diario_app_classico.py`
+    sem duplicar a interpolação). Retorna lista de `(sinal, xs_seg,
+    ys_seg)`."""
+    xs_num = pd.to_datetime(xs).astype('int64').astype(float)
+    segmentos = []
+    atual_x, atual_y = [xs[0]], [ys[0]]
+    sinal_atual = 'pos' if ys[0] >= 0 else 'neg'
+    for i in range(1, len(ys)):
+        sinal = 'pos' if ys[i] >= 0 else 'neg'
+        if sinal != sinal_atual:
+            y_prev, y_cur = ys[i - 1], ys[i]
+            frac = y_prev / (y_prev - y_cur) if (y_prev - y_cur) != 0 else 0.0
+            x_cruz_num = xs_num[i - 1] + frac * (xs_num[i] - xs_num[i - 1])
+            x_cruz = pd.Timestamp(int(x_cruz_num))
+            atual_x.append(x_cruz); atual_y.append(0.0)
+            segmentos.append((sinal_atual, atual_x, atual_y))
+            atual_x, atual_y = [x_cruz], [0.0]
+            sinal_atual = sinal
+        atual_x.append(xs[i]); atual_y.append(ys[i])
+    segmentos.append((sinal_atual, atual_x, atual_y))
+    return segmentos
 
 
 def extrair_metricas(df: pd.DataFrame, n_snapshot: int = cfg.JANELA_SNAPSHOT_CURTO_PRAZO) -> dict:

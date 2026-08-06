@@ -87,7 +87,8 @@ def calcular_correlacao_di(df_win: pd.DataFrame | None, df_wdo: pd.DataFrame | N
 
     corr_di_wdo = conjunto['di'].corr(conjunto['wdo'])
     corr_di_win = conjunto['di'].corr(conjunto['win'])
-    if pd.isna(corr_di_wdo) or pd.isna(corr_di_win):
+    corr_wdo_win = conjunto['wdo'].corr(conjunto['win'])
+    if pd.isna(corr_di_wdo) or pd.isna(corr_di_win) or pd.isna(corr_wdo_win):
         return None
 
     alinhamento = (corr_di_wdo - corr_di_win) / 2
@@ -96,6 +97,18 @@ def calcular_correlacao_di(df_win: pd.DataFrame | None, df_wdo: pd.DataFrame | N
         'alinhamento': round(float(alinhamento), 3),
         'corr_di_wdo': round(float(corr_di_wdo), 3),
         'corr_di_win': round(float(corr_di_win), 3),
+        # Terceira perna da tese (CORRELAÇÕES.md, professor Igor,
+        # 2026-08-03): "Dólar × Índice: inversamente proporcional" — dólar
+        # sobe -> saída de capital -> bolsa cai. Já era implícito no
+        # alinhamento DI-WDO/DI-WIN, mas agora é conferido também
+        # DIRETAMENTE (WDO×WIN), porque as duas relações podem divergir na
+        # prática: a nota do professor Igor lista uma exceção real (rally
+        # de commodities — minério/petróleo puxando Vale/Petro, que pesam
+        # muito no índice — pode fazer o índice subir MESMO com juros e
+        # dólar subindo). Não modelamos essa exceção numericamente (não
+        # temos feed de commodities integrado) — só é citada aqui e na UI
+        # como um alerta de leitura, não um número.
+        'corr_wdo_win': round(float(corr_wdo_win), 3),
         'nivel_nome': nome, 'cor': cor, 'janela_dias': len(conjunto),
     }
 

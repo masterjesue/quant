@@ -269,7 +269,7 @@ def _construir_diario98_novo_trade() -> html.Div:
                 campo('Ativo', dcc.Dropdown(id='diario98-ativo', options=_opcoes_diario(cfg.ATIVOS_DIARIO),
                                              clearable=False, className='win98-dropdown', style=largura_total)),
                 campo('Janela', dcc.Dropdown(id='diario98-janela',
-                                              options=_opcoes_diario(list(cfg.JANELAS_PREGAO.keys())),
+                                              options=_opcoes_janelas_98(),
                                               className='win98-dropdown', style=largura_total)),
                 campo('Estratégia', dcc.Dropdown(id='diario98-estrategia', multi=True,
                                                   options=_opcoes_estrategias(),
@@ -1009,17 +1009,23 @@ _COR_STATUS_ADERENCIA_TRACADOS = {
 
 
 def _formatar_janela_98(chave: str | None) -> str:
-    """"Abertura (9:00-9:30)" ao invés de só "abertura" — `JANELAS_PREGAO`
-    já é um dict {nome: (inicio, fim)}, só faltava formatar assim na
-    exibição (feedback diário.txt, 2026-07-11)."""
-    if not chave or chave not in cfg.JANELAS_PREGAO:
-        return chave or '—'
-    inicio, fim = cfg.JANELAS_PREGAO[chave]
-    return f"{chave.replace('_', ' ').title()} ({inicio}-{fim})"
+    """"Abertura (9:00-9:30)" — nome/horário vêm do cadastro editável
+    (`diario_trade.listar_janelas`, substitui `cfg.JANELAS_PREGAO` fixo,
+    2026-08-04), mesmo raciocínio de diario_app_classico.py::_formatar_janela."""
+    if not chave:
+        return '—'
+    linhas = dt.listar_janelas(somente_ativas=False)
+    linha = linhas[linhas['slug'] == chave]
+    if linha.empty:
+        return chave
+    r = linha.iloc[0]
+    return f"{r['nome']} ({r['hora_inicio']}-{r['hora_fim']})"
 
 
 def _opcoes_janelas_98() -> list[dict]:
-    return [{'label': _formatar_janela_98(k), 'value': k} for k in cfg.JANELAS_PREGAO.keys()]
+    linhas = dt.listar_janelas()
+    return [{'label': f"{r['nome']} ({r['hora_inicio']}-{r['hora_fim']})", 'value': r['slug']}
+            for _, r in linhas.iterrows()]
 
 
 def _mapa_nomes_estrategias_98() -> dict:
@@ -1896,6 +1902,34 @@ def _tabela_tags_emocionais_98(df: pd.DataFrame) -> html.Div:
     return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
 
 
+def _tabela_sessoes_98(df: pd.DataFrame) -> html.Div:
+    if df.empty:
+        return html.Div('Nenhuma sessão cadastrada.', style={'color': C['text2'], 'fontSize': '11px', 'padding': '8px'})
+    cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '4px 8px', 'fontSize': '10px', 'color': C['text2']})
+                          for t in ['Nome', 'Horário', 'Ativos', '']])
+    linhas = [html.Tr([
+        _td_diario98(linha['nome']),
+        _td_diario98(f"{linha['hora_inicio']}-{linha['hora_fim']}"),
+        _td_diario98(', '.join(linha['ativos']) if len(linha['ativos']) else 'Todos'),
+        _td_diario98(_botao_desativar_98('diario98-sessao-desativar', linha['id'])),
+    ]) for _, linha in df.iterrows()]
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
+def _tabela_janelas_98(df: pd.DataFrame) -> html.Div:
+    if df.empty:
+        return html.Div('Nenhuma janela cadastrada.', style={'color': C['text2'], 'fontSize': '11px', 'padding': '8px'})
+    cabecalho = html.Tr([html.Th(t, style={'textAlign': 'left', 'padding': '4px 8px', 'fontSize': '10px', 'color': C['text2']})
+                          for t in ['Nome', 'Horário', 'Ativos', '']])
+    linhas = [html.Tr([
+        _td_diario98(linha['nome']),
+        _td_diario98(f"{linha['hora_inicio']}-{linha['hora_fim']}"),
+        _td_diario98(', '.join(linha['ativos']) if len(linha['ativos']) else 'Todos'),
+        _td_diario98(_botao_desativar_98('diario98-janela-desativar', linha['id'])),
+    ]) for _, linha in df.iterrows()]
+    return html.Table([html.Thead(cabecalho), html.Tbody(linhas)], style={'width': '100%', 'borderCollapse': 'collapse'})
+
+
 def _construir_diario98_estrategias() -> html.Div:
     campo = _campo_diario98
     return html.Div([
@@ -1961,6 +1995,48 @@ def _construir_diario98_estrategias() -> html.Div:
         ])),
         win98_groupbox('Tags Emocionais Cadastradas', html.Div(_tabela_tags_emocionais_98(dt.listar_tags_emocionais()),
                                                                   id='diario98-tabela-tags-emocionais')),
+
+        # Sessão/Janela (substitui `cfg.JANELAS_PREGAO` fixo), 2026-08-04 —
+        # ver diario_app_classico.py pro mesmo raciocínio completo (vale pra
+        # WIN/WDO/BIT também, detecção sempre automática por horário, nunca
+        # seleção manual por trade).
+        win98_groupbox('Nova Sessão', html.Div([
+            html.Div([
+                campo('Nome', dcc.Input(id='diario98-nova-sessao-nome', type='text', style={**win98_field(), 'width': '180px'})),
+                campo('Início', dcc.Input(id='diario98-nova-sessao-inicio', type='text', placeholder='HH:MM',
+                                           style={**win98_field(), 'width': '80px'})),
+                campo('Fim', dcc.Input(id='diario98-nova-sessao-fim', type='text', placeholder='HH:MM',
+                                        style={**win98_field(), 'width': '80px'})),
+                campo('Ativos (vazio = todos)', dcc.Dropdown(
+                    id='diario98-nova-sessao-ativos', multi=True,
+                    options=_opcoes_diario(cfg.ATIVOS + cfg.ATIVOS_CTRADER),
+                    className='win98-dropdown', style={'width': '200px'})),
+            ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
+            html.Button('Adicionar Sessão', id='btn-diario98-add-sessao', n_clicks=0,
+                        className='win98-btn', style=win98_button(extra={'marginTop': '6px'})),
+            html.Span(id='diario98-sessao-status', style={'marginLeft': '10px', 'fontSize': '11px', 'color': C['text2']}),
+        ])),
+        win98_groupbox('Sessões Cadastradas', html.Div(_tabela_sessoes_98(dt.listar_sessoes()),
+                                                          id='diario98-tabela-sessoes')),
+
+        win98_groupbox('Nova Janela', html.Div([
+            html.Div([
+                campo('Nome', dcc.Input(id='diario98-nova-janela-nome', type='text', style={**win98_field(), 'width': '180px'})),
+                campo('Início', dcc.Input(id='diario98-nova-janela-inicio', type='text', placeholder='HH:MM',
+                                           style={**win98_field(), 'width': '80px'})),
+                campo('Fim', dcc.Input(id='diario98-nova-janela-fim', type='text', placeholder='HH:MM',
+                                        style={**win98_field(), 'width': '80px'})),
+                campo('Ativos (vazio = todos)', dcc.Dropdown(
+                    id='diario98-nova-janela-ativos', multi=True,
+                    options=_opcoes_diario(cfg.ATIVOS + cfg.ATIVOS_CTRADER),
+                    className='win98-dropdown', style={'width': '200px'})),
+            ], style={'display': 'flex', 'gap': '10px', 'flexWrap': 'wrap'}),
+            html.Button('Adicionar Janela', id='btn-diario98-add-janela', n_clicks=0,
+                        className='win98-btn', style=win98_button(extra={'marginTop': '6px'})),
+            html.Span(id='diario98-janela-status', style={'marginLeft': '10px', 'fontSize': '11px', 'color': C['text2']}),
+        ])),
+        win98_groupbox('Janelas Cadastradas', html.Div(_tabela_janelas_98(dt.listar_janelas()),
+                                                          id='diario98-tabela-janelas')),
     ])
 
 
@@ -2546,6 +2622,89 @@ def gerenciar_tags_emocionais_98(n_add, n_desativar, nome):
     id_componente = json.loads(origem.rsplit('.', 1)[0])
     dt.desativar_tag_emocional(id_componente['index'])
     return _tabela_tags_emocionais_98(dt.listar_tags_emocionais()), '✔ Tag desativada.', no_update
+
+
+def _validar_horario_98(valor: str | None) -> str | None:
+    """Ver diario_app_classico.py::_validar_horario pro mesmo raciocínio."""
+    if not valor or ':' not in valor:
+        return 'Use o formato HH:MM (ex: 09:00).'
+    try:
+        h, m = map(int, valor.strip().split(':'))
+    except ValueError:
+        return 'Use o formato HH:MM (ex: 09:00).'
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        return 'Horário fora do intervalo válido (00:00-23:59).'
+    return None
+
+
+@app.callback(
+    Output('diario98-tabela-sessoes', 'children'),
+    Output('diario98-sessao-status', 'children'),
+    Output('diario98-nova-sessao-nome', 'value'),
+    Output('diario98-nova-sessao-inicio', 'value'),
+    Output('diario98-nova-sessao-fim', 'value'),
+    Output('diario98-nova-sessao-ativos', 'value'),
+    Input('btn-diario98-add-sessao', 'n_clicks'),
+    Input({'type': 'diario98-sessao-desativar', 'index': ALL}, 'n_clicks'),
+    State('diario98-nova-sessao-nome', 'value'),
+    State('diario98-nova-sessao-inicio', 'value'),
+    State('diario98-nova-sessao-fim', 'value'),
+    State('diario98-nova-sessao-ativos', 'value'),
+    prevent_initial_call=True,
+)
+def gerenciar_sessoes_98(n_add, n_desativar, nome, inicio, fim, ativos):
+    ctx = callback_context
+    if not ctx.triggered:
+        return (no_update,) * 6
+    origem = ctx.triggered[0]['prop_id']
+    if origem.startswith('btn-diario98-add-sessao.'):
+        if not nome or not nome.strip():
+            return (no_update, '⚠ Informe um nome.') + (no_update,) * 4
+        erro = _validar_horario_98(inicio) or _validar_horario_98(fim)
+        if erro:
+            return (no_update, f'⚠ {erro}') + (no_update,) * 4
+        dt.criar_sessao(nome, inicio.strip(), fim.strip(), ativos=ativos or [])
+        return (_tabela_sessoes_98(dt.listar_sessoes()), f'✔ "{nome.strip()}" cadastrada.', '', '', '', [])
+    if not any(n_desativar or []):
+        return (no_update,) * 6
+    id_componente = json.loads(origem.rsplit('.', 1)[0])
+    dt.desativar_sessao(id_componente['index'])
+    return (_tabela_sessoes_98(dt.listar_sessoes()), '✔ Sessão desativada.') + (no_update,) * 4
+
+
+@app.callback(
+    Output('diario98-tabela-janelas', 'children'),
+    Output('diario98-janela-status', 'children'),
+    Output('diario98-nova-janela-nome', 'value'),
+    Output('diario98-nova-janela-inicio', 'value'),
+    Output('diario98-nova-janela-fim', 'value'),
+    Output('diario98-nova-janela-ativos', 'value'),
+    Input('btn-diario98-add-janela', 'n_clicks'),
+    Input({'type': 'diario98-janela-desativar', 'index': ALL}, 'n_clicks'),
+    State('diario98-nova-janela-nome', 'value'),
+    State('diario98-nova-janela-inicio', 'value'),
+    State('diario98-nova-janela-fim', 'value'),
+    State('diario98-nova-janela-ativos', 'value'),
+    prevent_initial_call=True,
+)
+def gerenciar_janelas_98(n_add, n_desativar, nome, inicio, fim, ativos):
+    ctx = callback_context
+    if not ctx.triggered:
+        return (no_update,) * 6
+    origem = ctx.triggered[0]['prop_id']
+    if origem.startswith('btn-diario98-add-janela.'):
+        if not nome or not nome.strip():
+            return (no_update, '⚠ Informe um nome.') + (no_update,) * 4
+        erro = _validar_horario_98(inicio) or _validar_horario_98(fim)
+        if erro:
+            return (no_update, f'⚠ {erro}') + (no_update,) * 4
+        dt.criar_janela(nome, inicio.strip(), fim.strip(), ativos=ativos or [])
+        return (_tabela_janelas_98(dt.listar_janelas()), f'✔ "{nome.strip()}" cadastrada.', '', '', '', [])
+    if not any(n_desativar or []):
+        return (no_update,) * 6
+    id_componente = json.loads(origem.rsplit('.', 1)[0])
+    dt.desativar_janela(id_componente['index'])
+    return (_tabela_janelas_98(dt.listar_janelas()), '✔ Janela desativada.') + (no_update,) * 4
 
 
 @app.callback(

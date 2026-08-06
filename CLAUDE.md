@@ -4,12 +4,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Note for any Claude Code instance opening this project
 
-Jesué runs **two separate Claude Code instances in this same folder**: this
-one (general development) and a native instance that live-tests the running
-dashboards via a Chrome browser extension. Both have full file access to
-this directory — `LABORATORIO_CHROME.md` at the repo root is a shared
-context/feedback file both instances read and write directly (no
-copy/paste). Check it if Jesué mentions testing feedback.
+Jesué runs **multiple Claude Code sessions in this same folder** — this one
+(general development), a native instance that live-tests the running
+dashboards via a Chrome browser extension, and at times other sessions
+working on unrelated initiatives in parallel (e.g. a cTrader/international-
+markets API integration). Expect to see edits in shared files (`dashboard.py`,
+`diario_trade.py`, `persistencia.py`, etc.) that you didn't make — that's
+normal, not a conflict to resolve; don't investigate or revert another
+session's work, just don't let it distract from your own task. Both
+testing-focused instances have full file access to this directory —
+`LABORATORIO_CHROME.md` at the repo root is a shared context/feedback file
+both instances read and write directly (no copy/paste). Check it if Jesué
+mentions testing feedback.
+
+## SQ'98 is discontinued — do not touch, consult, or compare (2026-08-04)
+
+`dashboard_98.py`, `diario_app_98.py`, `estilo_win98.py`, `assets_98/`, and
+`MAPA_ESTRUTURA_SQ98.md`/`CHANGELOG_SQ98.md` are **discontinued**. Explicit,
+repeated instruction from Jesué: treat this skin **as if it does not
+exist** until he asks otherwise — don't read it, don't edit it, don't
+mirror a fix into it "just in case", don't consult it for a UX pattern,
+don't compare a new feature against it. Spending tokens looking at it is
+itself the mistake, even read-only. This applies with **zero exceptions**:
+not a 2-line bugfix, not a regression fix, not "just checking how it did
+X". If a bug is found there in passing, note it and move on — never fix it
+there. All UI/UX work happens in `dashboard.py`/`diario_app_classico.py`/
+`assets/` only. Do not delete the '98 files either — just stop touching
+them entirely.
 
 ## What this project is
 
@@ -29,13 +50,15 @@ conventions" below.
 ## Commands
 
 Four independent long-running Dash processes make up the live system —
-none of them exit on their own, run each in the background:
+none of them exit on their own, run each in the background. **Only run the
+first and third** — the '98 pair is discontinued (see "SQ'98 is
+discontinued" above), don't start/edit/inspect it unless explicitly asked:
 
 ```bash
 python dashboard.py          # classic dark-mode dashboard  → http://127.0.0.1:8050
-python dashboard_98.py       # Windows-98-styled dashboard  → http://127.0.0.1:8051
+python dashboard_98.py       # DISCONTINUED — don't run/touch unless asked → http://127.0.0.1:8051
 python diario_app_classico.py  # Diário de Trade, classic skin → http://127.0.0.1:8053
-python diario_app_98.py        # Diário de Trade, '98 skin      → http://127.0.0.1:8052
+python diario_app_98.py        # DISCONTINUED — don't run/touch unless asked → http://127.0.0.1:8052
 ```
 
 The two `diario_app_*.py` processes are children, embedded via `<iframe>`
@@ -153,17 +176,21 @@ previous one's output columns. The S/R zone catalog lives only in
 history, cheap to rebuild). See `MAPA_ESTRUTURA.md` for the full column
 naming convention (`sr_{lado}_{rank}_{campo}`) and per-block detail.
 
-### Two front-ends, one shared logic layer
+### Two front-ends, one shared logic layer (historical — '98 now discontinued)
 
 `dashboard.py` (classic, dark "cockpit" UI) and `dashboard_98.py` (full
 Windows-98 desktop metaphor — real draggable windows, taskbar, Start menu,
-Clippy as the AI mentor) run independently and never duplicate data logic.
-Everything below the UI layer is shared: `metricas.py` (metric extraction,
-extracted specifically to eliminate duplication between the two dashboards),
-`persistencia.py`, `mt5_loader.py`, `features.py`, `config_backtest.py`,
+Clippy as the AI mentor) were originally built to run independently without
+duplicating data logic — **`dashboard_98.py`/`diario_app_98.py` are now
+discontinued** (see "SQ'98 is discontinued" at the top of this file); this
+section is kept for historical/architectural context, not as a live
+two-skin setup to maintain. Everything below the UI layer is still shared
+across the system: `metricas.py` (metric extraction, extracted specifically
+to eliminate duplication between the two dashboards, back when both were
+live), `persistencia.py`, `mt5_loader.py`, `features.py`, `config_backtest.py`,
 `ai_analyst.py` (Gemini mentor), `calendario_economico.py`, `diario_trade.py`,
 `tracados.py`, `aprendizagem.py`. Only the UI-construction layer
-(`construir_*` functions, callbacks, `estilo_win98.py`) is per-dashboard.
+(`construir_*` functions, callbacks, `estilo_win98.py`) was ever per-dashboard.
 `config_backtest.py` is the single home for every calibratable constant in
 the system — if a magic number is used in more than one place, it belongs
 there, not inlined.
